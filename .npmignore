@@ -1,10 +1,7 @@
 node_modules
 /log/
-/application/tasks
 *.log
-*.done
 *.pem
+*.done
 .DS_Store
-data/
-package-lock.json
 */skills/metaskills

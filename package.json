@@ -43,6 +43,7 @@
     "eslint-config-metarhia": "^8.2.2",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-prettier": "^5.0.0",
+    "metaskills": "^1.0.4",
     "prettier": "^3.3.3"
   }
 }
