@@ -1,0 +1,47 @@
+{
+  "name": "application",
+  "version": "0.0.0",
+  "author": "Dmitriy Shyaryaiev <turone@ukr.net>",
+  "description": "Application",
+  "license": "MIT",
+  "keywords": [],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/turone/application"
+  },
+  "bugs": {
+    "url": "https://github.com/turone/application/issues"
+  },
+  "homepage": "https://github.com/turone/application",
+  "main": "application/main.js",
+  "types": "types/global.d.ts",
+  "files": [
+    "lib/",
+    "schemas/",
+    "types/"
+  ],
+  "scripts": {
+    "test": "npm run lint && npm run types && metatests test/",
+    "types": "tsc -p types/tsconfig.json",
+    "lint": "eslint . && prettier -c \"**/*.js\" \"**/*.json\" \"**/*.md\" \"**/*.ts\"",
+    "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\" \"**/*.ts\""
+  },
+  "engines": {
+    "node": "^18.15 || 20 || 21 || 22"
+  },
+  "dependencies": {
+    "metautil": "^5.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.5.0",
+    "@types/pg": "^8.6.6",
+    "@types/ws": "^8.5.5",
+    "eslint": "^8.47.0",
+    "eslint-config-metarhia": "^8.2.2",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.30.0",
+    "eslint-plugin-prettier": "^5.0.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.1.6"
+  }
+}
