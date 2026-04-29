@@ -21,6 +21,11 @@
   },
   "homepage": "https://github.com/turone/shared-memory-fs",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./preload": "./lib/bootstrap/preload.cjs",
+    "./register": "./lib/bootstrap/register.mjs"
+  },
   "files": [
     "lib/",
     "index.js"
@@ -31,7 +36,7 @@
     "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\""
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.6"
   },
   "dependencies": {
     "metautil": "file:../metautil",

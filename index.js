@@ -1,7 +1,8 @@
 'use strict';
 
 module.exports = {
-  ...require('./lib/FilesystemCache.js'),
-  ...require('./lib/PlacementSource.js'),
-  ...require('./lib/SharedCache.js'),
+  ...require('./lib/cache.js'),
+  ...require('./lib/config.js'),
+  ...require('./lib/place.js'),
+  ...require('./lib/kernel.js'),
 };
