@@ -24,7 +24,10 @@
   "exports": {
     ".": "./index.js",
     "./preload": "./lib/bootstrap/preload.cjs",
-    "./register": "./lib/bootstrap/register.mjs"
+    "./register": "./lib/bootstrap/register.mjs",
+    "./adapters/fs-patch": "./lib/adapters/fs-patch.js",
+    "./adapters/require-hook": "./lib/adapters/require-hook.js",
+    "./adapters/import-hook": "./lib/adapters/import-hook.mjs"
   },
   "files": [
     "lib/",

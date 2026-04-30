@@ -170,4 +170,53 @@ describe('VfsConfig', () => {
       }), /writeNamespace/);
     });
   });
+
+  describe('compile', () => {
+    it('auto-adds require to domains when compile is true', () => {
+      const config = new VfsConfig({
+        places: {
+          lib: {
+            domains: ['fs'],
+            match: { dir: 'lib' },
+            provider: 'sab',
+            ext: ['js'],
+            compile: true,
+          },
+        },
+      });
+      const lib = config.place('lib');
+      assert.ok(lib.domains.includes('require'));
+    });
+
+    it('does not duplicate require if already present', () => {
+      const config = new VfsConfig({
+        places: {
+          lib: {
+            domains: ['fs', 'require'],
+            match: { dir: 'lib' },
+            provider: 'sab',
+            ext: ['js'],
+            compile: true,
+          },
+        },
+      });
+      const lib = config.place('lib');
+      const count = lib.domains.filter((d) => d === 'require').length;
+      assert.equal(count, 1);
+    });
+
+    it('does not add require when compile is false', () => {
+      const config = new VfsConfig({
+        places: {
+          static: {
+            domains: ['fs'],
+            match: { dir: 'static' },
+            provider: 'sab',
+          },
+        },
+      });
+      const s = config.place('static');
+      assert.equal(s.domains.includes('require'), false);
+    });
+  });
 });

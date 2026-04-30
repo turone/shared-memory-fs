@@ -74,7 +74,7 @@ instructions, current branch code and this file win.
 
 - VFSKernel is the primary consumer-facing class. Consumers instantiate it with a
   frozen VfsConfig and call `initialize()`, `snapshot()`, `handleAck()`,
-  `handleWorkerExit()`, `seal()`, `watch()`, `close()`.
+  `handleWorkerExit()`, `watch()`, `close()`.
 - VFSKernel injects a Node.js reader using `fs.open()` and `fh.read()` into a
   Buffer view over SAB.
 - Config is parsed by VfsConfig; VFSKernel receives it frozen.
@@ -97,9 +97,27 @@ instructions, current branch code and this file win.
 - `compact()` may legitimately return `null`; this is not an error.
 - `#broadcast()` isolates projection errors from consumer callback errors via separate
   try/catch blocks.
-- `seal()` builds sealIndex; `#handleUpdate()` and `#handleDelete()` incrementally update
-  sealIndex via `#addToSealIndex()` / `#removeFromSealIndex()`.
+- `pathIndex` is built automatically by `initialize()` and `fromSnapshot()`; there is
+  no manual `seal()` step.
+- `pathIndex` maps absolute OS paths to `{ place, key, fileKey }` for O(1) dispatch.
+- `#handleUpdate()` and `#handleDelete()` incrementally update pathIndex via
+  `#addToPathIndex()` / `#removeFromPathIndex()`.
 - `close()` stops the watcher, clears all internal maps, resets state.
+
+### Worker-side kernel (fromSnapshot + handleDelta)
+
+- `VFSKernel.fromSnapshot(snapshot, config, options)` creates a read-only worker-side
+  kernel. It has no cache, no watcher, no ACK tracking.
+- `fromSnapshot()` builds `segmentsMap` from snapshot segments, projects filesystems via
+  `FilesystemCache.project()`, registers places via registry.
+- Worker-side kernel supports `resolveFsPath()`, `dispatchFsRead()`,
+  `dispatchModuleResolve()`, `dispatchModuleLoad()`.
+- `handleDelta(msg)` applies `file-update` or `file-delete` messages on the worker side.
+- `handleDelta` with `file-update`: registers new segments, projects entries via
+  `FilesystemCache.projectEntry()`, updates place `files` Map. Updates pathIndex.
+- `handleDelta` with `file-delete`: removes keys from projected files and pathIndex.
+- Workers must send `{ name: 'ack-update', updateId }` back to main thread after
+  processing each delta.
 
 ## Config Rules (lib/config.js)
 
@@ -107,18 +125,31 @@ instructions, current branch code and this file win.
   supports both binary and decimal units.
 - `fromArgv()` uses a SKIP sentinel to avoid double construction; `_setFromArgv` does not exist.
 - Config is deep-frozen after construction. No runtime mutation.
+- Per-place `compile: true` enables V8 bytecode generation for JS files in that place.
+- `compile: true` automatically adds `'require'` to `domains` if not already present.
 
 ## Place Rules (lib/place.js)
 
 - Place constructor takes `(name, config)` — no provider parameter.
 - `files` Map is a live reference set by VFSKernel after projection.
-- Methods: `readFile(key)`, `stat(key)`, `exists(key)`, `filePath(key)`, `list(prefix)`.
+- Methods: `readFile(key)`, `stat(key)`, `exists(key)`, `filePath(key)`, `list(prefix)`,
+  `createReadStream(key, options)`, `readBytecode(key)`.
+- `createReadStream(key, options)` returns a chunked `Readable` over SAB data (64KB chunks).
+  Supports `{ start, end }` for HTTP Range requests. Returns `null` for disk entries or
+  unknown keys. Zero-copy: each chunk is `Buffer.from(sab, offset, chunkSize)`.
+- `readBytecode(key)` returns the `data` Buffer from the companion `.cache` entry, or `null`.
 
 ## Adapter Rules
 
 - Adapters have no internal path dependencies — they only import Node.js built-ins.
-- `fs-patch.js` imports `node:fs`, `node:path`, `node:stream`.
-- `require-hook.js` imports `node:module`, `node:path`.
+- `fs-patch.js` imports `node:fs`, `node:path`.
+- `fs-patch.js` `patchedCreateReadStream` delegates to `Place.createReadStream()` for
+  chunked SAB streaming with range support.
+- `require-hook.js` imports `node:module`, `node:path`, `node:vm`.
+- `require-hook.js` patches both `Module._resolveFilename` and `Module.prototype._compile`.
+  If `place.readBytecode(key)` returns a Buffer, `_compile` wraps the source via
+  `Module.wrap()`, creates `vm.Script({ cachedData })`, and runs it. Falls back to
+  original `_compile` if `cachedDataRejected` or on error.
 - `import-hook.mjs` imports `node:url`, `node:path`, reads kernel from `process[Symbol.for('shared-memory-fs')]`.
 - Each adapter exposes `install(kernel)` and `uninstall()`.
 
@@ -136,6 +167,29 @@ instructions, current branch code and this file win.
 - Keep Place `files` consumer-visible behavior unchanged across refactors.
 - Keep `handleWorkerExit()` removing the dead worker from all pending ACK sets.
 - Keep `close()` releasing the watcher and clearing state.
+
+## Bytecode Cache Rules
+
+- V8 bytecode caching is opt-in per place via `compile: true` in place config.
+- `compile: true` automatically adds `'require'` to `domains` if missing — prevents
+  silent misconfiguration where bytecode is generated but never applied.
+- `compile` is a main-thread-only flag. `fromSnapshot()` ignores it — workers never
+  compile, they only consume projected bytecode from snapshot/delta.
+- Main thread compiles JS files via `vm.Script` + `Module.wrap()` + `createCachedData()`.
+- Bytecode is stored as companion SAB entries: source at `key`, bytecode at `key + '.cache'`.
+- `compileModules()` is called by `initialize()` after projection; it rebuilds projection
+  and updates place `files` Maps to include companion entries.
+- Companion `.cache` keys are excluded from `pathIndex` (no fs dispatch for `.cache`).
+- `#isCompilable(placementName, key)` checks `place.config.compile === true` and
+  `fileExt(key) === 'js'`.
+- Watch `#processChange`: after allocating updated source, reads source directly from
+  `cache.getSegment(entry.segmentId).sab` (not via `segmentsMap`, which isn't updated yet),
+  compiles bytecode, allocates companion entry, adds to epoch updates.
+- Watch `#processDelete`: removes companion `.cache` entry alongside source entry.
+- `snapshot()` naturally includes companion entries — workers receive bytecode via
+  `fromSnapshot()` and `handleDelta()`.
+- Bytecode is invalidated only by source change (recompile) or Node.js version change
+  (restart). Within a single process run, `cachedDataRejected` never occurs.
 
 ## Tests And Docs
 
