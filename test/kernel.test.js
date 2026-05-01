@@ -31,7 +31,10 @@ describe('VFSKernel', () => {
     fs.mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'static', 'index.html'), '<h1>VFS</h1>');
     fs.writeFileSync(path.join(tmpDir, 'static', 'style.css'), 'body{}');
-    fs.writeFileSync(path.join(tmpDir, 'api', 'handler.js'), 'module.exports={}');
+    fs.writeFileSync(
+      path.join(tmpDir, 'api', 'handler.js'),
+      'module.exports={}',
+    );
     fs.writeFileSync(
       path.join(tmpDir, 'lib', 'utils.js'),
       'module.exports = { sum: (a, b) => a + b };',
@@ -40,58 +43,69 @@ describe('VFSKernel', () => {
 
   after(() => rmDir(tmpDir));
 
-  const makeConfig = (extra = {}) => new VfsConfig({
-    defaults: {
-      memory: { limit: '10 mib', segment: '1 mib', maxFileSize: '512 kib' },
-      hooks: { fs: false, require: false, import: false, diagnostics: false },
-    },
-    places: {
-      static: {
-        domains: ['fs'],
-        match: { dir: 'static' },
-        provider: 'sab',
-        ext: ['html', 'css'],
+  const makeConfig = (extra = {}) =>
+    new VfsConfig({
+      defaults: {
+        memory: {
+          limit: '10 mib',
+          segmentSize: '1 mib',
+          maxFileSize: '512 kib',
+        },
+        hooks: { fs: false, require: false, import: false },
       },
-      api: {
-        domains: ['fs'],
-        match: { dir: 'api' },
-        provider: 'disk',
+      places: {
+        static: {
+          domains: ['fs'],
+          match: { dir: 'static' },
+          provider: 'sab',
+          ext: ['html', 'css'],
+        },
+        api: {
+          domains: ['fs'],
+          match: { dir: 'api' },
+          provider: 'disk',
+        },
+        ...extra,
       },
-      ...extra,
-    },
-  });
+    });
 
-  const makeCompileConfig = () => new VfsConfig({
-    defaults: {
-      memory: { limit: '10 mib', segment: '1 mib', maxFileSize: '512 kib' },
-      hooks: { fs: false, require: false, import: false, diagnostics: false },
-    },
-    places: {
-      static: {
-        domains: ['fs'],
-        match: { dir: 'static' },
-        provider: 'sab',
-        ext: ['html', 'css'],
+  const makeCompileConfig = () =>
+    new VfsConfig({
+      defaults: {
+        memory: {
+          limit: '10 mib',
+          segmentSize: '1 mib',
+          maxFileSize: '512 kib',
+        },
+        hooks: { fs: false, require: false, import: false },
       },
-      api: {
-        domains: ['fs'],
-        match: { dir: 'api' },
-        provider: 'disk',
+      places: {
+        static: {
+          domains: ['fs'],
+          match: { dir: 'static' },
+          provider: 'sab',
+          ext: ['html', 'css'],
+        },
+        api: {
+          domains: ['fs'],
+          match: { dir: 'api' },
+          provider: 'disk',
+        },
+        lib: {
+          domains: ['fs', 'require'],
+          match: { dir: 'lib' },
+          provider: 'sab',
+          ext: ['js'],
+          compile: true,
+        },
       },
-      lib: {
-        domains: ['fs', 'require'],
-        match: { dir: 'lib' },
-        provider: 'sab',
-        ext: ['js'],
-        compile: true,
-      },
-    },
-  });
+    });
 
-  const makeKernel = (config) => new VFSKernel(config, {
-    appRoot: tmpDir,
-    console: { debug() {}, error() {}, log() {}, warn() {} },
-  });
+  const makeKernel = (config) =>
+    new VFSKernel(config, {
+      appRoot: tmpDir,
+      console: { debug() {}, error() {}, log() {}, warn() {} },
+    });
 
   describe('initialize', () => {
     it('loads SAB-backed files into projected maps', async () => {
@@ -205,10 +219,12 @@ describe('VFSKernel', () => {
 
       // Directly allocate entry to simulate watch
       const { scan } = require('../lib/scanner.js');
-      const { files } = await scan(path.join(tmpDir, 'static'), { ext: ['html', 'css'] });
+      const { files } = await scan(path.join(tmpDir, 'static'), {
+        ext: ['html', 'css'],
+      });
       const newFile = files.get('/new.html');
       if (newFile) {
-        const entry = await kernel.cache.allocate('static', '/new.html', newFile);
+        await kernel.cache.allocate('static', '/new.html', newFile);
         // Simulate flushEpoch behavior
         const updateId = ++kernel.nextUpdateId;
         const pendingEntries = [];
@@ -321,11 +337,10 @@ describe('VFSKernel', () => {
       await kernel.initialize();
 
       // Allocate an entry
-      const entry = await kernel.cache.allocate(
-        'static',
-        '/temp.html',
-        { stat: { size: 10 }, path: path.join(tmpDir, 'static', 'index.html') },
-      );
+      await kernel.cache.allocate('static', '/temp.html', {
+        stat: { size: 10 },
+        path: path.join(tmpDir, 'static', 'index.html'),
+      });
 
       // Simulate trackUpdate via private access — just verify pendingFrees stays empty
       // since getWorkerIds returns []
@@ -374,7 +389,7 @@ describe('VFSKernel', () => {
       });
 
       const abs = path.resolve(tmpDir, 'static', 'index.html');
-      const resolved = worker.dispatchFsRead('readFile', abs);
+      const resolved = worker.resolveFsPath(abs);
       assert.ok(resolved);
       assert.equal(resolved.place.name, 'static');
 
@@ -423,10 +438,18 @@ describe('VFSKernel', () => {
         name: 'file-update',
         target: 'static',
         updateId: 1,
-        updates: [['/new.html', {
-          kind: 'shared', segmentId: 99, offset: 0, length: 6,
-          stat: { size: 6 },
-        }]],
+        updates: [
+          [
+            '/new.html',
+            {
+              kind: 'shared',
+              segmentId: 99,
+              offset: 0,
+              length: 6,
+              stat: { size: 6 },
+            },
+          ],
+        ],
         newSegments: [{ id: 99, sab }],
       });
 
@@ -505,7 +528,7 @@ describe('VFSKernel', () => {
       assert.ok(source.toString().includes('sum'));
 
       // Bytecode companion should exist
-      const bytecode = libPlace.readBytecode('/utils.js');
+      const bytecode = libPlace.getCachedData('/utils.js');
       assert.ok(Buffer.isBuffer(bytecode));
       assert.ok(bytecode.length > 0);
 
@@ -522,7 +545,7 @@ describe('VFSKernel', () => {
       const staticPlace = kernel.getPlace('static');
       assert.ok(staticPlace);
       // HTML files should have no bytecode
-      const bytecode = staticPlace.readBytecode('/index.html');
+      const bytecode = staticPlace.getCachedData('/index.html');
       assert.equal(bytecode, null);
 
       kernel.close();
@@ -536,7 +559,7 @@ describe('VFSKernel', () => {
 
       const libPlace = kernel.getPlace('lib');
       const source = libPlace.readFile('/utils.js').toString('utf8');
-      const bytecode = libPlace.readBytecode('/utils.js');
+      const bytecode = libPlace.getCachedData('/utils.js');
 
       const wrapped = Module.wrap(source);
       const script = new vm.Script(wrapped, {
@@ -577,7 +600,7 @@ describe('VFSKernel', () => {
       const source = libPlace.readFile('/utils.js');
       assert.ok(Buffer.isBuffer(source));
 
-      const bytecode = libPlace.readBytecode('/utils.js');
+      const bytecode = libPlace.getCachedData('/utils.js');
       assert.ok(Buffer.isBuffer(bytecode));
       assert.ok(bytecode.length > 0);
 

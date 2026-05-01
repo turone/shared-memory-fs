@@ -8,7 +8,10 @@ const os = require('node:os');
 const { scan, getKey } = require('../lib/scanner.js');
 
 const createTmpDir = () => {
-  const dir = path.join(os.tmpdir(), `vfs-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const dir = path.join(
+    os.tmpdir(),
+    `vfs-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 };
@@ -83,6 +86,22 @@ describe('scanner', () => {
           `unexpected: ${key}`,
         );
       }
+    });
+
+    it('returns aggregated skipped map', async () => {
+      const { skipped } = await scan(tmpDir, { ext: ['html'] });
+      assert.ok(skipped instanceof Map);
+      assert.ok(skipped.size > 0, 'expected non-html files to be tracked');
+      for (const [, bucket] of skipped) {
+        assert.ok(bucket.count > 0);
+        assert.ok(bucket.examples.length > 0);
+        assert.ok(bucket.examples.length <= 3);
+      }
+    });
+
+    it('skipped is empty when no ext filter', async () => {
+      const { skipped } = await scan(tmpDir);
+      assert.equal(skipped.size, 0);
     });
   });
 

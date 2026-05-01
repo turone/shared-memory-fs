@@ -1,199 +1,168 @@
 ---
-name: "VFS Architecture"
+name: 'VFS Architecture'
 branch: main
-description: "Use when modifying VFS kernel, SAB cache, scanner, config, places, adapters, bootstrap, allocation, compaction, ACK handling, delta broadcasting, tests, or documentation."
+description: 'Use when modifying VFS kernel, SAB cache, scanner, config, places, adapters, bootstrap, or tests.'
 applyTo: lib/**, index.js, test/**, doc/**
 ---
 
 # VFS Architecture
 
-Architecture for `shared-memory-fs` — a pooled SharedArrayBuffer virtual filesystem
-for Node.js worker_threads. When this file conflicts with older docs or top-level
-instructions, current branch code and this file win.
+`shared-memory-fs` — pooled SharedArrayBuffer virtual filesystem for Node.js
+worker_threads, plus optional fs / require / import hooks.
 
 ## Module Map
 
-- `lib/cache.js` — Pool + SegmentRegistry + FilesystemCache (SAB allocator).
-  Self-contained, no Node.js built-in or external dependencies.
-- `lib/scanner.js` — pure async directory scanner. `scan(rootPath, {ext, startPath})`
-  returns `{ files: Map<key,{stat,path}>, dirs: Set }`. `getKey(filePath, basePath)`
-  produces forward-slash keys.
-- `lib/config.js` — VfsConfig class. Config cascade (hardcoded defaults → app config →
-  per-place → CLI overrides), validation, deep freeze. SKIP sentinel for `fromArgv()`.
-- `lib/place.js` — Place class. Logical namespace that owns cached file data.
-  `files` Map is a live reference updated by kernel.
-- `lib/registry.js` — PlacementRegistry. Stores places, resolves domain+path → place.
-- `lib/policy.js` — PolicyEngine. Readonly enforcement, write deny, diagnostics logging.
-- `lib/kernel.js` — VFSKernel. Top-level facade and cache orchestrator. Directly owns
-  FilesystemCache, segmentsMap, projected Maps, watcher, ACK tracking.
-- `lib/adapters/fs-patch.js` — monkey-patches node:fs for VFS-managed files.
-- `lib/adapters/require-hook.js` — patches Module._resolveFilename for CJS require.
-- `lib/adapters/import-hook.mjs` — ESM loader hooks (resolve + load) via module.register.
-- `lib/bootstrap/preload.cjs` — CJS bootstrap entry point (--require).
-- `lib/bootstrap/register.mjs` — ESM bootstrap entry point (--import).
-- `index.js` — public API surface; re-exports FilesystemCache, VfsConfig, Place, VFSKernel.
+```
+lib/cache.js              Pool + SegmentRegistry + FilesystemCache (SAB allocator).
+                          No Node.js or external deps. Reader injected from kernel.
+lib/scanner.js            scan(rootPath, {ext, startPath}) → {files, dirs}; getKey().
+lib/config.js             VfsConfig: defaults → app → per-place → CLI; deep-frozen.
+lib/place.js              Place: logical namespace; live `files` Map updated by kernel.
+lib/registry.js           PlacementRegistry + helpers mountOf / absPathOf.
+                          Domain+path → place; mount → place; routeByMount(absPath).
+lib/kernel.js             VFSKernel: facade + orchestrator. Owns cache, projection,
+                          watcher, ACK tracking, bytecode compilation.
+lib/adapters/*            fs-patch.js, require-hook.js, import-hook.mjs.
+                          Each exposes install(kernel) / uninstall().
+lib/bootstrap/*           preload.cjs (--require), register.mjs (--import).
+lib/providers/*           [planned] memory.js (per-thread writable), sea.js (SEA assets).
+index.js                  Public API: FilesystemCache, VfsConfig, Place, VFSKernel.
+```
 
-## FilesystemCache Rules (lib/cache.js)
+## Naming
 
-- `FilesystemCache` is self-contained and has no Node.js built-in or external dependencies.
-- There is only one segment type: base segments.
-- There are no oversize dedicated segments.
-- `Pool` retains empty segments in `emptySegmentIds` and reuses them; segments are not
-  returned to the OS.
-- `baseSegmentSize = Math.ceil(maxFileSize / configured) * configured`.
-- `limit` should be evenly divisible by the effective `baseSegmentSize`; otherwise the
-  remainder is wasted.
-- `load()` sorts candidates by descending size before allocation.
-- `SegmentRegistry.allocate()` does: best-fit free extent, then tail append, then new
-  segment, else disk fallback.
-- Shared entries are internal metadata objects: `{ kind: 'shared', segmentId, offset, length, stat }`.
-- Disk entries are internal metadata objects: `{ kind: 'disk', path, stat, data: null }`.
-- `size > maxFileSize` always means disk entry.
-- Do not add Node.js built-in dependencies to this file.
+See `/memories/naming.md`. No tautological identifiers (no `place.placement`,
+`placementToPlace`, etc.). Prefer one source of truth and short field names.
 
-## Projection Rules
+## Invariants (must hold)
 
-- Worker-side projection is eager, not lazy.
-- `FilesystemCache.projectEntry()` creates `Buffer.from(segmentsMap.get(segmentId), offset, length)`
-  once at projection time.
-- Public shared files exposed through Place `files` are `{ data, stat }`.
-- Disk-backed files exposed through Place `files` are `{ data: null, stat, path }`.
-- Buffer views are lightweight descriptors over SAB and are garbage-collected when
-  projected file objects are removed.
+- **Zero-copy reads**: workers receive `Buffer.from(sab, offset, length)` views,
+  never per-worker copies of file data.
+- **Frozen config**: VfsConfig is deep-frozen after construction; no runtime mutation.
+- **ACK-before-free**: shared entries replaced/deleted by the main thread are freed
+  only after every live worker ACKs the corresponding `updateId`, or after a worker
+  exits and `handleWorkerExit()` removes it from pending sets.
+- **Segments stay**: empty segments are kept in `Pool.emptySegmentIds` for reuse,
+  never returned to the OS.
+- **Single segment type**: only `baseSegmentSize`-sized segments. Files larger than
+  `maxFileSize` always become disk entries.
+- **No collateral mutation during iteration**: `handleWorkerExit()` collects
+  updateIds first, then frees outside the loop.
+- **One source of truth per concept**: a place's mount lives in `place.config.match`;
+  derive everything else through `mountOf(place)` / `absPathOf()` / `registry.byMount`.
 
-## Scanner Rules (lib/scanner.js)
+## Cache (lib/cache.js)
 
-- `scan()` stores only `{ stat, path }` per file; data is read into SAB by the reader
-  injected from VFSKernel.
-- `startPath` option allows scanning a subdirectory with keys relative to `rootPath`.
-- Path normalization produces forward-slash keys on all platforms (including Windows).
-- `getKey()` must continue to return forward-slash keys for Windows paths.
-- Extension filtering uses `metautil.fileExt()` (returns without dot: `'html'` not `'.html'`).
+- Self-contained, no Node.js built-in or external deps.
+- `baseSegmentSize = ceil(maxFileSize / configured) * configured`.
+- `load()` sorts files by descending size before allocating (pack large first).
+- `SegmentRegistry.allocate()` order: best-fit free extent → tail of partial segment
+  → new segment → null (caller decides disk fallback).
+- Entries are internal records; do not leak shape to consumers — use Place API.
+- `compact(threshold)` may legitimately return null. Threshold is supplied by caller.
 
-## VFSKernel Rules (lib/kernel.js)
+## Kernel (lib/kernel.js)
 
-- VFSKernel is the primary consumer-facing class. Consumers instantiate it with a
-  frozen VfsConfig and call `initialize()`, `snapshot()`, `handleAck()`,
-  `handleWorkerExit()`, `watch()`, `close()`.
-- VFSKernel injects a Node.js reader using `fs.open()` and `fh.read()` into a
-  Buffer view over SAB.
-- Config is parsed by VfsConfig; VFSKernel receives it frozen.
-- `watch()` uses metawatch `before` / `change` / `delete` / `after` events to build epochs.
-- Placement routing in `watch()` is based on the first segment of the path relative to
-  the monitored directory root, not on absolute-path prefix matching.
-- `#processChange(ep, ...)` must receive the epoch explicitly; do not close over the
-  mutable `epoch` variable from async code.
-- `#flushEpoch()` emits at most one `file-update` and one `file-delete` per placement per epoch.
-- Old entries are tracked against the last `updateId` produced in the epoch.
-- There is no timeout-based forced free.
-- Old entries are freed only after all workers ACK or after `handleWorkerExit(workerId)`
-  removes a dead worker from pending sets.
-- `handleWorkerExit()` collects entries to free first, then processes them outside the
-  iteration loop (no Map mutation during iteration).
-- `#trackUpdate()` frees immediately when `getWorkerIds()` returns empty (single-process fix).
-- `#tryCompact()` runs after freeing entries.
-- `#tryCompact()` is batch-first: it may broadcast one `file-update` per placement, but
-  tracks `oldEntries` only once against the last `updateId` of the compaction batch.
-- `compact()` may legitimately return `null`; this is not an error.
-- `#broadcast()` isolates projection errors from consumer callback errors via separate
-  try/catch blocks.
-- `pathIndex` is built automatically by `initialize()` and `fromSnapshot()`; there is
-  no manual `seal()` step.
-- `pathIndex` maps absolute OS paths to `{ place, key, fileKey }` for O(1) dispatch.
-- `#handleUpdate()` and `#handleDelete()` incrementally update pathIndex via
-  `#addToPathIndex()` / `#removeFromPathIndex()`.
-- `close()` stops the watcher, clears all internal maps, resets state.
+- Consumer-facing class. Construct with frozen `VfsConfig`, then `await initialize()`.
+- Injects a Node.js reader using `fs.open()` + `fh.read()` into a Buffer view over SAB.
+- Watcher uses metawatch `before` / `change` / `delete` / `after` epoch events.
+- Watch routing goes through `registry.routeByMount(absPath)` — no duplicate logic.
+- `#processChange(ep, ...)` receives the epoch by reference; never close over a mutable
+  `epoch` variable from async code.
+- `#flushEpoch()` emits at most one `file-update` and one `file-delete` per mount per
+  epoch. Old entries are tracked against the last `updateId` of the epoch.
+- No timeout-based forced free.
+- `#trackUpdate()` frees immediately when no workers are registered.
+- `#tryCompact()` runs after freeing entries; tracks `oldEntries` only against the
+  last `updateId` of the compaction batch.
+- `#broadcast()` isolates projection errors from consumer-callback errors via
+  separate try/catch.
+- `pathIndex` (`absPath → {place, key, fileKey}`) is built automatically by
+  `initialize()` and `fromSnapshot()`. No manual seal step. Companion `.cache` keys
+  are excluded.
+- Projection is incremental: built once on init via `#projectMount()`, mutated
+  thereafter via `#projectInto()` / `#applyUpdate()` / `#applyDelete()`. No full
+  rebuild after compile.
+- `close()` stops the watcher and clears all internal maps.
 
-### Worker-side kernel (fromSnapshot + handleDelta)
+### Worker side
 
-- `VFSKernel.fromSnapshot(snapshot, config, options)` creates a read-only worker-side
-  kernel. It has no cache, no watcher, no ACK tracking.
-- `fromSnapshot()` builds `segmentsMap` from snapshot segments, projects filesystems via
-  `FilesystemCache.project()`, registers places via registry.
-- Worker-side kernel supports `resolveFsPath()`, `dispatchFsRead()`,
-  `dispatchModuleResolve()`, `dispatchModuleLoad()`.
-- `handleDelta(msg)` applies `file-update` or `file-delete` messages on the worker side.
-- `handleDelta` with `file-update`: registers new segments, projects entries via
-  `FilesystemCache.projectEntry()`, updates place `files` Map. Updates pathIndex.
-- `handleDelta` with `file-delete`: removes keys from projected files and pathIndex.
-- Workers must send `{ name: 'ack-update', updateId }` back to main thread after
-  processing each delta.
+- `VFSKernel.fromSnapshot(snapshot, config, options)` returns a read-only kernel:
+  no cache, no watcher, no ACK tracking. Builds segmentsMap, projects filesystems,
+  registers places, builds pathIndex.
+- `handleDelta(msg)` applies `file-update` / `file-delete` incrementally
+  (segments, projected files, pathIndex).
+- Workers send `{ name: 'ack-update', updateId }` after each delta.
 
-## Config Rules (lib/config.js)
+## Config (lib/config.js)
 
-- VfsConfig parses `limit`, `baseSegmentSize`, and `maxFileSize` via `sizeToBytes()` and
-  supports both binary and decimal units.
-- `fromArgv()` uses a SKIP sentinel to avoid double construction; `_setFromArgv` does not exist.
-- Config is deep-frozen after construction. No runtime mutation.
-- Per-place `compile: true` enables V8 bytecode generation for JS files in that place.
-- `compile: true` automatically adds `'require'` to `domains` if not already present.
+- Cascade: hardcoded `DEFAULTS` → `raw.defaults` → per-place → CLI overrides.
+- Sizes parsed by `metautil.sizeToBytes()` (binary and decimal units).
+- `fromArgv()` uses a `SKIP` sentinel to avoid double construction.
+- `compile: true` auto-adds `'require'` to `domains`. Main-thread-only flag —
+  workers ignore it.
+- Validation: domain, provider, match-type, dir/prefix overlap.
 
-## Place Rules (lib/place.js)
+Live config keys (Phase 1 baseline; Phases 3+ may extend):
 
-- Place constructor takes `(name, config)` — no provider parameter.
-- `files` Map is a live reference set by VFSKernel after projection.
-- Methods: `readFile(key)`, `stat(key)`, `exists(key)`, `filePath(key)`, `list(prefix)`,
-  `createReadStream(key, options)`, `readBytecode(key)`.
-- `createReadStream(key, options)` returns a chunked `Readable` over SAB data (64KB chunks).
-  Supports `{ start, end }` for HTTP Range requests. Returns `null` for disk entries or
-  unknown keys. Zero-copy: each chunk is `Buffer.from(sab, offset, chunkSize)`.
-- `readBytecode(key)` returns the `data` Buffer from the companion `.cache` entry, or `null`.
+```
+defaults.memory.{limit, segmentSize, maxFileSize}
+defaults.compaction.threshold
+defaults.hooks.{fs, require, import}
+defaults.watchTimeout
+places.<name>.{enabled, domains, match, provider, ext, maxFileSize, compile}
+```
 
-## Adapter Rules
+Removed in Phase 1 (do not reintroduce without a real consumer):
+`mode`, `gc.*`, `policy.*`, `readonly`, `writeNamespace`, `sab-write`, `hooks.diagnostics`.
 
-- Adapters have no internal path dependencies — they only import Node.js built-ins.
-- `fs-patch.js` imports `node:fs`, `node:path`.
-- `fs-patch.js` `patchedCreateReadStream` delegates to `Place.createReadStream()` for
-  chunked SAB streaming with range support.
-- `require-hook.js` imports `node:module`, `node:path`, `node:vm`.
-- `require-hook.js` patches both `Module._resolveFilename` and `Module.prototype._compile`.
-  If `place.readBytecode(key)` returns a Buffer, `_compile` wraps the source via
-  `Module.wrap()`, creates `vm.Script({ cachedData })`, and runs it. Falls back to
-  original `_compile` if `cachedDataRejected` or on error.
-- `import-hook.mjs` imports `node:url`, `node:path`, reads kernel from `process[Symbol.for('shared-memory-fs')]`.
-- Each adapter exposes `install(kernel)` and `uninstall()`.
+## Place (lib/place.js)
 
-## Public API
+- Constructor `(name, config)`. No provider parameter.
+- `files` is a live Map set by VFSKernel.
+- Read methods return `Buffer | null`, `stat | null`, `boolean`, `string | null`,
+  `string[]`, `Readable | null`.
+- `createReadStream(key, {start, end})` streams SAB data in 64 KB zero-copy chunks
+  (each chunk is `Buffer.from(sab, offset, chunkSize)`). Returns `null` for disk
+  entries or unknown keys.
+- Bytecode read: `place.getCachedData(key)` returns the companion `.cache` entry
+  buffer or null. Exact public name may evolve in Phase 2.
 
-- `VFSKernel` is the primary consumer-facing class.
-- `FilesystemCache` and scanner are exported for advanced consumers but their internal
-  APIs are not part of the public contract.
-- Keep placements configurable.
+## Adapters
 
-## Required Behavior
+- Adapters use `kernel.resolveFsPath(absPath)` for fs routing and
+  `kernel.dispatchModuleResolve / dispatchModuleLoad` for module routing.
+- `fs-patch.js` — patches read APIs; passthrough when `resolveFsPath` returns null
+  or the entry is disk-backed (`data === null`). Writable APIs not yet implemented.
+- `require-hook.js` — patches `Module._resolveFilename` and
+  `Module.prototype._compile`. When `place.getCachedData(key)` returns a buffer,
+  uses `vm.Script({ cachedData })` and falls back to original `_compile` on
+  rejection or error.
+- `import-hook.mjs` — `resolve` shortcuts to a `vfs:` URL when VFS owns the file;
+  `load` returns source for `vfs:` URLs.
+- Each adapter exports `install(kernel) / uninstall()` and stores the kernel in
+  module scope.
 
-- Do not reintroduce per-worker file copies.
-- Do not break `snapshot()`, delta broadcasting, ACK flow, or disk fallback semantics.
-- Keep Place `files` consumer-visible behavior unchanged across refactors.
-- Keep `handleWorkerExit()` removing the dead worker from all pending ACK sets.
-- Keep `close()` releasing the watcher and clearing state.
+## Bootstrap
 
-## Bytecode Cache Rules
+- `preload.cjs` (--require): synchronous; creates kernel, installs CJS hooks, does
+  NOT call `initialize()`. Consumer must initialize before spawning workers.
+- `register.mjs` (--import): top-level await; creates, initializes, installs all
+  hooks, logs ready count.
 
-- V8 bytecode caching is opt-in per place via `compile: true` in place config.
-- `compile: true` automatically adds `'require'` to `domains` if missing — prevents
-  silent misconfiguration where bytecode is generated but never applied.
-- `compile` is a main-thread-only flag. `fromSnapshot()` ignores it — workers never
-  compile, they only consume projected bytecode from snapshot/delta.
-- Main thread compiles JS files via `vm.Script` + `Module.wrap()` + `createCachedData()`.
-- Bytecode is stored as companion SAB entries: source at `key`, bytecode at `key + '.cache'`.
-- `compileModules()` is called by `initialize()` after projection; it rebuilds projection
-  and updates place `files` Maps to include companion entries.
-- Companion `.cache` keys are excluded from `pathIndex` (no fs dispatch for `.cache`).
-- `#isCompilable(placementName, key)` checks `place.config.compile === true` and
-  `fileExt(key) === 'js'`.
-- Watch `#processChange`: after allocating updated source, reads source directly from
-  `cache.getSegment(entry.segmentId).sab` (not via `segmentsMap`, which isn't updated yet),
-  compiles bytecode, allocates companion entry, adds to epoch updates.
-- Watch `#processDelete`: removes companion `.cache` entry alongside source entry.
-- `snapshot()` naturally includes companion entries — workers receive bytecode via
-  `fromSnapshot()` and `handleDelta()`.
-- Bytecode is invalidated only by source change (recompile) or Node.js version change
-  (restart). Within a single process run, `cachedDataRejected` never occurs.
+## Required Behavior (do not break)
+
+- No per-worker file copies.
+- No mutation of frozen config at runtime.
+- `snapshot()`, delta broadcasting, ACK flow, disk fallback semantics.
+- `handleWorkerExit()` removes the dead worker from all pending ACK sets.
+- `close()` releases watcher and clears state.
 
 ## Tests And Docs
 
-- Update tests when changing allocator, projection, ACK flow, watch batching, or
-  placement behavior.
-- Keep `doc/` documentation aligned with this branch implementation.
-- If architecture changes in this branch, update this file in the same change.
+- Update tests in the same change as allocator / projection / ACK / watch / placement
+  changes.
+- Keep `doc/` and `README.md` aligned with current branch.
+- Update this file when a stated invariant or a module's responsibilities change.
+- Do not document implementation details that are likely to drift; describe
+  contracts and invariants.

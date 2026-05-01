@@ -79,7 +79,9 @@ describe('FilesystemCache', () => {
       });
       await cache.load('fs1', new Map());
       const entry = await cache.allocate(
-        'fs1', '/a.js', makeFile('/a.js', 500),
+        'fs1',
+        '/a.js',
+        makeFile('/a.js', 500),
       );
       assert.equal(entry.kind, 'shared');
       assert.equal(entry.length, 500);
@@ -87,7 +89,9 @@ describe('FilesystemCache', () => {
       cache.free(entry);
       // After free, can reallocate in same space
       const entry2 = await cache.allocate(
-        'fs1', '/b.js', makeFile('/b.js', 300),
+        'fs1',
+        '/b.js',
+        makeFile('/b.js', 300),
       );
       assert.equal(entry2.kind, 'shared');
     });
@@ -222,7 +226,10 @@ describe('FilesystemCache', () => {
 
     it('projects empty shared entry', () => {
       const entry = {
-        kind: 'shared', segmentId: 0, offset: 0, length: 0,
+        kind: 'shared',
+        segmentId: 0,
+        offset: 0,
+        length: 0,
         stat: { size: 0 },
       };
       const projected = FilesystemCache.projectEntry(entry, new Map());
@@ -236,7 +243,10 @@ describe('FilesystemCache', () => {
       view.set([72, 101, 108, 108, 111]); // "Hello"
       const segmentsMap = new Map([[1, sab]]);
       const entry = {
-        kind: 'shared', segmentId: 1, offset: 0, length: 5,
+        kind: 'shared',
+        segmentId: 1,
+        offset: 0,
+        length: 5,
         stat: { size: 5 },
       };
       const projected = FilesystemCache.projectEntry(entry, segmentsMap);

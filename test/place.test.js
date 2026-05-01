@@ -25,7 +25,10 @@ describe('Place', () => {
       ['/big.bin', { data: null, stat: { size: 99999 }, path: '/tmp/big.bin' }],
       ['/sub/page.html', { data: Buffer.alloc(0), stat: { size: 0 } }],
       ['/handler.js', { data: Buffer.from(sab, 10, 4), stat: { size: 4 } }],
-      ['/handler.js.cache', { data: Buffer.from(sab, 14, 3), stat: { size: 3 } }],
+      [
+        '/handler.js.cache',
+        { data: Buffer.from(sab, 14, 3), stat: { size: 3 } },
+      ],
     ]);
     return place;
   };
@@ -49,22 +52,22 @@ describe('Place', () => {
     });
   });
 
-  describe('readBytecode', () => {
+  describe('getCachedData', () => {
     it('returns bytecode from companion .cache entry', () => {
       const place = makePlace();
-      const bc = place.readBytecode('/handler.js');
+      const bc = place.getCachedData('/handler.js');
       assert.ok(Buffer.isBuffer(bc));
       assert.equal(bc.length, 3);
     });
 
     it('returns null when no .cache companion exists', () => {
       const place = makePlace();
-      assert.equal(place.readBytecode('/index.html'), null);
+      assert.equal(place.getCachedData('/index.html'), null);
     });
 
     it('returns null for unknown key', () => {
       const place = makePlace();
-      assert.equal(place.readBytecode('/nope.js'), null);
+      assert.equal(place.getCachedData('/nope.js'), null);
     });
   });
 
@@ -151,7 +154,10 @@ describe('Place', () => {
 
     it('supports start/end range', async () => {
       const place = makePlace();
-      const stream = place.createReadStream('/index.html', { start: 1, end: 3 });
+      const stream = place.createReadStream('/index.html', {
+        start: 1,
+        end: 3,
+      });
       const data = await collect(stream);
       assert.equal(data.toString(), 'ell');
     });
@@ -176,9 +182,7 @@ describe('Place', () => {
       const chunks = [];
       const stream = place.createReadStream('/data.bin');
       stream.on('data', (chunk) => chunks.push(chunk));
-      const result = await collect(
-        place.createReadStream('/data.bin'),
-      );
+      const result = await collect(place.createReadStream('/data.bin'));
       assert.equal(result.length, size);
       assert.equal(result[0], 0);
       assert.equal(result[size - 1], (size - 1) & 0xff);
