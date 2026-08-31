@@ -107,7 +107,7 @@ requireHook.install(kernel);
 
 ```js
 places: {
-  domain: { domains: ['fs'], match: { dir: 'domain' },
+  domain: { domains: ['fs'], dir: 'domain',
             provider: 'sab', ext: ['js'], compile: true },
 }
 ```
@@ -155,14 +155,14 @@ const config = new VfsConfig({
   places: {
     tools: {
       domains: ['fs', 'require'],
-      match: { dir: 'tools' },
+      dir: 'tools',
       provider: 'sab',
       ext: ['js'],
       compile: true,
     },
     workspace: {
       domains: ['fs'],
-      match: { dir: 'workspace' },
+      dir: 'workspace',
       provider: 'memory',
     },
   },
@@ -179,6 +179,63 @@ fs.readFileSync('/abs/elsewhere/file'); // EACCES if under appRoot
 Memory places are per-thread, so concurrent agents in different workers
 cannot see each other's scratch state — true isolation without IPC.
 
+### Static server with pre-compressed assets
+
+```js
+const config = new VfsConfig({
+  places: {
+    static: {
+      domains: ['fs'],
+      dir: 'public',
+      provider: 'sab',
+      compress: {
+        encodings: ['br', 'gzip'],
+        options: { br: { level: 11 }, gzip: { level: 9 } },
+        ext: 'compressible',
+      },
+    },
+  },
+});
+```
+
+Every worker then answers from the same SAB bytes:
+
+```js
+const place = kernel.getPlace('static');
+
+const pick = (key, accept) => {
+  const stored = place.storedEncodings(key); // ['raw', 'br', 'gzip']
+  for (const encoding of ['br', 'gzip']) {
+    if (accept.includes(encoding) && stored.includes(encoding)) {
+      return encoding;
+    }
+  }
+  return 'raw';
+};
+
+const serve = (req, res, key) => {
+  const accept = req.headers['accept-encoding'] || '';
+  const encoding = pick(key, accept);
+  if (encoding === 'raw') {
+    const body = place.readFile(key);
+    res.writeHead(200, { 'Content-Length': body.length });
+    return void res.end(body);
+  }
+  const body = place.readFileCompressed(key, encoding);
+  res.writeHead(200, {
+    'Content-Encoding': encoding,
+    'Content-Length': body.length,
+    Vary: 'Accept-Encoding',
+  });
+  res.end(body);
+};
+```
+
+Parsing `Accept-Encoding` (q-values, `identity;q=0`, `*`) and choosing a
+preference order are the server's job: the library only reports what it holds.
+With `retainRaw: false` the `'raw'` branch has no SAB bytes — use
+`fs.createReadStream(place.filePath(key))` instead.
+
 ### Single-Executable Application bundling
 
 ```js
@@ -188,7 +245,7 @@ cannot see each other's scratch state — true isolation without IPC.
 
 const config = new VfsConfig({
   places: {
-    app: { domains: ['fs'], match: { dir: 'public' }, provider: 'sea' },
+    app: { domains: ['fs'], dir: 'public', provider: 'sea' },
   },
 });
 ```
@@ -202,7 +259,7 @@ during development.
 
 ```js
 places: {
-  gen: { domains: ['fs', 'require'], match: { dir: 'gen' },
+  gen: { domains: ['fs', 'require'], dir: 'gen',
          provider: 'memory', compile: true },
 }
 

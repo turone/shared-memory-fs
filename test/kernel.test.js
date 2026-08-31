@@ -56,13 +56,13 @@ describe('VFSKernel', () => {
       places: {
         static: {
           domains: ['fs'],
-          match: { dir: 'static' },
+          dir: 'static',
           provider: 'sab',
           ext: ['html', 'css'],
         },
         api: {
           domains: ['fs'],
-          match: { dir: 'api' },
+          dir: 'api',
           provider: 'disk',
         },
         ...extra,
@@ -82,18 +82,18 @@ describe('VFSKernel', () => {
       places: {
         static: {
           domains: ['fs'],
-          match: { dir: 'static' },
+          dir: 'static',
           provider: 'sab',
           ext: ['html', 'css'],
         },
         api: {
           domains: ['fs'],
-          match: { dir: 'api' },
+          dir: 'api',
           provider: 'disk',
         },
         lib: {
           domains: ['fs', 'require'],
-          match: { dir: 'lib' },
+          dir: 'lib',
           provider: 'sab',
           ext: ['js'],
           compile: true,
@@ -107,12 +107,46 @@ describe('VFSKernel', () => {
       console: { debug() {}, error() {}, log() {}, warn() {} },
     });
 
+  describe('per-place maxFileSize', () => {
+    const makeSizedConfig = (maxFileSize) =>
+      new VfsConfig({
+        defaults: {
+          memory: { limit: '10 mib', segmentSize: '1 mib', maxFileSize: 4 },
+        },
+        places: {
+          static: {
+            domains: ['fs'],
+            dir: 'static',
+            provider: 'sab',
+            ext: ['html', 'css'],
+            maxFileSize,
+          },
+        },
+      });
+
+    it('overrides the global limit for its own files', async () => {
+      const kernel = makeKernel(makeSizedConfig('1 mib'));
+      await kernel.initialize();
+      const place = kernel.getPlace('static');
+      assert.ok(Buffer.isBuffer(place.readFile('/index.html')));
+      kernel.close();
+    });
+
+    it('sends larger files to disk when the place limit is smaller', async () => {
+      const kernel = makeKernel(makeSizedConfig(4));
+      await kernel.initialize();
+      const place = kernel.getPlace('static');
+      assert.equal(place.readFile('/index.html'), null);
+      assert.ok(place.filePath('/index.html'));
+      kernel.close();
+    });
+  });
+
   describe('initialize', () => {
     it('loads SAB-backed files into projected maps', async () => {
       const kernel = makeKernel(makeConfig());
       await kernel.initialize();
       assert.equal(kernel.initialized, true);
-
       const staticPlace = kernel.getPlace('static');
       assert.ok(staticPlace);
       assert.ok(staticPlace.files.size >= 2);
@@ -579,7 +613,7 @@ describe('VFSKernel', () => {
       assert.ok(snap.filesystems.lib);
       const entries = new Map(snap.filesystems.lib.entries);
       assert.ok(entries.has('/utils.js'));
-      assert.ok(entries.has('/utils.js.cache'));
+      assert.ok(entries.has('/utils.js\u0000cache'));
 
       kernel.close();
     });
@@ -608,12 +642,11 @@ describe('VFSKernel', () => {
       worker.close();
     });
 
-    it('pathIndex excludes .cache companion keys', async () => {
+    it('pathIndex excludes bytecode companion keys', async () => {
       const kernel = makeKernel(makeCompileConfig());
       await kernel.initialize();
 
-      // .cache keys should not be in pathIndex
-      const cacheAbs = path.resolve(tmpDir, 'lib', 'utils.js.cache');
+      const cacheAbs = path.resolve(tmpDir, 'lib', 'utils.js\u0000cache');
       assert.equal(kernel.pathIndex.has(cacheAbs), false);
 
       // But source key should be

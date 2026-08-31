@@ -18,10 +18,10 @@ const buildKernel = async () => {
       hooks: { fs: false, require: false, import: false },
     },
     places: {
-      mem: { domains: ['fs'], match: { dir: 'mem' }, provider: 'memory' },
+      mem: { domains: ['fs'], dir: 'mem', provider: 'memory' },
       stat: {
         domains: ['fs'],
-        match: { dir: 'stat' },
+        dir: 'stat',
         provider: 'sab',
       },
     },

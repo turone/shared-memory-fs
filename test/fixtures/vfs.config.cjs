@@ -8,7 +8,7 @@ module.exports = {
   places: {
     static: {
       domains: ['fs'],
-      match: { dir: 'static' },
+      dir: 'static',
       provider: 'sab',
     },
   },

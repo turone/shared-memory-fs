@@ -30,12 +30,12 @@ const config = new VfsConfig({
   places: {
     'tenant-a': {
       domains: ['fs', 'require'],
-      match: { dir: 'tenant-a' },
+      dir: 'tenant-a',
       provider: 'memory',
     },
     'tenant-b': {
       domains: ['fs', 'require'],
-      match: { dir: 'tenant-b' },
+      dir: 'tenant-b',
       provider: 'memory',
     },
   },

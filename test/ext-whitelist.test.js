@@ -28,7 +28,7 @@ const baseConfig = (extOnExtra) =>
     places: {
       static: {
         domains: ['fs'],
-        match: { dir: 'static' },
+        dir: 'static',
         provider: 'sab',
         ext: ['html', 'css'],
         extOnExtra,
@@ -97,7 +97,7 @@ describe('ext whitelist diagnostics', () => {
           places: {
             x: {
               domains: ['fs'],
-              match: { dir: 'x' },
+              dir: 'x',
               ext: ['js'],
               extOnExtra: 'shout',
             },
@@ -114,7 +114,7 @@ const memoryConfig = (extOnExtra) =>
     places: {
       mem: {
         domains: ['fs'],
-        match: { dir: 'mem' },
+        dir: 'mem',
         provider: 'memory',
         ext: ['js'],
         extOnExtra,
@@ -199,7 +199,7 @@ describe('ext whitelist: SEA loader', () => {
       places: {
         bundle: {
           domains: ['fs'],
-          match: { dir: 'pub' },
+          dir: 'pub',
           provider: 'sea',
           ext: ['html'],
           extOnExtra,

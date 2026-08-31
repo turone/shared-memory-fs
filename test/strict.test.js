@@ -20,7 +20,7 @@ const baseConfig = (extra = {}) =>
       ...extra,
     },
     places: {
-      mem: { domains: ['fs'], match: { dir: 'mem' }, provider: 'memory' },
+      mem: { domains: ['fs'], dir: 'mem', provider: 'memory' },
     },
   });
 
@@ -58,7 +58,7 @@ describe('strict sandbox mode', () => {
       new VfsConfig({
         defaults: { hooks: { fs: false, require: false, import: false } },
         places: {
-          mem: { domains: ['fs'], match: { dir: 'mem' }, provider: 'memory' },
+          mem: { domains: ['fs'], dir: 'mem', provider: 'memory' },
         },
       }),
       { appRoot: APP_ROOT },

@@ -18,10 +18,15 @@ lib/cache.js              Pool + SegmentRegistry + FilesystemCache (SAB allocato
 lib/scanner.js            scan(rootPath, {ext, startPath}) → {files, dirs}; getKey().
 lib/config.js             VfsConfig: defaults → app → per-place → CLI; deep-frozen.
 lib/place.js              Place: logical namespace; live `files` Map updated by kernel.
-lib/registry.js           PlacementRegistry + helpers mountOf / absPathOf.
+lib/registry.js           PlacementRegistry + helper absPathOf.
                           Domain+path → place; mount → place; routeByMount(absPath).
 lib/kernel.js             VFSKernel: facade + orchestrator. Owns cache, projection,
-                          watcher, ACK tracking, bytecode compilation.
+                          watcher, ACK tracking.
+lib/module-cache.js       ModuleCache: V8 bytecode compilation (companion entries).
+                          Deps injected: { cache, projectInto }. No kernel back-ref.
+lib/compression-cache.js  CompressionCache: gzip/deflate/br/zstd representations.
+                          Deps injected: { cache, projectInto, console }.
+lib/companion.js          NUL-separated companion keys: `<source>\0<tag>`.
 lib/adapters/*            fs-patch.js, require-hook.js, import-hook.mjs.
                           Each exposes install(kernel) / uninstall().
 lib/bootstrap/*           preload.cjs (--require), register.mjs (--import).
@@ -48,8 +53,16 @@ See `/memories/naming.md`. No tautological identifiers (no `place.placement`,
   `maxFileSize` always become disk entries.
 - **No collateral mutation during iteration**: `handleWorkerExit()` collects
   updateIds first, then frees outside the loop.
-- **One source of truth per concept**: a place's mount lives in `place.config.match`;
-  derive everything else through `mountOf(place)` / `absPathOf()` / `registry.byMount`.
+- **One source of truth per concept**: a place's mount lives in `place.mount` (from `config.dir`);
+  derive everything else through `place.mount` / `absPathOf()` / `registry.byMount`.
+- **Companions are internal**: bytecode and compressed representations live under
+  `<source>\0<tag>` keys. Never expose them through `list()`, `exists()`, the path
+  index or the patched `fs`; the NUL separator keeps them from colliding with files.
+- **No mixed versions**: a source and its representations are published in one
+  `file-update`. A representation that fails to rebuild is invalidated through
+  `removals` in that same message, never in a separate delete.
+- **No bogus entries**: compressed bytes exist only in memory, so they are allocated
+  with `{ fallback: false }` — a disk entry would point at the raw file.
 
 ## Cache (lib/cache.js)
 
@@ -78,7 +91,7 @@ See `/memories/naming.md`. No tautological identifiers (no `place.placement`,
 - `#broadcast()` isolates projection errors from consumer-callback errors via
   separate try/catch.
 - `pathIndex` (`absPath → {place, key, fileKey}`) is built automatically by
-  `initialize()` and `fromSnapshot()`. No manual seal step. Companion `.cache` keys
+  `initialize()` and `fromSnapshot()`. No manual seal step. Companion keys
   are excluded.
 - Projection is incremental: built once on init via `#projectMount()`, mutated
   thereafter via `#projectInto()` / `#applyUpdate()` / `#applyDelete()`. No full
@@ -101,7 +114,11 @@ See `/memories/naming.md`. No tautological identifiers (no `place.placement`,
 - `fromArgv()` uses a `SKIP` sentinel to avoid double construction.
 - `compile: true` auto-adds `'require'` to `domains`. Main-thread-only flag —
   workers ignore it.
-- Validation: domain, provider, match-type, dir/prefix overlap.
+- Validation: domain, provider, dir required, dir overlap per domain.
+- `compress` resolves to `{ codecs: [{encoding, options}], ext, retainRaw }`.
+  `options: null` means the codec runs with native zlib defaults — the library
+  never injects its own level. Compression requires provider `sab`;
+  `retainRaw: false` is incompatible with `compile`.
 
 Live config keys (Phase 1 baseline; Phases 3+ may extend):
 
@@ -110,7 +127,8 @@ defaults.memory.{limit, segmentSize, maxFileSize}
 defaults.compaction.threshold
 defaults.hooks.{fs, require, import}
 defaults.watchTimeout
-places.<name>.{enabled, domains, match, provider, ext, maxFileSize, compile}
+places.<name>.{enabled, domains, dir, provider, ext, maxFileSize, compile}
+places.<name>.compress.{encodings, options, ext, retainRaw}
 ```
 
 Removed in Phase 1 (do not reintroduce without a real consumer):

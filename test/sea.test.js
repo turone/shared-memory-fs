@@ -19,7 +19,7 @@ const mockSea = (assets) => ({
 const APP_ROOT = path.resolve('/tmp/vfs-sea-test');
 
 describe('SEA provider', () => {
-  it('loads matching assets into a SAB place under match.dir', async () => {
+  it('loads matching assets into a SAB place under dir', async () => {
     const sea = mockSea({
       'public/index.html': '<h1>SEA</h1>',
       'public/style.css': 'body{color:#000}',
@@ -38,7 +38,7 @@ describe('SEA provider', () => {
       places: {
         public: {
           domains: ['fs'],
-          match: { dir: 'public' },
+          dir: 'public',
           provider: 'sea',
         },
       },
@@ -71,7 +71,7 @@ describe('SEA provider', () => {
         hooks: { fs: false, require: false, import: false },
       },
       places: {
-        a: { domains: ['fs'], match: { dir: 'assets' }, provider: 'sea' },
+        a: { domains: ['fs'], dir: 'assets', provider: 'sea' },
       },
     });
     const kernel = new VFSKernel(config, {
@@ -108,7 +108,7 @@ describe('SEA provider', () => {
         hooks: { fs: false, require: false, import: false },
       },
       places: {
-        pub: { domains: ['fs'], match: { dir: 'pub' }, provider: 'sea' },
+        pub: { domains: ['fs'], dir: 'pub', provider: 'sea' },
       },
     });
     const main = new VFSKernel(config, {
@@ -142,7 +142,7 @@ describe('SEA provider', () => {
         hooks: { fs: false, require: false, import: false },
       },
       places: {
-        e: { domains: ['fs'], match: { dir: 'e' }, provider: 'sea' },
+        e: { domains: ['fs'], dir: 'e', provider: 'sea' },
       },
     });
     const kernel = new VFSKernel(config, {

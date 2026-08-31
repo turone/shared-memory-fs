@@ -43,7 +43,7 @@ const buildKernel = async () => {
     places: {
       esm: {
         domains: ['fs', 'import'],
-        match: { dir: 'esm' },
+        dir: 'esm',
         provider: 'sab',
       },
     },

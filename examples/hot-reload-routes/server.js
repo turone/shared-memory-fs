@@ -31,7 +31,7 @@ const config = new VfsConfig({
   places: {
     routes: {
       domains: ['fs', 'require'],
-      match: { dir: 'routes' },
+      dir: 'routes',
       provider: 'memory',
     },
   },

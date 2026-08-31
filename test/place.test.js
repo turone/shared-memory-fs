@@ -14,7 +14,7 @@ const collect = (stream) =>
 
 describe('Place', () => {
   const makePlace = () => {
-    const config = { name: 'static', match: { dir: 'static' } };
+    const config = { name: 'static', dir: 'static' };
     const place = new Place('static', config);
     const sab = new SharedArrayBuffer(1024);
     const view = new Uint8Array(sab, 0, 5);
@@ -26,7 +26,7 @@ describe('Place', () => {
       ['/sub/page.html', { data: Buffer.alloc(0), stat: { size: 0 } }],
       ['/handler.js', { data: Buffer.from(sab, 10, 4), stat: { size: 4 } }],
       [
-        '/handler.js.cache',
+        '/handler.js\u0000cache',
         { data: Buffer.from(sab, 14, 3), stat: { size: 3 } },
       ],
     ]);
@@ -53,14 +53,14 @@ describe('Place', () => {
   });
 
   describe('getCachedData', () => {
-    it('returns bytecode from companion .cache entry', () => {
+    it('returns bytecode from bytecode companion entry', () => {
       const place = makePlace();
       const bc = place.getCachedData('/handler.js');
       assert.ok(Buffer.isBuffer(bc));
       assert.equal(bc.length, 3);
     });
 
-    it('returns null when no .cache companion exists', () => {
+    it('returns null when no bytecode companion exists', () => {
       const place = makePlace();
       assert.equal(place.getCachedData('/index.html'), null);
     });
@@ -114,10 +114,11 @@ describe('Place', () => {
   });
 
   describe('list', () => {
-    it('lists all keys with default prefix', () => {
+    it('lists all keys with default prefix, hiding companions', () => {
       const place = makePlace();
       const keys = place.list('/');
-      assert.equal(keys.length, 6);
+      assert.equal(keys.length, 5);
+      assert.ok(keys.every((k) => !k.includes('\u0000')));
     });
 
     it('filters by prefix', () => {
@@ -170,7 +171,7 @@ describe('Place', () => {
     });
 
     it('streams large buffer in multiple chunks', async () => {
-      const config = { name: 'big', match: { dir: 'big' } };
+      const config = { name: 'big', dir: 'big' };
       const place = new Place('big', config);
       const size = 200000; // > 64KB * 3
       const sab = new SharedArrayBuffer(size);

@@ -19,7 +19,7 @@ const makeKernel = (extraPlace = {}) => {
     places: {
       tmp: {
         domains: ['fs'],
-        match: { dir: 'tmp' },
+        dir: 'tmp',
         provider: 'memory',
         ...extraPlace,
       },
@@ -96,7 +96,7 @@ describe('Memory provider', () => {
         places: {
           static: {
             domains: ['fs'],
-            match: { dir: 'static' },
+            dir: 'static',
             provider: 'sab',
           },
         },
@@ -161,7 +161,7 @@ describe('Memory provider', () => {
       const config = new VfsConfig({
         defaults: { memory: { limit: '1 mib', segmentSize: '64 kib' } },
         places: {
-          ro: { domains: ['fs'], match: { dir: 'ro' }, provider: 'sab' },
+          ro: { domains: ['fs'], dir: 'ro', provider: 'sab' },
         },
       });
       const kernel = new VFSKernel(config, { appRoot: APP_ROOT });
@@ -176,7 +176,7 @@ describe('Memory provider', () => {
   });
 
   describe('compile auto-bytecode', () => {
-    it('generates .cache companion on JS write', async () => {
+    it('generates bytecode companion on JS write', async () => {
       const kernel = makeKernel({ domains: ['fs', 'require'], compile: true });
       await kernel.initialize();
       const place = kernel.getPlace('tmp');
@@ -203,7 +203,7 @@ describe('Memory provider', () => {
       kernel.close();
     });
 
-    it('removes .cache on unlink', async () => {
+    it('removes bytecode companion on unlink', async () => {
       const kernel = makeKernel({ domains: ['fs', 'require'], compile: true });
       await kernel.initialize();
       const place = kernel.getPlace('tmp');
@@ -211,7 +211,7 @@ describe('Memory provider', () => {
       assert.ok(place.getCachedData('/x.js'));
       place.unlink('/x.js');
       assert.equal(place.getCachedData('/x.js'), null);
-      assert.equal(place.exists('/x.js.cache'), false);
+      assert.equal(place.files.has('/x.js\u0000cache'), false);
       kernel.close();
     });
   });
@@ -235,7 +235,7 @@ describe('Memory provider', () => {
       const config = new VfsConfig({
         defaults: { memory: { limit: '1 mib', segmentSize: '64 kib' } },
         places: {
-          tmp: { domains: ['fs'], match: { dir: 'tmp' }, provider: 'memory' },
+          tmp: { domains: ['fs'], dir: 'tmp', provider: 'memory' },
         },
       });
       const worker = VFSKernel.fromSnapshot(snap, config, {

@@ -4,6 +4,7 @@
 purpose-built preset that solves a narrow set of real production problems:
 
 - worker_threads paying repeated parse/IO cost on the same files
+- static assets recompressed on every response instead of once at boot
 - single-executable applications (Node SEA) needing to serve embedded assets
 - runtime code generation (AI agents, hot-reload) that must be `require`-able
 - multi-tenant runtimes that need a hard `appRoot` whitelist
@@ -17,6 +18,7 @@ ecosystem as of 2026.
 | -------------------------------------- | -------------------------------------------------- | ---------------------------------- | ------------------------ |
 | Cross-thread shared bytes (SAB)        | **Yes**                                            | No                                 | No                       |
 | V8 bytecode cache shared between WTs   | **Yes** (`compile: true`)                          | No                                 | No                       |
+| Pre-compressed representations in SAB  | **Yes** (`compress: {...}`)                        | No                                 | No                       |
 | `provider: 'sea'` (node:sea assets)    | **Yes**                                            | No                                 | No                       |
 | Multiple mounts in one instance        | **Yes** (`places: {...}`)                          | No (one `mount(prefix)` at a time) | n/a (no mount concept)   |
 | Per-mount ext whitelist + policy       | **Yes** (`ext` + `extOnExtra`)                     | No                                 | No                       |
@@ -72,12 +74,30 @@ dozens of `application/lib/*.js` × `n` workers that's literal milliseconds
 per file × n on every spawn.
 
 Our [`compile: true`](../README.md#bytecode--compile-true) per-place
-generates V8 bytecode at init, stores it as a `<key>.cache` companion
-entry in the same SAB segment. Workers `vm.Script({ cachedData })` it
-zero-copy; `script.cachedDataRejected === false` confirmed in
+generates V8 bytecode at init, stores it as a companion entry in the same
+SAB segment. Workers `vm.Script({ cachedData })` it zero-copy;
+`script.cachedDataRejected === false` confirmed in
 [test/adapter-require.test.js](../test/adapter-require.test.js).
 
-#### 3. No SEA provider
+#### 3. No pre-compressed representations
+
+A VFS that only holds raw bytes leaves compression to the response path,
+which means either compressing the same asset on every request or bolting
+on a separate cache. Neither `@platformatic/vfs` nor `memfs` has a notion
+of several encodings of one file.
+
+Our `compress: { encodings: ['br', 'gzip'] }` builds each representation
+once during `initialize()` and stores it in SAB next to the source, so
+every worker answers from the same bytes with zero copies and zero CPU
+per request. `retainRaw: false` drops the uncompressed copy from memory
+entirely when only compressed responses are served. Representations are
+republished atomically with their source on watcher changes and freed only
+after ACK — see [test/compression.test.js](../test/compression.test.js).
+
+HTTP negotiation stays in the server: the library reports what it holds
+via `place.storedEncodings(key)` and never inspects `Accept-Encoding`.
+
+#### 4. No SEA provider
 
 There is no `provider: 'sea'` analogue. Their `RealFSProvider` sandboxes
 to a real directory; `MemoryProvider` is empty at boot. Loading
@@ -88,7 +108,7 @@ maps each prefix-matched key to a Place file key, copies the asset bytes
 into SAB. Tested in [test/sea.test.js](../test/sea.test.js); demoed in
 [examples/sea-static/](../examples/sea-static/).
 
-#### 4. Single-mount model
+#### 5. Single-mount model
 
 `vfs.mount('/prefix')` activates one prefix at a time; multi-tenant
 deployments need multiple `create()` instances and multiple mount points
@@ -99,9 +119,9 @@ We model mounts as **first-class config**:
 ```js
 new VfsConfig({
   places: {
-    'tenant-a': { match: { dir: 'tenant-a' }, provider: 'memory', ... },
-    'tenant-b': { match: { dir: 'tenant-b' }, provider: 'memory', ... },
-    'static':   { match: { dir: 'public'  }, provider: 'sab',    ... },
+    'tenant-a': { dir: 'tenant-a', provider: 'memory', ... },
+    'tenant-b': { dir: 'tenant-b', provider: 'memory', ... },
+    'static':   { dir: 'public', provider: 'sab',    ... },
   },
 });
 ```
@@ -110,7 +130,7 @@ A single `PlacementRegistry` routes any path to the right place via
 `routeByMount(absPath)` — used by fs-patch, require-hook, import-hook,
 and watcher uniformly.
 
-#### 5. No per-mount extension whitelist
+#### 6. No per-mount extension whitelist
 
 If `MemoryProvider` is fed `.bak`, `.tmp`, or `.swp` files, they live in
 the VFS forever. There is no policy for "this mount serves only `.html`
@@ -121,7 +141,7 @@ applies uniformly across scanner init, SEA loader init, memory
 `writeFile`, and watcher single-file changes — see
 [test/ext-whitelist.test.js](../test/ext-whitelist.test.js).
 
-#### 6. Strict sandbox is coarse
+#### 7. Strict sandbox is coarse
 
 Their `overlay: false` mode means "fall through to real fs only for what
 exists in the VFS." Anything outside the VFS gets passed to real fs
@@ -134,7 +154,7 @@ paths outside `appRoot` pass through untouched. See
 [examples/multi-tenant/](../examples/multi-tenant/) and
 [test/strict.test.js](../test/strict.test.js).
 
-#### 7. Persistent SqliteProvider is a separate axis
+#### 8. Persistent SqliteProvider is a separate axis
 
 `@platformatic/vfs` ships `SqliteProvider` for persistence across
 process restarts. We do not have an equivalent today. For our target
@@ -163,14 +183,15 @@ in-memory `fs` that you patch in for the duration of a test. It is not
 meant to be a runtime production VFS for a multi-thread server, which is
 exactly the gap we fill.
 
-| Concern                       | shared-memory-fs  | memfs                |
-| ----------------------------- | ----------------- | -------------------- |
-| Cross-thread shared bytes     | Yes               | No                   |
-| Bytecode cache                | Yes               | No                   |
-| SEA / single-executable       | Yes               | No                   |
-| Per-mount routing + whitelist | Yes               | No                   |
-| Module hooks (require/import) | Yes               | Via `unionfs`/manual |
-| Use as test mock              | Possible (memory) | **Designed for it**  |
+| Concern                        | shared-memory-fs  | memfs                |
+| ------------------------------ | ----------------- | -------------------- |
+| Cross-thread shared bytes      | Yes               | No                   |
+| Bytecode cache                 | Yes               | No                   |
+| Pre-compressed representations | Yes               | No                   |
+| SEA / single-executable        | Yes               | No                   |
+| Per-mount routing + whitelist  | Yes               | No                   |
+| Module hooks (require/import)  | Yes               | Via `unionfs`/manual |
+| Use as test mock               | Possible (memory) | **Designed for it**  |
 
 If you need a quick test fixture, `memfs` is a one-liner and we are
 overkill. If you need to ship a multi-worker production server with
@@ -195,9 +216,9 @@ We are intentionally **narrower** than `@platformatic/vfs`.
 
 `@platformatic/vfs` is becoming `node:vfs`; its job is to expose the full
 filesystem contract. Our job is to be a focused **multi-thread / SEA /
-bytecode preset** that solves the four real problems listed at the top
-of this document, with as little code as possible (~3000 LOC,
-167 tests).
+bytecode / compression preset** that solves the real problems listed at
+the top of this document, with as little code as possible (~3500 LOC,
+209 tests).
 
 When `node:vfs` lands (or for users of `@platformatic/vfs` today), the
 natural integration shape is a thin adapter:

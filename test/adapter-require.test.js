@@ -44,13 +44,13 @@ const buildKernel = async (extra = {}) => {
     places: {
       code: {
         domains: ['fs', 'require'],
-        match: { dir: 'code' },
+        dir: 'code',
         provider: 'sab',
         ...extra,
       },
       mem: {
         domains: ['fs', 'require'],
-        match: { dir: 'mem' },
+        dir: 'mem',
         provider: 'memory',
       },
     },

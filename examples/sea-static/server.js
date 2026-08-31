@@ -31,7 +31,7 @@ const config = new VfsConfig({
   places: {
     pub: {
       domains: ['fs'],
-      match: { dir: 'pub' },
+      dir: 'pub',
       provider: isSea ? 'sea' : 'sab',
       ext: ['html', 'css', 'js', 'svg', 'json'],
       extOnExtra: 'warn',

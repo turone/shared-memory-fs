@@ -39,7 +39,7 @@
     "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\""
   },
   "engines": {
-    "node": ">=20.6"
+    "node": ">=22.15.0"
   },
   "dependencies": {
     "metautil": "file:../metautil",
