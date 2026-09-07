@@ -235,9 +235,9 @@ without the router ever touching the disk. Consequences to design around:
 
 ## Tests And Docs
 
-- `node --test test/*.test.js` (176 tests; one symlink test skips where links are
-  unavailable, the 8.3-alias tests skip off Windows). `npm run lint` = eslint +
-  prettier. Bootstrap and hooks tests use
+- Use `npm test` for the complete suite. A symlink test may skip where test
+  symlinks are unavailable; the 8.3-alias tests skip off Windows.
+  `npm run lint` = eslint + prettier. Bootstrap and hooks tests use
   child processes / workers — never install hooks in the runner process without
   uninstalling in `after`.
 - CI runs both on Linux and Windows across Node 22.22.3 / 22.x / 24.12.0 /

@@ -219,8 +219,8 @@ We are intentionally **narrower** than `@platformatic/vfs`.
 `@platformatic/vfs` is becoming `node:vfs`; its job is to expose the full
 filesystem contract. Our job is to be a focused **multi-thread / SEA /
 bytecode / compression preset** that solves the real problems listed at
-the top of this document, with as little code as possible (~3500 LOC,
-172 tests).
+the top of this document, with as little code as possible (~3500 LOC
+and a focused test suite).
 
 When `node:vfs` lands (or for users of `@platformatic/vfs` today), the
 natural integration shape is a thin adapter:

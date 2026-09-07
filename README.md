@@ -512,9 +512,11 @@ npm test        # node --test "test/*.test.js"
 npm run lint    # eslint + prettier
 ```
 
-172 tests covering config, cache, scanner, place, kernel, module hooks,
-fs-patch, compression, SEA, watcher, bootstrap. One symlink test skips
-where links are unavailable.
+Run the complete test suite with `npm test`. The suite covers
+configuration, cache allocation, scanner, places, routing, module hooks,
+compression, SEA, watcher, bootstrap, workers and strict sandbox
+behavior. The symlink test may be skipped on platforms where test
+symlinks are unavailable.
 
 ## Support
 
