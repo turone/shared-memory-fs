@@ -5,272 +5,301 @@ const assert = require('node:assert/strict');
 const { FilesystemCache } = require('../lib/cache.js');
 
 const KB = 1024;
-const MB = 1024 * KB;
+const make = (options = {}) =>
+  new FilesystemCache({
+    limit: 16 * KB,
+    segmentSize: 4 * KB,
+    maxFileSize: 2 * KB,
+    ...options,
+  });
 
-const makeReader = () => async (filePath, sab, offset, size) => {
-  const view = new Uint8Array(sab, offset, size);
-  const buf = Buffer.from(filePath, 'utf8');
-  view.set(buf.subarray(0, size));
-};
+const buf = (size, fill = 'a') => Buffer.alloc(size, fill);
+const input = (size, fill) => ({
+  data: buf(size, fill),
+  stat: { size, mtimeMs: 1 },
+});
+const files = (spec) =>
+  new Map(Object.entries(spec).map(([k, n]) => [k, input(n)]));
 
-const makeFile = (name, size) => ({
-  stat: { size },
-  path: name,
+const bytes = (cache, entry) =>
+  Buffer.from(
+    cache.getSegment(entry.segmentId).sab,
+    entry.offset,
+    entry.length,
+  );
+
+describe('FilesystemCache: load', () => {
+  it('packs large files first and keeps the entry map', async () => {
+    const cache = make();
+    const index = await cache.load(
+      'p',
+      files({ '/a': 100, '/b': 2000, '/c': 500 }),
+    );
+    assert.deepEqual([...index.entries.keys()].sort(), ['/a', '/b', '/c']);
+    const b = index.entries.get('/b');
+    assert.equal(b.kind, 'shared');
+    assert.equal(b.offset, 0);
+    assert.equal(bytes(cache, b).toString(), 'a'.repeat(2000));
+    assert.equal(cache.entry('p', '/a').kind, 'shared');
+    assert.equal(cache.entry('p', '/zzz'), null);
+  });
+
+  it('turns oversize files into disk entries', async () => {
+    const cache = make();
+    const file = { path: '/tmp/big', stat: { size: 3 * KB, mtimeMs: 1 } };
+    await cache.load('p', new Map([['/big', file]]));
+    assert.deepEqual(cache.entry('p', '/big'), {
+      kind: 'disk',
+      path: '/tmp/big',
+      stat: file.stat,
+    });
+  });
+
+  it('honours per-call maxFileSize', async () => {
+    const cache = make();
+    await cache.load('p', files({ '/x': 3 * KB }), { maxFileSize: 4 * KB });
+    assert.equal(cache.entry('p', '/x').kind, 'shared');
+  });
+
+  it('empty files are shared entries without bytes', async () => {
+    const cache = make();
+    await cache.load('p', files({ '/e': 0 }));
+    const e = cache.entry('p', '/e');
+    assert.equal(e.kind, 'shared');
+    assert.equal(e.length, 0);
+    assert.equal(cache.pool.segments.size, 0);
+  });
+
+  it('store predicate keeps selected files on disk', async () => {
+    const cache = make();
+    await cache.load('p', files({ '/a': 10, '/b': 10 }), {
+      store: (key) => key !== '/b',
+    });
+    assert.equal(cache.entry('p', '/a').kind, 'shared');
+    assert.equal(cache.entry('p', '/b').kind, 'disk');
+  });
+
+  it('uses the injected reader and rolls the extent back when it throws', async () => {
+    let calls = 0;
+    const reader = async (file, view) => {
+      calls++;
+      if (file.path === '/bad') throw new Error('changed');
+      view.fill(0x42);
+    };
+    const cache = make({ reader });
+    const good = { path: '/good', stat: { size: 100, mtimeMs: 1 } };
+    const bad = { path: '/bad', stat: { size: 100, mtimeMs: 1 } };
+    const entry = await cache.allocate('p', '/good', good);
+    assert.equal(bytes(cache, entry).toString(), 'B'.repeat(100));
+    await assert.rejects(cache.allocate('p', '/bad', bad), /changed/);
+    assert.equal(calls, 2);
+    assert.equal(cache.entry('p', '/bad'), null);
+    // The failed extent was released: the next allocation reuses its offset.
+    const next = await cache.allocate('p', '/next', good);
+    assert.equal(next.offset, 100);
+  });
+
+  it('rejects buffers whose length disagrees with stat.size', async () => {
+    const cache = make();
+    await assert.rejects(
+      cache.allocate('p', '/x', { data: buf(10), stat: { size: 11 } }),
+      /size mismatch/,
+    );
+  });
+
+  it('without reader, path inputs fall back to disk entries', async () => {
+    const cache = make();
+    const entry = await cache.allocate('p', '/x', {
+      path: '/tmp/x',
+      stat: { size: 5 },
+    });
+    assert.equal(entry.kind, 'disk');
+  });
 });
 
-describe('FilesystemCache', () => {
-  describe('constructor', () => {
-    it('applies defaults', () => {
-      const cache = new FilesystemCache();
-      assert.equal(cache.maxFileSize, 10 * MB);
-      assert.equal(cache.totalUsed, 0);
+describe('FilesystemCache: allocate / free', () => {
+  it('fallback: false returns null instead of a disk entry', async () => {
+    const cache = make();
+    const entry = await cache.allocate('p', '/big', input(3 * KB), {
+      fallback: false,
     });
-
-    it('accepts custom options', () => {
-      const cache = new FilesystemCache({
-        limit: 128 * MB,
-        baseSegmentSize: 32 * MB,
-        maxFileSize: 5 * MB,
-      });
-      assert.equal(cache.maxFileSize, 5 * MB);
-    });
+    assert.equal(entry, null);
+    assert.equal(cache.entry('p', '/big'), null);
   });
 
-  describe('load + snapshot + project', () => {
-    it('loads files into SAB and projects them', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-        reader: makeReader(),
-      });
-      const files = new Map();
-      files.set('/index.html', makeFile('/index.html', 100));
-      files.set('/style.css', makeFile('/style.css', 200));
-      await cache.load('static', files);
-
-      const snap = cache.snapshot();
-      assert.ok(snap.segments.length > 0);
-      assert.ok(snap.filesystems.static);
-      assert.equal(snap.filesystems.static.entries.length, 2);
-
-      const segmentsMap = new Map();
-      for (const seg of snap.segments) segmentsMap.set(seg.id, seg.sab);
-
-      const projected = FilesystemCache.project(
-        snap.filesystems.static,
-        segmentsMap,
-      );
-      assert.equal(projected.size, 2);
-      const html = projected.get('/index.html');
-      assert.ok(html.data instanceof Buffer);
-      assert.equal(html.data.length, 100);
-      assert.equal(html.stat.size, 100);
+  it('refuses sizes above one segment even with maxFileSize: Infinity', async () => {
+    const cache = make();
+    const entry = await cache.allocate('p', '/x', input(5 * KB), {
+      fallback: false,
+      maxFileSize: Infinity,
     });
+    assert.equal(entry, null);
+    assert.throws(() => cache.registry.allocate(0), RangeError);
+    assert.throws(() => cache.registry.allocate(1.5), RangeError);
   });
 
-  describe('allocate + free', () => {
-    it('allocates and frees entries', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-        reader: makeReader(),
-      });
-      await cache.load('fs1', new Map());
-      const entry = await cache.allocate(
-        'fs1',
-        '/a.js',
-        makeFile('/a.js', 500),
-      );
-      assert.equal(entry.kind, 'shared');
-      assert.equal(entry.length, 500);
-
-      cache.free(entry);
-      // After free, can reallocate in same space
-      const entry2 = await cache.allocate(
-        'fs1',
-        '/b.js',
-        makeFile('/b.js', 300),
-      );
-      assert.equal(entry2.kind, 'shared');
-    });
+  it('respects the pool limit', async () => {
+    const cache = make({ limit: 4 * KB });
+    await cache.allocate('p', '/a', input(2 * KB));
+    await cache.allocate('p', '/b', input(2 * KB));
+    const c = await cache.allocate('p', '/c', input(1 * KB));
+    assert.equal(c.kind, 'disk');
   });
 
-  describe('disk fallback', () => {
-    it('falls back to disk for oversize files', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 100,
-        reader: makeReader(),
-      });
-      const files = new Map();
-      files.set('/big.bin', makeFile('/big.bin', 200));
-      await cache.load('fs1', files);
-      const snap = cache.snapshot();
-      const entries = new Map(snap.filesystems.fs1.entries);
-      const entry = entries.get('/big.bin');
-      assert.equal(entry.kind, 'disk');
-      assert.equal(entry.path, '/big.bin');
-    });
-
-    it('falls back to disk when no reader and no data', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-      });
-      const files = new Map();
-      files.set('/a.js', makeFile('/a.js', 100));
-      await cache.load('fs1', files);
-      const snap = cache.snapshot();
-      const entries = new Map(snap.filesystems.fs1.entries);
-      assert.equal(entries.get('/a.js').kind, 'disk');
-    });
+  it('free() reuses extents best-fit and merges neighbours', async () => {
+    const cache = make();
+    const a = await cache.allocate('p', '/a', input(500));
+    const b = await cache.allocate('p', '/b', input(300));
+    const c = await cache.allocate('p', '/c', input(200));
+    cache.free(a);
+    cache.free(c);
+    assert.deepEqual(cache.registry.free.get(1), [
+      { offset: 0, length: 500 },
+      { offset: 800, length: 200 },
+    ]);
+    const d = await cache.allocate('p', '/d', input(200));
+    assert.equal(d.offset, 800);
+    cache.free(b);
+    assert.deepEqual(cache.registry.free.get(1), [{ offset: 0, length: 800 }]);
   });
 
-  describe('empty file', () => {
-    it('handles zero-size files as shared with length 0', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-        reader: makeReader(),
-      });
-      const files = new Map();
-      files.set('/empty.txt', makeFile('/empty.txt', 0));
-      await cache.load('fs1', files);
-      const snap = cache.snapshot();
-      const entries = new Map(snap.filesystems.fs1.entries);
-      const entry = entries.get('/empty.txt');
-      assert.equal(entry.kind, 'shared');
-      assert.equal(entry.length, 0);
-    });
+  it('fully freed segments are kept for reuse, never released', async () => {
+    const cache = make();
+    const a = await cache.allocate('p', '/a', input(100));
+    cache.remove('p', '/a');
+    cache.free(a);
+    assert.ok(cache.pool.emptySegmentIds.has(1));
+    assert.equal(cache.pool.segments.size, 1);
+    const b = await cache.allocate('p', '/b', input(100));
+    assert.equal(b.segmentId, 1);
+    assert.equal(cache.pool.segments.size, 1);
   });
 
-  describe('remove', () => {
-    it('removes entry from filesystem index', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-        reader: makeReader(),
-      });
-      const files = new Map();
-      files.set('/a.js', makeFile('/a.js', 100));
-      await cache.load('fs1', files);
-      const removed = cache.remove('fs1', '/a.js');
-      assert.ok(removed);
-      assert.equal(removed.kind, 'shared');
-      assert.equal(cache.remove('fs1', '/a.js'), null);
-    });
+  it('remove() returns the entry and free() ignores non-shared ones', async () => {
+    const cache = make();
+    await cache.allocate('p', '/a', input(10));
+    const removed = cache.remove('p', '/a');
+    assert.equal(removed.kind, 'shared');
+    assert.equal(cache.remove('p', '/a'), null);
+    cache.free({ kind: 'disk' });
+    cache.free(null);
+  });
+});
 
-    it('returns null for unknown filesystem', () => {
-      const cache = new FilesystemCache();
-      assert.equal(cache.remove('nope', '/a.js'), null);
-    });
+describe('FilesystemCache: compact', () => {
+  // seg 1: /a + /b fill it exactly; seg 2: /c alone.
+  const fill = async (cache, sizes = [2 * KB, 2 * KB, 200]) => {
+    const a = await cache.allocate('p', '/a', input(sizes[0]));
+    const b = await cache.allocate('p', '/b', input(sizes[1]));
+    const c = await cache.allocate('q', '/c', input(sizes[2], 'c'));
+    assert.equal(b.segmentId, 1);
+    assert.equal(c.segmentId, 2);
+    return { a, b, c };
+  };
+
+  it('moves entries of the emptiest segment into others and reports them', async () => {
+    const cache = make({ maxFileSize: 4 * KB });
+    const { a, c } = await fill(cache);
+    cache.remove('p', '/a');
+    cache.free(a);
+    const result = cache.compact(0.5);
+    assert.ok(result);
+    assert.equal(result.updates.length, 1);
+    const [{ name, key, entry }] = result.updates;
+    assert.equal(name, 'q');
+    assert.equal(key, '/c');
+    assert.equal(entry.segmentId, 1);
+    assert.equal(entry.offset, 0);
+    assert.equal(bytes(cache, entry).toString(), 'c'.repeat(200));
+    assert.deepEqual(result.oldEntries, [c]);
+    assert.equal(cache.entry('q', '/c'), entry);
+    assert.ok(cache.indexes.get('q').segmentIds.has(1));
+    assert.ok(!cache.indexes.get('q').segmentIds.has(2));
+    assert.equal(result.newSegments[0].id, 1);
   });
 
-  describe('compact', () => {
-    it('returns null when less than 2 segments', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-        reader: makeReader(),
-      });
-      const files = new Map();
-      files.set('/a.js', makeFile('/a.js', 100));
-      await cache.load('fs1', files);
-      assert.equal(cache.compact(), null);
-    });
-
-    it('compacts when a segment is underutilized', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1024,
-        maxFileSize: 512,
-        reader: makeReader(),
-      });
-      // Fill two segments
-      const files = new Map();
-      for (let i = 0; i < 3; i++) {
-        files.set(`/f${i}.js`, makeFile(`/f${i}.js`, 500));
-      }
-      await cache.load('fs1', files);
-      // Free entries from first segment to make it underutilized
-      const snap = cache.snapshot();
-      const entries = new Map(snap.filesystems.fs1.entries);
-      const firstEntry = entries.get('/f0.js');
-      cache.free(firstEntry);
-      cache.remove('fs1', '/f0.js');
-      // Now compact should try to move remaining entry
-      const result = cache.compact(0.9);
-      // Result may be null if conditions not met, that's valid
-      if (result) {
-        assert.ok(result.updates.length > 0);
-        assert.ok(result.oldEntries.length > 0);
-      }
-    });
+  it('threshold 0 disables; nothing to do returns null', async () => {
+    const cache = make({ maxFileSize: 4 * KB });
+    await fill(cache);
+    assert.equal(cache.compact(0), null);
+    assert.equal(cache.compact(0.01), null);
   });
 
-  describe('projection', () => {
-    it('projects disk entry correctly', () => {
-      const entry = { kind: 'disk', path: '/big.bin', stat: { size: 999 } };
-      const projected = FilesystemCache.projectEntry(entry, new Map());
-      assert.equal(projected.data, null);
-      assert.equal(projected.path, '/big.bin');
-      assert.equal(projected.stat.size, 999);
-    });
-
-    it('projects empty shared entry', () => {
-      const entry = {
-        kind: 'shared',
-        segmentId: 0,
-        offset: 0,
-        length: 0,
-        stat: { size: 0 },
-      };
-      const projected = FilesystemCache.projectEntry(entry, new Map());
-      assert.ok(Buffer.isBuffer(projected.data));
-      assert.equal(projected.data.length, 0);
-    });
-
-    it('projects shared entry as Buffer view over SAB', () => {
-      const sab = new SharedArrayBuffer(1024);
-      const view = new Uint8Array(sab, 0, 5);
-      view.set([72, 101, 108, 108, 111]); // "Hello"
-      const segmentsMap = new Map([[1, sab]]);
-      const entry = {
-        kind: 'shared',
-        segmentId: 1,
-        offset: 0,
-        length: 5,
-        stat: { size: 5 },
-      };
-      const projected = FilesystemCache.projectEntry(entry, segmentsMap);
-      assert.equal(projected.data.toString(), 'Hello');
-      assert.equal(projected.data.buffer, sab);
-    });
+  it('rolls back when the move does not fit without growing', async () => {
+    const cache = make({ maxFileSize: 4 * KB });
+    const { a } = await fill(cache, [1 * KB, 3 * KB, 1536]);
+    cache.remove('p', '/a');
+    cache.free(a);
+    // seg 2 (/c, 37%) is the candidate but 1536 bytes do not fit into the
+    // 1 KiB hole of seg 1 and the pool must not grow.
+    const before = JSON.stringify([
+      [...cache.registry.free],
+      [...cache.registry.tail],
+    ]);
+    assert.equal(cache.compact(0.5), null);
+    assert.equal(
+      JSON.stringify([[...cache.registry.free], [...cache.registry.tail]]),
+      before,
+    );
+    assert.equal(cache.entry('q', '/c').segmentId, 2);
+    assert.equal(cache.registry.closed.size, 0);
   });
 
-  describe('stats', () => {
-    it('returns segment statistics', async () => {
-      const cache = new FilesystemCache({
-        limit: 10 * MB,
-        baseSegmentSize: 1 * MB,
-        maxFileSize: 512 * KB,
-        reader: makeReader(),
-      });
-      const files = new Map();
-      files.set('/a.js', makeFile('/a.js', 100));
-      await cache.load('fs1', files);
-      const stats = cache.stats();
-      assert.equal(stats.segmentCount, 1);
-      assert.equal(stats.cleanCount, 0);
-      assert.ok(stats.totalUsed > 0);
-      assert.ok(stats.lines.length > 0);
-    });
+  it('the emptied segment stays closed until ACK-pending bytes are freed', async () => {
+    const cache = make({ maxFileSize: 4 * KB });
+    const { a, c } = await fill(cache);
+    // /d shares seg 2 with /c, then gets replaced: its bytes wait for an ACK.
+    const d = await cache.allocate('q', '/d', input(300, 'd'));
+    cache.remove('q', '/d');
+    cache.remove('p', '/a');
+    cache.free(a);
+    const result = cache.compact(0.5);
+    assert.equal(result.updates[0].entry.segmentId, 1);
+    assert.ok(cache.registry.closed.has(2), 'seg 2 closed, not recycled');
+    assert.equal(
+      bytes(cache, d).toString(),
+      'd'.repeat(300),
+      'old bytes intact',
+    );
+    // New allocations must not land in the closed segment.
+    const e = await cache.allocate('p', '/e', input(100));
+    assert.notEqual(e.segmentId, 2);
+    cache.free(c);
+    assert.ok(cache.registry.closed.has(2), 'still holds /d');
+    cache.free(d);
+    assert.ok(!cache.registry.closed.has(2));
+    assert.ok(cache.pool.emptySegmentIds.has(2), 'now reusable');
+  });
+});
+
+describe('FilesystemCache: snapshot / projection', () => {
+  it('snapshot is keyed by place and projects zero-copy views', async () => {
+    const cache = make();
+    await cache.load('p', files({ '/a': 10 }));
+    await cache.load('q', files({ '/b': 0 }));
+    const snap = cache.snapshot();
+    assert.deepEqual(Object.keys(snap.places), ['p', 'q']);
+    assert.equal(snap.segments.length, 1);
+    const map = new Map(snap.segments.map((s) => [s.id, s.sab]));
+    const files1 = FilesystemCache.project(snap.places.p, map);
+    const a = files1.get('/a');
+    assert.ok(a.data.buffer instanceof SharedArrayBuffer);
+    assert.equal(a.data.toString(), 'a'.repeat(10));
+    const b = FilesystemCache.project(snap.places.q, map).get('/b');
+    assert.equal(b.data.length, 0);
+    const disk = FilesystemCache.projectEntry(
+      { kind: 'disk', path: '/x', stat: { size: 1 } },
+      map,
+    );
+    assert.deepEqual(disk, { data: null, stat: { size: 1 }, path: '/x' });
+  });
+
+  it('stats() summarises segments', async () => {
+    const cache = make();
+    await cache.load('p', files({ '/a': 1024 }));
+    const s = cache.stats();
+    assert.equal(s.segmentCount, 1);
+    assert.equal(s.totalUsed, 4 * KB);
+    assert.match(s.lines[0], /25\.0%/);
   });
 });

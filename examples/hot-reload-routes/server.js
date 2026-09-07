@@ -2,7 +2,7 @@
 
 // hot-reload-routes — minimal HTTP server whose route handlers live in a
 // memory-backed VFS place. An "AI agent" (here: a setInterval) writes new
-// route files via `place.writeFile`. The patched fs + require-hook make
+// route files via `kernel.fs('routes').writeFile`. The module hook makes
 // them immediately requirable; old require-cache entries are evicted via
 // `delete require.cache[absPath]` so each request picks up fresh code.
 //
@@ -16,9 +16,9 @@
 
 const http = require('node:http');
 const path = require('node:path');
-const { VfsConfig, VFSKernel } = require('../..');
+const { VfsConfig, VfsKernel } = require('../..');
 const fsPatch = require('../../lib/adapters/fs-patch.js');
-const requireHook = require('../../lib/adapters/require-hook.js');
+const moduleHook = require('../../lib/adapters/module-hook.js');
 
 const APP_ROOT = __dirname;
 const ROUTES_DIR = path.join(APP_ROOT, 'routes');
@@ -26,22 +26,16 @@ const ROUTES_DIR = path.join(APP_ROOT, 'routes');
 const config = new VfsConfig({
   defaults: {
     memory: { limit: '256 kib', segmentSize: '64 kib', maxFileSize: '8 kib' },
-    hooks: { fs: false, require: false, import: false },
   },
   places: {
-    routes: {
-      domains: ['fs', 'require'],
-      dir: 'routes',
-      provider: 'memory',
-    },
+    routes: { provider: 'memory', fs: { writable: true }, require: true },
   },
 });
 
-const kernel = new VFSKernel(config, { appRoot: APP_ROOT });
+const kernel = new VfsKernel(config, { appRoot: APP_ROOT });
 
 const writeRoute = (name, source) => {
-  const place = kernel.getPlace('routes');
-  place.writeFile(`/${name}.js`, Buffer.from(source));
+  kernel.fs('routes').writeFile(`/${name}.js`, source);
   // Evict Node's require cache so the next require() recompiles.
   const abs = path.join(ROUTES_DIR, `${name}.js`);
   delete require.cache[abs];
@@ -59,7 +53,7 @@ const loadRoute = (name) => {
 (async () => {
   await kernel.initialize();
   fsPatch.install(kernel);
-  requireHook.install(kernel);
+  moduleHook.install(kernel);
 
   // Seed initial route.
   writeRoute(
@@ -101,9 +95,8 @@ module.exports = (req, res) => {
     writeRoute(
       'echo',
       `'use strict';
-const url = require('node:url');
 module.exports = (req, res) => {
-  const q = url.parse(req.url, true).query;
+  const q = Object.fromEntries(new URL(req.url, 'http://x').searchParams);
   res.end(JSON.stringify(q) + '\\n');
 };`,
     );

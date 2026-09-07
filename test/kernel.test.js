@@ -2,658 +2,358 @@
 
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
-const { VfsConfig } = require('../lib/config.js');
-const { VFSKernel } = require('../lib/kernel.js');
+const { Worker } = require('node:worker_threads');
+const { VfsKernel } = require('../lib/kernel.js');
+const { bytecodeKey } = require('../lib/companion.js');
+const {
+  tmpDir,
+  writeTree,
+  rm,
+  kernel,
+  config,
+  quiet,
+  until,
+  sleep,
+} = require('./helpers.js');
 
-const createTmpDir = () => {
-  const dir = path.join(
-    os.tmpdir(),
-    `vfs-kernel-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-};
-
-const rmDir = (dir) => {
-  fs.rmSync(dir, { recursive: true, force: true });
-};
-
-describe('VFSKernel', () => {
-  let tmpDir;
-
+describe('VfsKernel: lifecycle', () => {
+  let root;
   before(() => {
-    tmpDir = createTmpDir();
-    fs.mkdirSync(path.join(tmpDir, 'static'), { recursive: true });
-    fs.mkdirSync(path.join(tmpDir, 'api'), { recursive: true });
-    fs.mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
-    fs.writeFileSync(path.join(tmpDir, 'static', 'index.html'), '<h1>VFS</h1>');
-    fs.writeFileSync(path.join(tmpDir, 'static', 'style.css'), 'body{}');
-    fs.writeFileSync(
-      path.join(tmpDir, 'api', 'handler.js'),
-      'module.exports={}',
+    root = writeTree(tmpDir('kernel'), { 'site/a.txt': 'a' });
+  });
+  after(() => rm(root));
+
+  it('goes new → initializing → ready; ready-only APIs guard themselves', async () => {
+    const k = new VfsKernel(config({ site: { fs: true } }), {
+      appRoot: root,
+      console: quiet,
+    });
+    assert.equal(k.state, 'new');
+    assert.ok(!k.ready);
+    assert.throws(() => k.fs('site'), /requires a ready kernel/);
+    assert.throws(() => k.snapshot(), /requires a ready kernel/);
+    assert.throws(() => k.watch(), /requires a ready kernel/);
+    const init = k.initialize();
+    assert.equal(k.state, 'initializing');
+    await init;
+    assert.equal(k.state, 'ready');
+    await assert.rejects(k.initialize(), /state "ready"/);
+    k.close();
+    assert.equal(k.state, 'closed');
+    await assert.rejects(k.initialize(), /state "closed"/);
+    assert.throws(() => k.fs('site'), /closed/);
+    // The pool is unreachable after close, so its segments are collectable.
+    assert.equal(k.cache, null);
+    assert.equal(k.moduleCache, null);
+    assert.equal(k.compressionCache, null);
+    k.handleAck(1, 'w');
+    k.handleWorkerExit('w');
+  });
+
+  it('a failing initialize closes the kernel', async () => {
+    const seaModule = {
+      getAssetKeys: () => {
+        throw new Error('boom');
+      },
+    };
+    const k = new VfsKernel(config({ site: { provider: 'sea', fs: true } }), {
+      appRoot: root,
+      console: quiet,
+      seaModule,
+    });
+    await assert.rejects(k.initialize(), /boom/);
+    assert.equal(k.state, 'closed');
+  });
+
+  it('fs() explains unknown places, missing fs domain and passthrough providers', async () => {
+    const k = await kernel(root, {
+      site: { require: { compile: false } },
+      disk: { provider: 'disk', fs: true },
+      nd: { provider: 'node-default', fs: true },
+    });
+    assert.throws(() => k.fs('nope'), /unknown place "nope"/);
+    assert.throws(() => k.fs('site'), /no fs domain/);
+    assert.throws(() => k.fs('disk'), /node:fs directly/);
+    assert.throws(() => k.fs('nd'), /node:fs directly/);
+    k.close();
+  });
+
+  it('VfsKernel.current is the bootstrap slot', () => {
+    assert.equal(VfsKernel.current, null);
+    const marker = {};
+    VfsKernel.current = marker;
+    assert.equal(VfsKernel.current, marker);
+    assert.equal(require('..').kernel, marker);
+    VfsKernel.current = null;
+    assert.equal(VfsKernel.current, null);
+  });
+});
+
+describe('VfsKernel: providers', () => {
+  let root;
+  before(() => {
+    root = writeTree(tmpDir('kernel-prov'), {
+      'site/index.html': '<h1>',
+      'site/app.js': 'module.exports = 1;',
+      'site/big.bin': 'B'.repeat(70 * 1024),
+      'lib/util.js': 'exports.x = 1;',
+      'lib/data.json': '{"a":1}',
+      'lib/notes.md': '# no',
+    });
+  });
+  after(() => rm(root));
+
+  it('sab: scans by scanExt, oversize files stay on disk, bytecode for require', async () => {
+    const k = await kernel(root, {
+      site: { fs: true, require: true },
+      lib: { require: true },
+    });
+    const site = k.fs('site');
+    assert.deepEqual(site.readdir('/'), ['app.js', 'big.bin', 'index.html']);
+    assert.equal(
+      site.readFile('/big.bin').length,
+      70 * 1024,
+      'disk-backed entry reads from disk',
     );
-    fs.writeFileSync(
-      path.join(tmpDir, 'lib', 'utils.js'),
-      'module.exports = { sum: (a, b) => a + b };',
+    assert.deepEqual(site.storedEncodings('/big.bin'), []);
+    assert.ok(k.bytecode(path.join(root, 'site', 'app.js')));
+    assert.equal(k.bytecode(path.join(root, 'site', 'index.html')), null);
+    const lib = k.registry.get('lib');
+    assert.deepEqual(
+      [...lib.files.keys()].filter((key) => !key.includes('\0')).sort(),
+      ['/data.json', '/util.js'],
     );
+    assert.ok(lib.files.has(bytecodeKey('/util.js')));
+    assert.ok(!lib.files.has(bytecodeKey('/data.json')));
+    k.close();
   });
 
-  after(() => rmDir(tmpDir));
+  it('resolveModule applies domain, ext and provider rules', async () => {
+    const k = await kernel(root, {
+      site: { fs: true, import: { ext: ['js'] } },
+      lib: { require: { ext: ['js'], compile: false } },
+      d: { provider: 'disk', require: { compile: false } },
+      n: { provider: 'node-default', fs: true },
+    });
+    const at = (...p) => path.join(root, ...p);
+    assert.equal(
+      k.resolveModule(at('site', 'app.js'), 'import').key,
+      '/app.js',
+    );
+    assert.equal(
+      k.resolveModule(at('site', 'app.js'), 'require'),
+      null,
+      'domain off',
+    );
+    assert.equal(
+      k.resolveModule(at('site', 'index.html'), 'import'),
+      null,
+      'ext',
+    );
+    assert.equal(
+      k.resolveModule(at('lib', 'util.js'), 'require').file.data.toString(),
+      'exports.x = 1;',
+    );
+    assert.equal(k.resolveModule(at('lib', 'data.json'), 'require'), null);
+    assert.equal(k.resolveModule(at('d', 'x.js'), 'require'), null);
+    assert.equal(k.resolveModule(at('n', 'x.js'), 'require'), null);
+    assert.equal(k.resolveModule(at('elsewhere', 'x.js'), 'require'), null);
+    assert.equal(k.resolveModule('/outside/x.js', 'require'), null);
+    k.close();
+  });
 
-  const makeConfig = (extra = {}) =>
-    new VfsConfig({
-      defaults: {
-        memory: {
-          limit: '10 mib',
-          segmentSize: '1 mib',
-          maxFileSize: '512 kib',
-        },
-        hooks: { fs: false, require: false, import: false },
+  it('resolveModule denies under strict', async () => {
+    const k = await kernel(
+      root,
+      {
+        lib: { require: true },
+        d: { provider: 'disk', require: { compile: false } },
       },
+      { strict: true },
+    );
+    const at = (...p) => path.join(root, ...p);
+    assert.deepEqual(k.resolveModule(at('lib', 'missing.js'), 'require'), {
+      denied: true,
+    });
+    assert.deepEqual(k.resolveModule(at('lib', 'notes.md'), 'require'), {
+      denied: true,
+    });
+    assert.deepEqual(
+      k.resolveModule(at('lib', 'util.js'), 'import'),
+      { denied: true },
+      'domain off',
+    );
+    assert.deepEqual(k.resolveModule(at('unknown', 'x.js'), 'require'), {
+      denied: true,
+    });
+    assert.equal(
+      k.resolveModule(at('d', 'x.js'), 'require'),
+      null,
+      'disk is managed passthrough',
+    );
+    assert.equal(
+      k.resolveModule(at('lib', 'util.js'), 'require').key,
+      '/util.js',
+    );
+    k.close();
+  });
+
+  it('memory places are empty, per-kernel and writable', async () => {
+    const k1 = await kernel(root, {
+      mem: { provider: 'memory', fs: { writable: true } },
+    });
+    const k2 = await kernel(root, {
+      mem: { provider: 'memory', fs: { writable: true } },
+    });
+    k1.fs('mem').writeFile('/x', '1');
+    assert.equal(k2.fs('mem').exists('/x'), false);
+    assert.equal(k1.fs('mem').readFile('/x', 'utf8'), '1');
+    k1.close();
+    k2.close();
+  });
+});
+
+describe('VfsKernel: snapshot, workers, ACK', () => {
+  let root;
+  before(() => {
+    root = writeTree(tmpDir('kernel-snap'), {
+      'site/a.txt': 'aaa',
+      'site/b.js': 'module.exports = 2;',
+    });
+  });
+  after(() => rm(root));
+
+  const places = {
+    site: { fs: true, require: true },
+    mem: { provider: 'memory', fs: { writable: true } },
+    d: { provider: 'disk', fs: true },
+  };
+
+  it('snapshot is keyed by place and fromSnapshot projects it read-only', async () => {
+    const k = await kernel(root, places);
+    const snap = k.snapshot();
+    assert.deepEqual(Object.keys(snap.places), ['site']);
+    assert.ok(snap.segments.length >= 1);
+    const w = VfsKernel.fromSnapshot(snap, config(places), { appRoot: root });
+    assert.equal(w.state, 'ready');
+    assert.equal(w.fs('site').readFile('/a.txt', 'utf8'), 'aaa');
+    assert.ok(w.bytecode(path.join(root, 'site', 'b.js')));
+    assert.ok(w.fs('site').readFileView === undefined || true);
+    assert.throws(() => w.snapshot(), /main-thread only/);
+    assert.throws(() => w.fs('site').writeFile('/x', 'y'), { code: 'EROFS' });
+    w.fs('mem').writeFile('/m', 'm');
+    assert.equal(w.fs('mem').readFile('/m', 'utf8'), 'm');
+    assert.equal(k.fs('mem').exists('/m'), false);
+    const empty = VfsKernel.fromSnapshot(null, config(places), {
+      appRoot: root,
+    });
+    assert.equal(empty.fs('site').exists('/a.txt'), false);
+    k.close();
+    w.close();
+  });
+
+  it('handleDelta applies vfs-update entries and removals', async () => {
+    const k = await kernel(root, places);
+    const w = VfsKernel.fromSnapshot(k.snapshot(), config(places), {
+      appRoot: root,
+    });
+    const entry = await k.cache.allocate('site', '/new.txt', {
+      data: Buffer.from('new'),
+      stat: { size: 3, mtimeMs: 1 },
+    });
+    const { sab } = k.cache.getSegment(entry.segmentId);
+    w.handleDelta({
+      name: 'vfs-update',
+      updateId: 1,
       places: {
-        static: {
-          domains: ['fs'],
-          dir: 'static',
-          provider: 'sab',
-          ext: ['html', 'css'],
-        },
-        api: {
-          domains: ['fs'],
-          dir: 'api',
-          provider: 'disk',
-        },
-        ...extra,
+        site: { entries: [['/new.txt', entry]], removals: ['/a.txt'] },
       },
+      newSegments: [{ id: entry.segmentId, sab }],
     });
-
-  const makeCompileConfig = () =>
-    new VfsConfig({
-      defaults: {
-        memory: {
-          limit: '10 mib',
-          segmentSize: '1 mib',
-          maxFileSize: '512 kib',
-        },
-        hooks: { fs: false, require: false, import: false },
-      },
-      places: {
-        static: {
-          domains: ['fs'],
-          dir: 'static',
-          provider: 'sab',
-          ext: ['html', 'css'],
-        },
-        api: {
-          domains: ['fs'],
-          dir: 'api',
-          provider: 'disk',
-        },
-        lib: {
-          domains: ['fs', 'require'],
-          dir: 'lib',
-          provider: 'sab',
-          ext: ['js'],
-          compile: true,
-        },
-      },
-    });
-
-  const makeKernel = (config) =>
-    new VFSKernel(config, {
-      appRoot: tmpDir,
-      console: { debug() {}, error() {}, log() {}, warn() {} },
-    });
-
-  describe('per-place maxFileSize', () => {
-    const makeSizedConfig = (maxFileSize) =>
-      new VfsConfig({
-        defaults: {
-          memory: { limit: '10 mib', segmentSize: '1 mib', maxFileSize: 4 },
-        },
-        places: {
-          static: {
-            domains: ['fs'],
-            dir: 'static',
-            provider: 'sab',
-            ext: ['html', 'css'],
-            maxFileSize,
-          },
-        },
-      });
-
-    it('overrides the global limit for its own files', async () => {
-      const kernel = makeKernel(makeSizedConfig('1 mib'));
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.ok(Buffer.isBuffer(place.readFile('/index.html')));
-      kernel.close();
-    });
-
-    it('sends larger files to disk when the place limit is smaller', async () => {
-      const kernel = makeKernel(makeSizedConfig(4));
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.equal(place.readFile('/index.html'), null);
-      assert.ok(place.filePath('/index.html'));
-      kernel.close();
-    });
+    assert.equal(w.fs('site').readFile('/new.txt', 'utf8'), 'new');
+    assert.equal(w.fs('site').exists('/a.txt'), false);
+    w.handleDelta({ name: 'other' });
+    k.close();
+    w.close();
   });
 
-  describe('initialize', () => {
-    it('loads SAB-backed files into projected maps', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-      assert.equal(kernel.initialized, true);
-      const staticPlace = kernel.getPlace('static');
-      assert.ok(staticPlace);
-      assert.ok(staticPlace.files.size >= 2);
-
-      const html = staticPlace.files.get('/index.html');
-      assert.ok(html);
-      assert.ok(Buffer.isBuffer(html.data));
-      assert.equal(html.data.toString(), '<h1>VFS</h1>');
-
-      kernel.close();
-    });
-
-    it('loads disk-backed places with null data', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      const apiPlace = kernel.getPlace('api');
-      assert.ok(apiPlace);
-      assert.ok(apiPlace.files.size >= 1);
-
-      const handler = apiPlace.files.get('/handler.js');
-      assert.ok(handler);
-      assert.equal(handler.data, null);
-      assert.ok(handler.path);
-
-      kernel.close();
-    });
+  it('frees only after every worker ACKed or exited; repeated ACKs are harmless', async () => {
+    const workers = new Set(['w1', 'w2']);
+    const k = await kernel(root, places, {}, { getWorkerIds: () => workers });
+    let freed = 0;
+    const originalFree = k.cache.free.bind(k.cache);
+    k.cache.free = (entry) => {
+      freed++;
+      originalFree(entry);
+    };
+    const old = k.cache.entry('site', '/a.txt');
+    // Emulate what an epoch does: track old bytes against an update id.
+    k.pendingFrees.set(7, { workerIds: new Set(workers), entries: [old] });
+    k.handleAck(7, 'w1');
+    assert.equal(freed, 0);
+    k.handleAck(7, 'w1');
+    assert.equal(freed, 0);
+    k.handleWorkerExit('w2');
+    assert.equal(freed, 1);
+    k.handleAck(7, 'w2');
+    k.handleAck(99, 'w1');
+    assert.equal(freed, 1, 'nothing is freed twice');
+    assert.equal(k.pendingFrees.size, 0);
+    k.close();
   });
 
-  describe('pathIndex', () => {
-    it('builds pathIndex automatically on initialize', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      assert.ok(kernel.pathIndex.size > 0);
-
-      const abs = path.resolve(tmpDir, 'static', 'index.html');
-      const resolved = kernel.pathIndex.get(abs);
-      assert.ok(resolved);
-      assert.equal(resolved.place.name, 'static');
-
-      kernel.close();
-    });
-  });
-
-  describe('resolveFsPath', () => {
-    it('resolves path to place via pathIndex', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      const abs = path.resolve(tmpDir, 'static', 'index.html');
-      const result = kernel.resolveFsPath(abs);
-      assert.ok(result);
-      assert.equal(result.place.name, 'static');
-
-      kernel.close();
-    });
-
-    it('returns null for unmanaged paths', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      const result = kernel.resolveFsPath('/some/other/path.js');
-      assert.equal(result, null);
-
-      kernel.close();
-    });
-  });
-
-  describe('snapshot', () => {
-    it('returns cache snapshot', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      const snap = kernel.snapshot();
-      assert.ok(snap);
-      assert.ok(snap.segments.length > 0);
-      assert.ok(snap.filesystems.static);
-
-      kernel.close();
-    });
-
-    it('returns null before initialize', () => {
-      const kernel = makeKernel(makeConfig());
-      assert.equal(kernel.snapshot(), null);
-      kernel.close();
-    });
-  });
-
-  describe('ACK flow', () => {
-    it('tracks updates and frees after all ACKs', async () => {
-      const broadcasts = [];
-      const kernel = new VFSKernel(makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-        broadcast: (data) => broadcasts.push(data),
-        getWorkerIds: () => [1, 2],
+  it('link() + attach(): a worker gets the projection, deltas and ACKs them', async () => {
+    const k = await kernel(root, places, { watchTimeout: 50, watch: true });
+    const { vfs, transferList } = k.link();
+    assert.equal(k.links.size, 1);
+    const script = `
+      const { parentPort } = require('node:worker_threads');
+      const { attach, kernel: before } = require(${JSON.stringify(path.resolve(__dirname, '..'))});
+      const kernel = attach();
+      const { kernel: after } = require(${JSON.stringify(path.resolve(__dirname, '..'))});
+      const site = kernel.fs('site');
+      parentPort.on('message', (m) => {
+        if (m === 'read') parentPort.postMessage(site.readFile('/a.txt', 'utf8'));
+        if (m === 'exit') process.exit(0);
       });
-      await kernel.initialize();
-
-      // Simulate an update by writing a file and manually processing
-      const filePath = path.join(tmpDir, 'static', 'new.html');
-      fs.writeFileSync(filePath, '<p>new</p>');
-
-      // Directly allocate entry to simulate watch
-      const { scan } = require('../lib/scanner.js');
-      const { files } = await scan(path.join(tmpDir, 'static'), {
-        ext: ['html', 'css'],
-      });
-      const newFile = files.get('/new.html');
-      if (newFile) {
-        await kernel.cache.allocate('static', '/new.html', newFile);
-        // Simulate flushEpoch behavior
-        const updateId = ++kernel.nextUpdateId;
-        const pendingEntries = [];
-        kernel.pendingFrees.set(updateId, {
-          workerIds: new Set([1, 2]),
-          entries: pendingEntries,
-        });
-
-        assert.equal(kernel.pendingFrees.size, 1);
-
-        kernel.handleAck(updateId, 1);
-        assert.equal(kernel.pendingFrees.size, 1); // still pending
-
-        kernel.handleAck(updateId, 2);
-        assert.equal(kernel.pendingFrees.size, 0); // freed
-      }
-
-      fs.unlinkSync(filePath);
-      kernel.close();
+      parentPort.postMessage([before, after === kernel, site.readFile('/a.txt', 'utf8')]);
+    `;
+    const worker = new Worker(script, {
+      eval: true,
+      workerData: { vfs },
+      transferList,
     });
-  });
-
-  describe('handleWorkerExit', () => {
-    it('removes worker from all pending ACK sets', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      kernel.pendingFrees.set(1, {
-        workerIds: new Set([10, 20]),
-        entries: [],
-      });
-      kernel.pendingFrees.set(2, {
-        workerIds: new Set([10, 30]),
-        entries: [],
-      });
-
-      kernel.handleWorkerExit(10);
-
-      const p1 = kernel.pendingFrees.get(1);
-      assert.ok(p1);
-      assert.equal(p1.workerIds.has(10), false);
-      assert.equal(p1.workerIds.size, 1);
-
-      const p2 = kernel.pendingFrees.get(2);
-      assert.ok(p2);
-      assert.equal(p2.workerIds.has(10), false);
-
-      kernel.close();
-    });
-
-    it('frees entries when last worker exits', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      kernel.pendingFrees.set(1, {
-        workerIds: new Set([10]),
-        entries: [],
-      });
-
-      kernel.handleWorkerExit(10);
-      assert.equal(kernel.pendingFrees.size, 0);
-
-      kernel.close();
-    });
-  });
-
-  describe('close', () => {
-    it('clears all state', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      assert.equal(kernel.initialized, true);
-      assert.ok(kernel.pathIndex.size > 0);
-
-      kernel.close();
-
-      assert.equal(kernel.initialized, false);
-      assert.equal(kernel.pathIndex.size, 0);
-      assert.equal(kernel.watcher, null);
-      assert.equal(kernel.pendingFrees.size, 0);
-      assert.equal(kernel.segmentsMap.size, 0);
-      assert.equal(kernel.projected.size, 0);
-      assert.equal(kernel.sources.size, 0);
-    });
-  });
-
-  describe('getPlace / getPlaces', () => {
-    it('returns registered places', async () => {
-      const kernel = makeKernel(makeConfig());
-      await kernel.initialize();
-
-      assert.ok(kernel.getPlace('static'));
-      assert.ok(kernel.getPlace('api'));
-      assert.equal(kernel.getPlace('unknown'), null);
-
-      const all = kernel.getPlaces();
-      assert.ok(all.length >= 2);
-
-      kernel.close();
-    });
-  });
-
-  describe('single-process mode (no workers)', () => {
-    it('frees entries immediately when no workers', async () => {
-      const kernel = new VFSKernel(makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-        getWorkerIds: () => [],
-      });
-      await kernel.initialize();
-
-      // Allocate an entry
-      await kernel.cache.allocate('static', '/temp.html', {
-        stat: { size: 10 },
-        path: path.join(tmpDir, 'static', 'index.html'),
-      });
-
-      // Simulate trackUpdate via private access — just verify pendingFrees stays empty
-      // since getWorkerIds returns []
-      assert.equal(kernel.pendingFrees.size, 0);
-
-      kernel.close();
-    });
-  });
-
-  describe('fromSnapshot', () => {
-    it('creates worker-side kernel from snapshot', async () => {
-      const main = makeKernel(makeConfig());
-      await main.initialize();
-      const snapshot = main.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snapshot, makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      assert.equal(worker.initialized, true);
-      assert.equal(worker.cache, null);
-      assert.equal(worker.watcher, null);
-
-      const place = worker.getPlace('static');
-      assert.ok(place);
-      assert.ok(place.files.size >= 2);
-
-      const html = place.files.get('/index.html');
-      assert.ok(html);
-      assert.ok(Buffer.isBuffer(html.data));
-      assert.equal(html.data.toString(), '<h1>VFS</h1>');
-
-      main.close();
-      worker.close();
-    });
-
-    it('supports dispatch after fromSnapshot', async () => {
-      const main = makeKernel(makeConfig());
-      await main.initialize();
-      const snapshot = main.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snapshot, makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      const abs = path.resolve(tmpDir, 'static', 'index.html');
-      const resolved = worker.resolveFsPath(abs);
-      assert.ok(resolved);
-      assert.equal(resolved.place.name, 'static');
-
-      main.close();
-      worker.close();
-    });
-
-    it('supports resolveFsPath after fromSnapshot', async () => {
-      const main = makeKernel(makeConfig());
-      await main.initialize();
-      const snapshot = main.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snapshot, makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      const abs = path.resolve(tmpDir, 'static', 'style.css');
-      const resolved = worker.resolveFsPath(abs);
-      assert.ok(resolved);
-      assert.equal(resolved.place.name, 'static');
-
-      main.close();
-      worker.close();
-    });
-  });
-
-  describe('handleDelta', () => {
-    it('applies file-update delta', async () => {
-      const main = makeKernel(makeConfig());
-      await main.initialize();
-      const snapshot = main.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snapshot, makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      // Create a new SAB entry to simulate an update
-      const sab = new SharedArrayBuffer(16);
-      const view = new Uint8Array(sab, 0, 6);
-      view.set(Buffer.from('<new/>'));
-      worker.segmentsMap.set(99, sab);
-
-      worker.handleDelta({
-        name: 'file-update',
-        target: 'static',
-        updateId: 1,
-        updates: [
-          [
-            '/new.html',
-            {
-              kind: 'shared',
-              segmentId: 99,
-              offset: 0,
-              length: 6,
-              stat: { size: 6 },
-            },
-          ],
-        ],
-        newSegments: [{ id: 99, sab }],
-      });
-
-      const place = worker.getPlace('static');
-      const file = place.files.get('/new.html');
-      assert.ok(file);
-      assert.equal(file.data.toString(), '<new/>');
-
-      main.close();
-      worker.close();
-    });
-
-    it('applies file-delete delta', async () => {
-      const main = makeKernel(makeConfig());
-      await main.initialize();
-      const snapshot = main.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snapshot, makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      assert.ok(worker.getPlace('static').files.has('/index.html'));
-
-      worker.handleDelta({
-        name: 'file-delete',
-        target: 'static',
-        updateId: 2,
-        keys: ['/index.html'],
-      });
-
-      assert.equal(worker.getPlace('static').files.has('/index.html'), false);
-
-      main.close();
-      worker.close();
-    });
-
-    it('updates pathIndex on delta', async () => {
-      const main = makeKernel(makeConfig());
-      await main.initialize();
-      const snapshot = main.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snapshot, makeConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      const abs = path.resolve(tmpDir, 'static', 'index.html');
-      assert.ok(worker.pathIndex.has(abs));
-
-      worker.handleDelta({
-        name: 'file-delete',
-        target: 'static',
-        updateId: 3,
-        keys: ['/index.html'],
-      });
-
-      assert.equal(worker.pathIndex.has(abs), false);
-
-      main.close();
-      worker.close();
-    });
-  });
-
-  describe('compileModules', () => {
-    it('generates bytecode for JS files in compilable places', async () => {
-      const kernel = makeKernel(makeCompileConfig());
-      await kernel.initialize();
-
-      const libPlace = kernel.getPlace('lib');
-      assert.ok(libPlace);
-
-      // Source should be accessible
-      const source = libPlace.readFile('/utils.js');
-      assert.ok(Buffer.isBuffer(source));
-      assert.ok(source.toString().includes('sum'));
-
-      // Bytecode companion should exist
-      const bytecode = libPlace.getCachedData('/utils.js');
-      assert.ok(Buffer.isBuffer(bytecode));
-      assert.ok(bytecode.length > 0);
-
-      // Bytecode should be larger than source (typically 2-5x)
-      assert.ok(bytecode.length > source.length);
-
-      kernel.close();
-    });
-
-    it('does not generate bytecode for non-compile places', async () => {
-      const kernel = makeKernel(makeCompileConfig());
-      await kernel.initialize();
-
-      const staticPlace = kernel.getPlace('static');
-      assert.ok(staticPlace);
-      // HTML files should have no bytecode
-      const bytecode = staticPlace.getCachedData('/index.html');
-      assert.equal(bytecode, null);
-
-      kernel.close();
-    });
-
-    it('bytecode is valid for vm.Script', async () => {
-      const vm = require('node:vm');
-      const Module = require('node:module');
-      const kernel = makeKernel(makeCompileConfig());
-      await kernel.initialize();
-
-      const libPlace = kernel.getPlace('lib');
-      const source = libPlace.readFile('/utils.js').toString('utf8');
-      const bytecode = libPlace.getCachedData('/utils.js');
-
-      const wrapped = Module.wrap(source);
-      const script = new vm.Script(wrapped, {
-        filename: '/utils.js',
-        cachedData: bytecode,
-      });
-      assert.equal(script.cachedDataRejected, false);
-
-      kernel.close();
-    });
-
-    it('snapshot includes bytecode companion entries', async () => {
-      const kernel = makeKernel(makeCompileConfig());
-      await kernel.initialize();
-
-      const snap = kernel.snapshot();
-      assert.ok(snap.filesystems.lib);
-      const entries = new Map(snap.filesystems.lib.entries);
-      assert.ok(entries.has('/utils.js'));
-      assert.ok(entries.has('/utils.js\u0000cache'));
-
-      kernel.close();
-    });
-
-    it('worker receives bytecode via fromSnapshot', async () => {
-      const kernel = makeKernel(makeCompileConfig());
-      await kernel.initialize();
-      const snap = kernel.snapshot();
-
-      const worker = VFSKernel.fromSnapshot(snap, makeCompileConfig(), {
-        appRoot: tmpDir,
-        console: { debug() {}, error() {}, log() {}, warn() {} },
-      });
-
-      const libPlace = worker.getPlace('lib');
-      assert.ok(libPlace);
-
-      const source = libPlace.readFile('/utils.js');
-      assert.ok(Buffer.isBuffer(source));
-
-      const bytecode = libPlace.getCachedData('/utils.js');
-      assert.ok(Buffer.isBuffer(bytecode));
-      assert.ok(bytecode.length > 0);
-
-      kernel.close();
-      worker.close();
-    });
-
-    it('pathIndex excludes bytecode companion keys', async () => {
-      const kernel = makeKernel(makeCompileConfig());
-      await kernel.initialize();
-
-      const cacheAbs = path.resolve(tmpDir, 'lib', 'utils.js\u0000cache');
-      assert.equal(kernel.pathIndex.has(cacheAbs), false);
-
-      // But source key should be
-      const sourceAbs = path.resolve(tmpDir, 'lib', 'utils.js');
-      assert.ok(kernel.pathIndex.has(sourceAbs));
-
-      kernel.close();
-    });
+    const messages = [];
+    worker.on('message', (m) => messages.push(m));
+    const acks = [];
+    const port = [...k.links.values()][0];
+    port.on('message', (m) => acks.push(m));
+    const errors = [];
+    worker.on('error', (e) => errors.push(e));
+    await until(() => messages.length === 1 || errors.length > 0);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(messages, [[null, true, 'aaa']]);
+    // Anything that is not a delta must not produce an ACK.
+    port.postMessage({ name: 'ping' });
+    await sleep(100);
+    assert.deepEqual(acks, []);
+    // Change the file: the delta must reach the worker and be ACKed.
+    require('node:fs').writeFileSync(path.join(root, 'site', 'a.txt'), 'AAAA');
+    await until(() => k.fs('site').readFile('/a.txt', 'utf8') === 'AAAA');
+    await until(() => k.pendingFrees.size === 0, 3000);
+    assert.equal(k.pendingFrees.size, 0, 'worker ACKed the update');
+    assert.deepEqual(
+      acks.map((m) => m.name),
+      ['ack-update'],
+      'exactly one ACK, only for the delta',
+    );
+    worker.postMessage('read');
+    await until(() => messages.length === 2);
+    assert.equal(messages[1], 'AAAA');
+    worker.postMessage('exit');
+    await until(() => k.links.size === 0);
+    assert.equal(k.links.size, 0, 'worker exit closed the link');
+    k.close();
   });
 });

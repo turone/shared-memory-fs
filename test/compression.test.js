@@ -1,412 +1,215 @@
 'use strict';
 
 const { describe, it, before, after } = require('node:test');
-const assert = require('node:assert');
-const fs = require('node:fs');
-const fsp = require('node:fs/promises');
-const os = require('node:os');
-const path = require('node:path');
+const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
-const { VfsConfig, VFSKernel } = require('../index.js');
+const fs = require('node:fs');
+const path = require('node:path');
+const { compressedKey } = require('../lib/companion.js');
+const { tmpDir, writeTree, rm, kernel, drain, until } = require('./helpers.js');
 
-const SOURCE = 'body { color: red; }\n'.repeat(40);
-const PAGE = '<html><body>hello</body></html>\n'.repeat(20);
-const BINARY = Buffer.from(
-  Array.from({ length: 4096 }, (_, i) => (i * 7919) % 256),
-);
+describe('compression: representations in SAB', () => {
+  let root;
+  let k;
+  let site;
+  const text = 'hello hello hello hello hello hello hello hello';
 
-const silentConsole = { debug() {}, error() {}, log() {}, warn() {} };
-
-const waitFor = async (predicate, timeout = 5000) => {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  throw new Error('timed out waiting for condition');
-};
-
-let tmpDir;
-
-const makeKernel = (compress, extra = {}) => {
-  const config = new VfsConfig({
-    places: {
-      static: {
-        domains: ['fs'],
-        dir: 'static',
-        provider: 'sab',
-        compress,
-        ...extra,
-      },
-    },
-  });
-  return new VFSKernel(config, { appRoot: tmpDir, console: silentConsole });
-};
-
-describe('compression', () => {
   before(async () => {
-    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'vfs-compress-'));
-    const dir = path.join(tmpDir, 'static');
-    await fsp.mkdir(dir, { recursive: true });
-    await fsp.writeFile(path.join(dir, 'style.css'), SOURCE);
-    await fsp.writeFile(path.join(dir, 'index.html'), PAGE);
-    await fsp.writeFile(path.join(dir, 'movie.mp4'), BINARY);
+    root = writeTree(tmpDir('compress'), {
+      'site/index.html': text,
+      'site/app.js': text,
+      'site/logo.png': 'PNG'.repeat(20),
+      'site/empty.css': '',
+    });
+    k = await kernel(root, {
+      site: {
+        fs: {
+          zeroCopy: true,
+          compress: {
+            encodings: ['gzip', 'br'],
+            options: { br: { level: 4 } },
+            ext: 'compressible',
+          },
+        },
+      },
+    });
+    site = k.fs('site');
   });
 
   after(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    k.close();
+    rm(root);
   });
 
-  describe('representations', () => {
-    it('round-trips every codec', async () => {
-      const kernel = makeKernel({
-        encodings: ['br', 'gzip', 'deflate', 'zstd'],
-      });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      const decode = {
-        br: zlib.brotliDecompressSync,
-        gzip: zlib.gunzipSync,
-        deflate: zlib.inflateSync,
-        zstd: zlib.zstdDecompressSync,
-      };
-      for (const [encoding, fn] of Object.entries(decode)) {
-        const data = place.readFileCompressed('/style.css', encoding);
-        assert.ok(Buffer.isBuffer(data), `${encoding} missing`);
-        assert.equal(fn(data).toString(), SOURCE);
-      }
-      kernel.close();
-    });
-
-    it('keeps compressed bytes in SAB', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      const data = place.readFileCompressed('/style.css', 'br');
-      assert.ok(data.buffer instanceof SharedArrayBuffer);
-      kernel.close();
-    });
-
-    it('returns null for an encoding that is not stored', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.equal(place.readFileCompressed('/style.css', 'gzip'), null);
-      assert.equal(place.statCompressed('/style.css', 'gzip'), null);
-      kernel.close();
-    });
-
-    it('exposes compressed stat with source metadata', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      const stat = place.statCompressed('/style.css', 'br');
-      const raw = place.stat('/style.css');
-      assert.equal(stat.encoding, 'br');
-      assert.equal(stat.sourceSize, raw.size);
-      assert.equal(stat.mtimeMs, raw.mtimeMs);
-      assert.ok(stat.size > 0);
-      assert.ok(stat.size < stat.sourceSize);
-      kernel.close();
-    });
-
-    it('lists stored encodings, raw first', async () => {
-      const kernel = makeKernel({ encodings: ['br', 'gzip'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.deepEqual(place.storedEncodings('/style.css'), [
-        'raw',
-        'br',
-        'gzip',
-      ]);
-      assert.deepEqual(place.storedEncodings('/nope.css'), []);
-      kernel.close();
-    });
+  it('builds every configured encoding for compressible files only', () => {
+    assert.deepEqual(site.storedEncodings('/index.html'), [
+      'raw',
+      'gzip',
+      'br',
+    ]);
+    assert.deepEqual(site.storedEncodings('/app.js'), ['raw', 'gzip', 'br']);
+    assert.deepEqual(site.storedEncodings('/logo.png'), ['raw']);
+    assert.deepEqual(site.storedEncodings('/empty.css'), ['raw', 'gzip', 'br']);
+    assert.deepEqual(site.storedEncodings('/nope'), []);
   });
 
-  describe('options', () => {
-    it('honours an explicit level', async () => {
-      const fast = makeKernel({
-        encodings: ['br'],
-        options: { br: { level: 0 } },
-      });
-      const best = makeKernel({
-        encodings: ['br'],
-        options: { br: { level: 11 } },
-      });
-      await fast.initialize();
-      await best.initialize();
-      const fastSize = fast
-        .getPlace('static')
-        .statCompressed('/style.css', 'br').size;
-      const bestSize = best
-        .getPlace('static')
-        .statCompressed('/style.css', 'br').size;
-      assert.ok(bestSize < fastSize, `${bestSize} !< ${fastSize}`);
-      fast.close();
-      best.close();
-    });
+  it('compressed bytes decode to the source; stat carries both sizes', () => {
+    const gz = site.readFileCompressed('/index.html', 'gzip');
+    assert.equal(zlib.gunzipSync(gz).toString(), text);
+    assert.ok(!(gz.buffer instanceof SharedArrayBuffer), 'owned copy');
+    const view = site.readFileCompressedView('/index.html', 'br');
+    assert.ok(view.buffer instanceof SharedArrayBuffer);
+    assert.equal(zlib.brotliDecompressSync(view).toString(), text);
+    const st = site.statCompressed('/index.html', 'gzip');
+    assert.equal(st.size, gz.length);
+    assert.equal(st.sourceSize, text.length);
+    assert.equal(st.encoding, 'gzip');
+    assert.equal(typeof st.mtimeMs, 'number');
+    assert.equal(site.readFileCompressed('/logo.png', 'gzip'), null);
+    assert.equal(site.statCompressed('/nope', 'gzip'), null);
   });
 
-  describe('file selection', () => {
-    it('compresses only the configured extensions', async () => {
-      const kernel = makeKernel({ encodings: ['br'], ext: ['css'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.ok(place.readFileCompressed('/style.css', 'br'));
-      assert.equal(place.readFileCompressed('/index.html', 'br'), null);
-      assert.equal(place.readFileCompressed('/movie.mp4', 'br'), null);
-      kernel.close();
+  it('rejects encodings that are not configured', () => {
+    assert.throws(() => site.readFileCompressed('/index.html', 'zstd'), {
+      code: 'ENOTSUP',
     });
-
-    it('compresses every file when ext is omitted', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.ok(place.readFileCompressed('/index.html', 'br'));
-      assert.ok(place.readFileCompressed('/movie.mp4', 'br'));
-      kernel.close();
-    });
-
-    it('expands the compressible alias', async () => {
-      const kernel = makeKernel({ encodings: ['br'], ext: 'compressible' });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.ok(place.readFileCompressed('/style.css', 'br'));
-      assert.ok(place.readFileCompressed('/index.html', 'br'));
-      assert.equal(place.readFileCompressed('/movie.mp4', 'br'), null);
-      kernel.close();
-    });
+    assert.throws(
+      () =>
+        site.storedEncodings.call(site, '/index.html') &&
+        site.statCompressed('/index.html', 'deflate'),
+      {
+        code: 'ENOTSUP',
+      },
+    );
   });
 
-  describe('retainRaw: false', () => {
-    const config = () => ({
-      encodings: ['br'],
-      ext: ['css'],
-      retainRaw: false,
-    });
-
-    it('keeps the source on disk and the representation in SAB', async () => {
-      const kernel = makeKernel(config());
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.equal(place.readFile('/style.css'), null);
-      assert.equal(place.createReadStream('/style.css'), null);
-      assert.equal(
-        place.filePath('/style.css'),
-        path.join(tmpDir, 'static', 'style.css'),
-      );
-      assert.equal(place.stat('/style.css').size, SOURCE.length);
-      assert.ok(place.readFileCompressed('/style.css', 'br'));
-      assert.deepEqual(place.storedEncodings('/style.css'), ['br']);
-      kernel.close();
-    });
-
-    it('leaves files outside compress.ext raw in SAB', async () => {
-      const kernel = makeKernel(config());
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      const data = place.readFile('/movie.mp4');
-      assert.ok(Buffer.isBuffer(data));
-      assert.ok(data.buffer instanceof SharedArrayBuffer);
-      assert.deepEqual(place.storedEncodings('/movie.mp4'), ['raw']);
-      kernel.close();
-    });
-  });
-
-  describe('streaming', () => {
-    it('streams a byte range of the chosen representation', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      const full = place.readFileCompressed('/style.css', 'br');
-      const stream = place.createReadStreamCompressed('/style.css', 'br', {
+  it('streams compressed bytes with ranges', async () => {
+    const gz = site.readFileCompressed('/index.html', 'gzip');
+    const all = await drain(
+      site.createReadStreamCompressed('/index.html', 'gzip'),
+    );
+    assert.deepEqual(all, gz);
+    const part = await drain(
+      site.createReadStreamCompressed('/index.html', 'gzip', {
         start: 2,
-        end: 9,
-      });
-      const chunks = [];
-      for await (const chunk of stream) chunks.push(chunk);
-      assert.deepEqual(Buffer.concat(chunks), full.subarray(2, 10));
-      kernel.close();
-    });
-
-    it('returns null for an encoding that is not stored', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.equal(
-        place.createReadStreamCompressed('/style.css', 'gzip'),
-        null,
-      );
-      kernel.close();
-    });
+        end: 5,
+      }),
+    );
+    assert.deepEqual(part, gz.subarray(2, 6));
+    assert.equal(site.createReadStreamCompressed('/nope', 'gzip'), null);
   });
 
-  describe('companions stay internal', () => {
-    it('are hidden from list, exists and pathIndex', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      const keys = place.list('/');
-      assert.ok(keys.every((k) => !k.includes('\u0000')));
-      assert.equal(place.exists('/style.css\u0000br'), false);
-      const abs = path.join(tmpDir, 'static', 'style.css\u0000br');
-      assert.equal(kernel.pathIndex.has(abs), false);
-      kernel.close();
-    });
+  it('companions never leak into listings, exists or the patched fs', () => {
+    assert.deepEqual(site.readdir('/'), [
+      'app.js',
+      'empty.css',
+      'index.html',
+      'logo.png',
+    ]);
+    assert.equal(site.exists(compressedKey('/index.html', 'gzip')), false);
+    assert.equal(site.readFile(compressedKey('/index.html', 'gzip')), null);
+    assert.equal(
+      k.routeRead(path.join(root, 'site', compressedKey('index.html', 'gzip')))
+        .kind,
+      'passthrough',
+    );
   });
 
-  describe('worker projection', () => {
-    it('propagates representations through the snapshot', async () => {
-      const raw = {
-        places: {
-          static: {
-            domains: ['fs'],
-            dir: 'static',
-            provider: 'sab',
-            compress: { encodings: ['br'] },
-          },
+  it('snapshot carries representations to workers', () => {
+    const { VfsKernel } = require('../lib/kernel.js');
+    const w = VfsKernel.fromSnapshot(k.snapshot(), k.config, { appRoot: root });
+    const ws = w.fs('site');
+    assert.deepEqual(ws.storedEncodings('/index.html'), ['raw', 'gzip', 'br']);
+    assert.equal(
+      zlib.gunzipSync(ws.readFileCompressed('/index.html', 'gzip')).toString(),
+      text,
+    );
+    w.close();
+  });
+});
+
+describe('compression: retainRaw: false', () => {
+  it('keeps only representations in SAB; the source stays on disk', async () => {
+    const root = writeTree(tmpDir('compress-raw'), {
+      'site/index.html': '<h1>'.repeat(50),
+      'site/logo.png': 'PNG',
+    });
+    const k = await kernel(root, {
+      site: {
+        fs: {
+          compress: { encodings: ['gzip'], ext: ['html'], retainRaw: false },
         },
-      };
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const worker = VFSKernel.fromSnapshot(
-        kernel.snapshot(),
-        new VfsConfig(raw),
-        { appRoot: tmpDir, console: silentConsole },
-      );
-      const place = worker.getPlace('static');
-      const data = place.readFileCompressed('/style.css', 'br');
-      assert.ok(data.buffer instanceof SharedArrayBuffer);
-      assert.equal(zlib.brotliDecompressSync(data).toString(), SOURCE);
-      kernel.close();
-      worker.close();
+      },
     });
+    const site = k.fs('site');
+    assert.deepEqual(site.storedEncodings('/index.html'), ['gzip']);
+    assert.deepEqual(site.storedEncodings('/logo.png'), ['raw']);
+    assert.equal(
+      site.readFile('/index.html', 'utf8'),
+      '<h1>'.repeat(50),
+      'read from disk',
+    );
+    assert.equal(site.stat('/index.html').size, 200);
+    assert.equal(k.cache.entry('site', '/index.html').kind, 'disk');
+    assert.equal(
+      k.routeRead(path.join(root, 'site', 'index.html')).kind,
+      'passthrough',
+    );
+    k.close();
+    rm(root);
+  });
+});
+
+describe('compression: failures are per representation', () => {
+  it('a representation that does not fit one segment is skipped, others survive', async () => {
+    const root = writeTree(tmpDir('compress-fit'), {
+      // Random bytes do not compress: gzip output exceeds the 4 KiB segment.
+      'site/noise.txt': require('node:crypto').randomBytes(4090),
+    });
+    const warnings = [];
+    const k = await kernel(
+      root,
+      { site: { fs: { compress: { encodings: ['gzip'] } } } },
+      {
+        memory: { limit: '64 kib', segmentSize: '4 kib', maxFileSize: '4 kib' },
+      },
+      { console: { warn: (m) => warnings.push(m), error() {}, log() {} } },
+    );
+    const site = k.fs('site');
+    assert.deepEqual(site.storedEncodings('/noise.txt'), ['raw']);
+    assert.ok(
+      warnings.some((w) => /skipped gzip/.test(w) && /segment/.test(w)),
+    );
+    k.close();
+    rm(root);
   });
 
-  describe('allocation failure', () => {
-    it('warns and skips the representation that does not fit', async () => {
-      const warnings = [];
-      const config = new VfsConfig({
-        places: {
-          static: {
-            domains: ['fs'],
-            dir: 'static',
-            provider: 'sab',
-            maxFileSize: 200,
-            compress: { encodings: ['br'], ext: ['mp4'] },
-          },
-        },
-      });
-      const kernel = new VFSKernel(config, {
-        appRoot: tmpDir,
-        console: { ...silentConsole, warn: (m) => warnings.push(m) },
-      });
-      await kernel.initialize();
-      const place = kernel.getPlace('static');
-      assert.equal(place.readFileCompressed('/movie.mp4', 'br'), null);
-      assert.equal(warnings.length, 1);
-      assert.match(warnings[0], /static/);
-      assert.match(warnings[0], /movie\.mp4/);
-      assert.match(warnings[0], /br/);
-      assert.match(warnings[0], /does not fit/);
-      kernel.close();
+  it('hot reload replaces representations; a shrunk source keeps only fresh ones', async () => {
+    const root = writeTree(tmpDir('compress-watch'), {
+      'site/a.txt': 'aaaa'.repeat(10),
     });
-  });
-
-  describe('worker delta', () => {
-    const workerConfig = () =>
-      new VfsConfig({
-        places: {
-          static: {
-            domains: ['fs'],
-            dir: 'static',
-            provider: 'sab',
-            compress: { encodings: ['br'] },
-          },
-        },
-      });
-
-    it('drops a stale representation named in removals', async () => {
-      const kernel = makeKernel({ encodings: ['br'] });
-      await kernel.initialize();
-      const worker = VFSKernel.fromSnapshot(kernel.snapshot(), workerConfig(), {
-        appRoot: tmpDir,
-        console: silentConsole,
-      });
-      const place = worker.getPlace('static');
-      assert.ok(place.readFileCompressed('/style.css', 'br'));
-
-      const entry = kernel.cache.filesystems.static.entries.get('/style.css');
-      worker.handleDelta({
-        name: 'file-update',
-        target: 'static',
-        updateId: 1,
-        updates: [['/style.css', entry]],
-        removals: ['/style.css\u0000br'],
-        newSegments: [],
-      });
-
-      assert.equal(place.readFileCompressed('/style.css', 'br'), null);
-      assert.deepEqual(place.storedEncodings('/style.css'), ['raw']);
-      kernel.close();
-      worker.close();
-    });
-  });
-
-  describe('watcher', () => {
-    let watchDir;
-
-    before(async () => {
-      watchDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'vfs-watch-'));
-      await fsp.mkdir(path.join(watchDir, 'static'), { recursive: true });
-      await fsp.writeFile(path.join(watchDir, 'static', 'style.css'), SOURCE);
-    });
-
-    after(() => {
-      fs.rmSync(watchDir, { recursive: true, force: true });
-    });
-
-    it('republishes source and representations in one message', async () => {
-      const messages = [];
-      const config = new VfsConfig({
-        defaults: { watchTimeout: 30 },
-        places: {
-          static: {
-            domains: ['fs'],
-            dir: 'static',
-            provider: 'sab',
-            compress: { encodings: ['br'] },
-          },
-        },
-      });
-      const kernel = new VFSKernel(config, {
-        appRoot: watchDir,
-        console: silentConsole,
-        broadcast: (msg) => messages.push(msg),
-      });
-      await kernel.initialize();
-      kernel.watch();
-
-      const updated = SOURCE + 'p { margin: 0; }\n';
-      await fsp.writeFile(path.join(watchDir, 'static', 'style.css'), updated);
-      await waitFor(() => messages.some((m) => m.name === 'file-update'));
-
-      const msg = messages.find((m) => m.name === 'file-update');
-      assert.ok(msg, 'no file-update broadcast');
-      const keys = msg.updates.map(([key]) => key);
-      assert.ok(keys.includes('/style.css'));
-      assert.ok(keys.includes('/style.css\u0000br'));
-
-      const place = kernel.getPlace('static');
-      assert.equal(place.readFile('/style.css').toString(), updated);
-      const br = place.readFileCompressed('/style.css', 'br');
-      assert.equal(zlib.brotliDecompressSync(br).toString(), updated);
-      assert.equal(
-        place.statCompressed('/style.css', 'br').sourceSize,
-        updated.length,
-      );
-      kernel.close();
-    });
+    const msgs = [];
+    const k = await kernel(
+      root,
+      { site: { fs: { compress: { encodings: ['gzip'] } } } },
+      { watch: true, watchTimeout: 60 },
+      { broadcast: (m) => msgs.push(m) },
+    );
+    const site = k.fs('site');
+    const before = site.readFileCompressed('/a.txt', 'gzip');
+    fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'bbbb'.repeat(20));
+    await until(
+      () => site.readFile('/a.txt', 'utf8') === 'bbbb'.repeat(20),
+      4000,
+    );
+    const after = site.readFileCompressed('/a.txt', 'gzip');
+    assert.notDeepEqual(after, before);
+    assert.equal(zlib.gunzipSync(after).toString(), 'bbbb'.repeat(20));
+    const keys = msgs.at(-1).places.site.entries.map(([key]) => key);
+    assert.ok(
+      keys.includes('/a.txt') && keys.includes(compressedKey('/a.txt', 'gzip')),
+    );
+    k.close();
+    rm(root);
   });
 });

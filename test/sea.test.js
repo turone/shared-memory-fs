@@ -3,163 +3,85 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { VfsConfig } = require('../lib/config.js');
-const { VFSKernel } = require('../lib/kernel.js');
+const { VfsKernel } = require('../lib/kernel.js');
+const { tmpDir, rm, config, quiet } = require('./helpers.js');
 
-// Mock node:sea — minimal subset used by VFSKernel.
-const mockSea = (assets) => ({
+// SEA places load node:sea assets named `<place>/<key>` into SAB. Tests
+// inject a compatible module instead of building a real executable.
+
+const seaModule = (assets) => ({
   isSea: () => true,
   getAssetKeys: () => Object.keys(assets),
   getAsset: (key) => {
-    if (!(key in assets)) throw new Error(`asset not found: ${key}`);
-    return Buffer.from(assets[key]);
+    const buf = Buffer.from(assets[key]);
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   },
 });
 
-const APP_ROOT = path.resolve('/tmp/vfs-sea-test');
-
 describe('SEA provider', () => {
-  it('loads matching assets into a SAB place under dir', async () => {
-    const sea = mockSea({
-      'public/index.html': '<h1>SEA</h1>',
-      'public/style.css': 'body{color:#000}',
-      'public/img/logo.svg': '<svg/>',
-      'private/secrets.txt': 'nope',
-    });
-    const config = new VfsConfig({
-      defaults: {
-        memory: {
-          limit: '1 mib',
-          segmentSize: '64 kib',
-          maxFileSize: '32 kib',
-        },
-        hooks: { fs: false, require: false, import: false },
-      },
-      places: {
-        public: {
-          domains: ['fs'],
-          dir: 'public',
+  const assets = {
+    'bundle/index.html': '<h1>sea</h1>',
+    'bundle/app.js': 'module.exports = "sea-js";',
+    'bundle/sub/style.css': 'a{}',
+    'bundle/skip.bin': 'zz',
+    'other/x.txt': 'not ours',
+  };
+
+  it('loads matching assets into SAB and serves them like a sab place', async () => {
+    const root = tmpDir('sea');
+    const k = new VfsKernel(
+      config({
+        bundle: {
           provider: 'sea',
+          fs: { ext: ['html', 'css', 'js'], zeroCopy: true },
+          require: true,
         },
-      },
-    });
-    const kernel = new VFSKernel(config, {
-      appRoot: APP_ROOT,
-      seaModule: sea,
-      console: { debug() {}, error() {}, log() {}, warn() {} },
-    });
-    await kernel.initialize();
-
-    const place = kernel.getPlace('public');
-    assert.equal(place.files.size, 3);
-    assert.equal(place.readFile('/index.html').toString(), '<h1>SEA</h1>');
-    assert.equal(place.readFile('/style.css').toString(), 'body{color:#000}');
-    assert.equal(place.readFile('/img/logo.svg').toString(), '<svg/>');
-    assert.equal(place.exists('/secrets.txt'), false);
-    kernel.close();
+      }),
+      { appRoot: root, console: quiet, seaModule: seaModule(assets) },
+    );
+    await k.initialize();
+    const bundle = k.fs('bundle');
+    assert.deepEqual(bundle.readdir('/', { recursive: true }), [
+      'app.js',
+      'index.html',
+      'sub',
+      'sub/style.css',
+    ]);
+    assert.equal(bundle.readFile('/index.html', 'utf8'), '<h1>sea</h1>');
+    assert.ok(
+      bundle.readFileView('/index.html').buffer instanceof SharedArrayBuffer,
+    );
+    assert.ok(
+      k.bytecode(path.join(root, 'bundle', 'app.js')),
+      'bytecode compiled for sea sources',
+    );
+    assert.equal(
+      k.resolveModule(path.join(root, 'bundle', 'app.js'), 'require').key,
+      '/app.js',
+    );
+    assert.throws(() => bundle.writeFile('/x', 'y'), { code: 'EROFS' });
+    const snap = k.snapshot();
+    assert.ok(snap.places.bundle.entries.length >= 3);
+    const w = VfsKernel.fromSnapshot(snap, k.config, { appRoot: root });
+    assert.equal(w.fs('bundle').readFile('/sub/style.css', 'utf8'), 'a{}');
+    assert.equal(k.watcher, null, 'nothing to watch');
+    k.close();
+    w.close();
+    rm(root);
   });
 
-  it('exposes assets via fs path index', async () => {
-    const sea = mockSea({ 'assets/a.txt': 'A' });
-    const config = new VfsConfig({
-      defaults: {
-        memory: {
-          limit: '256 kib',
-          segmentSize: '64 kib',
-          maxFileSize: '8 kib',
-        },
-        hooks: { fs: false, require: false, import: false },
-      },
-      places: {
-        a: { domains: ['fs'], dir: 'assets', provider: 'sea' },
-      },
-    });
-    const kernel = new VFSKernel(config, {
-      appRoot: APP_ROOT,
-      seaModule: sea,
-    });
-    await kernel.initialize();
-
-    const abs = path.resolve(APP_ROOT, 'assets', 'a.txt');
-    const route = kernel.resolveFsPath(abs);
-    assert.ok(route);
-    assert.equal(route.place.name, 'a');
-    assert.equal(route.fileKey, '/a.txt');
-    kernel.close();
-  });
-
-  it('snapshot includes SEA assets and worker projects them', async () => {
-    const sea = mockSea({
-      'pub/x.bin': Buffer.from([1, 2, 3, 4, 5]).toString('binary'),
-    });
-    // Use Buffer-bytes path to avoid encoding gotchas:
-    const seaBin = {
-      isSea: () => true,
-      getAssetKeys: () => ['pub/x.bin'],
-      getAsset: () => Buffer.from([1, 2, 3, 4, 5]),
-    };
-    const config = new VfsConfig({
-      defaults: {
-        memory: {
-          limit: '256 kib',
-          segmentSize: '64 kib',
-          maxFileSize: '8 kib',
-        },
-        hooks: { fs: false, require: false, import: false },
-      },
-      places: {
-        pub: { domains: ['fs'], dir: 'pub', provider: 'sea' },
-      },
-    });
-    const main = new VFSKernel(config, {
-      appRoot: APP_ROOT,
-      seaModule: seaBin,
-    });
-    await main.initialize();
-
-    const snap = main.snapshot();
-    assert.ok(snap.filesystems.pub);
-
-    const worker = VFSKernel.fromSnapshot(snap, config, { appRoot: APP_ROOT });
-    const wp = worker.getPlace('pub');
-    const data = wp.readFile('/x.bin');
-    assert.deepEqual([...data], [1, 2, 3, 4, 5]);
-
-    main.close();
-    worker.close();
-    void sea;
-  });
-
-  it('warns and stays empty when sea module unavailable', async () => {
+  it('is empty when node:sea is unavailable', async () => {
+    const root = tmpDir('sea-none');
     const warnings = [];
-    const config = new VfsConfig({
-      defaults: {
-        memory: {
-          limit: '256 kib',
-          segmentSize: '64 kib',
-          maxFileSize: '8 kib',
-        },
-        hooks: { fs: false, require: false, import: false },
-      },
-      places: {
-        e: { domains: ['fs'], dir: 'e', provider: 'sea' },
-      },
+    const k = new VfsKernel(config({ bundle: { provider: 'sea', fs: true } }), {
+      appRoot: root,
+      console: { ...quiet, warn: (m) => warnings.push(m) },
+      seaModule: null,
     });
-    const kernel = new VFSKernel(config, {
-      appRoot: APP_ROOT,
-      // No seaModule injected; outside SEA, node:sea reports isSea() === false
-      // and #loadSeaModule returns null.
-      console: {
-        debug() {},
-        error() {},
-        log() {},
-        warn: (m) => warnings.push(m),
-      },
-    });
-    await kernel.initialize();
-
-    assert.equal(kernel.getPlace('e').files.size, 0);
-    assert.ok(warnings.some((m) => /node:sea unavailable/.test(m)));
-    kernel.close();
+    await k.initialize();
+    assert.deepEqual(k.fs('bundle').readdir('/'), []);
+    assert.ok(warnings.some((w) => /node:sea unavailable/.test(w)));
+    k.close();
+    rm(root);
   });
 });

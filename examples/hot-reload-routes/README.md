@@ -24,10 +24,11 @@ curl http://localhost:3000/hello   # /hello replaced with new body at +6 s
 
 ## What this shows
 
-- `provider: 'memory'` place is fully writable; `place.writeFile(key, buf)` is
-  the API used by the agent.
-- Patched `require()` resolves absolute paths inside the place's mount even
-  when the file does not exist on disk (memory-only).
+- `provider: 'memory'` place with `fs: { writable: true }` is fully writable;
+  `kernel.fs('routes').writeFile(key, source)` is the API used by the agent.
+- The module hook resolves absolute paths inside the place even when the
+  file does not exist on disk (memory-only), and `require: true` gives each
+  written route V8 bytecode.
 - Hot reload = `delete require.cache[absPath]` after each write. The next
   `require()` recompiles from the updated buffer.
 - `compile: true` could be added to the place config for V8 bytecode caching;

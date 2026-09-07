@@ -17,11 +17,12 @@ verified manually against the public API.
 All examples import shared-memory-fs as a sibling of this folder:
 
 ```js
-const { VfsConfig, VFSKernel } = require('../..');
+const { VfsConfig, VfsKernel } = require('../..');
 const fsPatch = require('../../lib/adapters/fs-patch.js');
-const requireHook = require('../../lib/adapters/require-hook.js');
+const moduleHook = require('../../lib/adapters/module-hook.js');
 ```
 
-If you copy an example out of the repo, replace those two paths with
-`require('shared-memory-fs')` and `require('shared-memory-fs/lib/adapters/...')`
-or expose the adapters from your own preset module.
+If you copy an example out of the repo, replace those paths with
+`require('shared-memory-fs')`, `require('shared-memory-fs/adapters/fs-patch')`
+and `require('shared-memory-fs/adapters/module-hook')` — or skip the manual
+wiring entirely and start with `node --import shared-memory-fs/register`.

@@ -13,7 +13,8 @@ curl http://localhost:3000/
 
 The place reads `pub/index.html`, `pub/style.css`, `pub/app.js` from disk into
 SAB segments at startup. After that, every HTTP request is served zero-copy
-from the SAB.
+from the SAB: the place has `fs: { zeroCopy: true }` and the handler passes
+`readFileView()` straight to `res.end()`.
 
 ## Build a single-executable application (sea provider)
 

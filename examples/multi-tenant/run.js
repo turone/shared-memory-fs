@@ -15,33 +15,24 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
-const { VfsConfig, VFSKernel } = require('../..');
+const { VfsConfig, VfsKernel } = require('../..');
 const fsPatch = require('../../lib/adapters/fs-patch.js');
-const requireHook = require('../../lib/adapters/require-hook.js');
+const moduleHook = require('../../lib/adapters/module-hook.js');
 
 const APP_ROOT = __dirname;
 
 const config = new VfsConfig({
   defaults: {
     memory: { limit: '512 kib', segmentSize: '64 kib', maxFileSize: '8 kib' },
-    hooks: { fs: false, require: false, import: false },
     strict: true,
   },
   places: {
-    'tenant-a': {
-      domains: ['fs', 'require'],
-      dir: 'tenant-a',
-      provider: 'memory',
-    },
-    'tenant-b': {
-      domains: ['fs', 'require'],
-      dir: 'tenant-b',
-      provider: 'memory',
-    },
+    'tenant-a': { provider: 'memory', fs: { writable: true }, require: true },
+    'tenant-b': { provider: 'memory', fs: { writable: true }, require: true },
   },
 });
 
-const kernel = new VFSKernel(config, { appRoot: APP_ROOT });
+const kernel = new VfsKernel(config, { appRoot: APP_ROOT });
 
 const tenantCode = (name) => `'use strict';
 const fs = require('node:fs');
@@ -55,27 +46,31 @@ module.exports = function probe() {
 (async () => {
   await kernel.initialize();
   fsPatch.install(kernel);
-  requireHook.install(kernel);
+  moduleHook.install(kernel);
 
-  const a = kernel.getPlace('tenant-a');
-  const b = kernel.getPlace('tenant-b');
+  const a = kernel.fs('tenant-a');
+  const b = kernel.fs('tenant-b');
 
-  a.writeFile('/data.txt', Buffer.from('tenant-a secret'));
-  a.writeFile('/index.js', Buffer.from(tenantCode('A')));
-  b.writeFile('/data.txt', Buffer.from('tenant-b secret'));
-  b.writeFile('/index.js', Buffer.from(tenantCode('B')));
+  a.writeFile('/data.txt', 'tenant-a secret');
+  a.writeFile('/index.js', tenantCode('A'));
+  b.writeFile('/data.txt', 'tenant-b secret');
+  b.writeFile('/index.js', tenantCode('B'));
 
   console.log('-- 1. each tenant runs and reads its own file --');
   require(path.join(APP_ROOT, 'tenant-a', 'index.js'))();
   require(path.join(APP_ROOT, 'tenant-b', 'index.js'))();
 
-  console.log('-- 2. strict: path under appRoot but outside any place --');
-  const stray = path.join(APP_ROOT, 'config.local.json');
-  try {
-    fs.readFileSync(stray);
-    console.log('  read stray (UNEXPECTED — strict not enforced)');
-  } catch (err) {
-    console.log('  read stray ->', err.code, '(strict mode working)');
+  console.log('-- 2. strict: appRoot is the sandbox boundary --');
+  for (const stray of [
+    path.join(APP_ROOT, 'private', 'config.local.json'),
+    path.join(APP_ROOT, 'README.md'),
+  ]) {
+    try {
+      fs.readFileSync(stray);
+      console.log(`  read ${path.basename(stray)} (UNEXPECTED)`);
+    } catch (err) {
+      console.log(`  read ${path.basename(stray)} ->`, err.code);
+    }
   }
 
   console.log('-- 3. paths OUTSIDE appRoot are unaffected by strict --');
@@ -92,7 +87,7 @@ module.exports = function probe() {
   );
 
   fsPatch.uninstall();
-  requireHook.uninstall();
+  moduleHook.uninstall();
   kernel.close();
 })().catch((err) => {
   console.error(err);

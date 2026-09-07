@@ -4,143 +4,79 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
-const { scan, getKey } = require('../lib/scanner.js');
-
-const createTmpDir = () => {
-  const dir = path.join(
-    os.tmpdir(),
-    `vfs-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-};
-
-const rmDir = (dir) => {
-  fs.rmSync(dir, { recursive: true, force: true });
-};
+const { scan, keyOf } = require('../lib/scanner.js');
+const { tmpDir, writeTree, rm } = require('./helpers.js');
 
 describe('scanner', () => {
-  let tmpDir;
+  let root;
+  let canSymlink = true;
 
   before(() => {
-    tmpDir = createTmpDir();
-    fs.mkdirSync(path.join(tmpDir, 'sub'), { recursive: true });
-    fs.mkdirSync(path.join(tmpDir, 'sub', 'deep'), { recursive: true });
-    fs.writeFileSync(path.join(tmpDir, 'index.html'), '<html></html>');
-    fs.writeFileSync(path.join(tmpDir, 'style.css'), 'body{}');
-    fs.writeFileSync(path.join(tmpDir, 'app.js'), 'console.log(1)');
-    fs.writeFileSync(path.join(tmpDir, 'sub', 'page.html'), '<p>hi</p>');
-    fs.writeFileSync(path.join(tmpDir, 'sub', 'deep', 'nested.js'), '1');
+    root = writeTree(tmpDir('scan'), {
+      'a.html': 'A',
+      'sub/b.JS': 'B',
+      'sub/deep/c.txt': 'C',
+      noext: 'N',
+    });
+    try {
+      fs.symlinkSync(
+        path.join(root, 'a.html'),
+        path.join(root, 'link.html'),
+        'file',
+      );
+      fs.symlinkSync(
+        path.join(root, 'sub'),
+        path.join(root, 'linkdir'),
+        'junction',
+      );
+    } catch {
+      canSymlink = false;
+    }
   });
 
-  after(() => rmDir(tmpDir));
+  after(() => rm(root));
 
-  describe('scan()', () => {
-    it('returns all files and dirs', async () => {
-      const { files, dirs } = await scan(tmpDir);
-      assert.ok(files.size >= 5);
-      assert.ok(dirs.size >= 3); // root, sub, sub/deep
-      assert.ok(dirs.has(tmpDir));
-    });
-
-    it('files have stat and path', async () => {
-      const { files } = await scan(tmpDir);
-      for (const [, file] of files) {
-        assert.ok(file.stat);
-        assert.ok(file.path);
-        assert.ok(typeof file.stat.size === 'number');
-      }
-    });
-
-    it('keys use forward slashes', async () => {
-      const { files } = await scan(tmpDir);
-      for (const key of files.keys()) {
-        assert.ok(!key.includes('\\'), `key has backslash: ${key}`);
-        assert.ok(key.startsWith('/'), `key missing leading /: ${key}`);
-      }
-    });
-
-    it('includes nested files', async () => {
-      const { files } = await scan(tmpDir);
-      const keys = [...files.keys()];
-      assert.ok(keys.some((k) => k.includes('/sub/page.html')));
-      assert.ok(keys.some((k) => k.includes('/sub/deep/nested.js')));
-    });
+  it('keys are /-separated, relative, with leading slash', async () => {
+    const files = await scan(root);
+    const keys = [...files.keys()].sort();
+    assert.deepEqual(
+      keys.filter((k) => !k.startsWith('/link')),
+      ['/a.html', '/noext', '/sub/b.JS', '/sub/deep/c.txt'],
+    );
+    const b = files.get('/sub/b.JS');
+    assert.equal(b.path, path.join(root, 'sub', 'b.JS'));
+    assert.deepEqual(Object.keys(b.stat).sort(), ['mtimeMs', 'size']);
+    assert.equal(b.stat.size, 1);
+    assert.equal(keyOf(path.join(root, 'x', 'y.z'), root), '/x/y.z');
   });
 
-  describe('ext filtering', () => {
-    it('filters by extension', async () => {
-      const { files } = await scan(tmpDir, { ext: ['html'] });
-      for (const key of files.keys()) {
-        assert.ok(key.endsWith('.html'), `unexpected: ${key}`);
-      }
-      assert.ok(files.size >= 2);
-    });
-
-    it('supports multiple extensions', async () => {
-      const { files } = await scan(tmpDir, { ext: ['html', 'css'] });
-      for (const key of files.keys()) {
-        assert.ok(
-          key.endsWith('.html') || key.endsWith('.css'),
-          `unexpected: ${key}`,
-        );
-      }
-    });
-
-    it('returns aggregated skipped map', async () => {
-      const { skipped } = await scan(tmpDir, { ext: ['html'] });
-      assert.ok(skipped instanceof Map);
-      assert.ok(skipped.size > 0, 'expected non-html files to be tracked');
-      for (const [, bucket] of skipped) {
-        assert.ok(bucket.count > 0);
-        assert.ok(bucket.examples.length > 0);
-        assert.ok(bucket.examples.length <= 3);
-      }
-    });
-
-    it('skipped is empty when no ext filter', async () => {
-      const { skipped } = await scan(tmpDir);
-      assert.equal(skipped.size, 0);
-    });
+  it('filters by ext (case-insensitive, no dots)', async () => {
+    const files = await scan(root, { ext: ['js'] });
+    assert.deepEqual([...files.keys()], ['/sub/b.JS']);
   });
 
-  describe('startPath', () => {
-    it('scans subdirectory with keys relative to root', async () => {
-      const subDir = path.join(tmpDir, 'sub');
-      const { files, dirs } = await scan(tmpDir, { startPath: subDir });
-      assert.ok(files.size >= 2);
-      assert.ok(dirs.has(subDir));
-      for (const key of files.keys()) {
-        assert.ok(key.startsWith('/sub/'), `key not relative to root: ${key}`);
-      }
+  it('startPath scans a subtree with keys relative to root', async () => {
+    const files = await scan(root, {
+      startPath: path.join(root, 'sub', 'deep'),
     });
+    assert.deepEqual([...files.keys()], ['/sub/deep/c.txt']);
   });
 
-  describe('getKey()', () => {
-    it('produces forward-slash key', () => {
-      const base = '/home/user/project';
-      const file = '/home/user/project/src/index.js';
-      const key = getKey(file, base);
-      assert.equal(key, '/src/index.js');
-    });
-
-    it('handles Windows-style paths', () => {
-      if (process.platform !== 'win32') return;
-      const base = 'C:\\Users\\dev\\project';
-      const file = 'C:\\Users\\dev\\project\\lib\\cache.js';
-      const key = getKey(file, base);
-      assert.equal(key, '/lib/cache.js');
-    });
+  it('missing directory yields an empty map', async () => {
+    const files = await scan(path.join(root, 'nope'));
+    assert.equal(files.size, 0);
   });
 
-  describe('empty directory', () => {
-    it('returns empty files map for empty dir', async () => {
-      const emptyDir = path.join(tmpDir, 'empty');
-      fs.mkdirSync(emptyDir, { recursive: true });
-      const { files, dirs } = await scan(emptyDir);
-      assert.equal(files.size, 0);
-      assert.ok(dirs.has(emptyDir));
-    });
+  it('never traverses directory links; file links only with followSymlinks', async (t) => {
+    if (!canSymlink) {
+      t.skip('symlinks unavailable');
+      return;
+    }
+    const strict = await scan(root);
+    assert.ok(!strict.has('/link.html'));
+    assert.ok(![...strict.keys()].some((k) => k.startsWith('/linkdir')));
+    const loose = await scan(root, { followSymlinks: true });
+    assert.ok(loose.has('/link.html'));
+    assert.ok(![...loose.keys()].some((k) => k.startsWith('/linkdir')));
   });
 });

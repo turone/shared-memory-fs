@@ -8,179 +8,216 @@ applyTo: lib/**, index.js, test/**, doc/**
 # VFS Architecture
 
 `shared-memory-fs` — pooled SharedArrayBuffer virtual filesystem for Node.js
-worker_threads, plus optional fs / require / import hooks.
+worker_threads, plus fs / module hooks. Node >= 22.15 (module.registerHooks).
 
 ## Module Map
 
 ```
+lib/config.js             VfsConfig: raw → deep-frozen { global, places }. Place = one
+                          directory under appRoot; domains fs / require / import.
 lib/cache.js              Pool + SegmentRegistry + FilesystemCache (SAB allocator).
-                          No Node.js or external deps. Reader injected from kernel.
-lib/scanner.js            scan(rootPath, {ext, startPath}) → {files, dirs}; getKey().
-lib/config.js             VfsConfig: defaults → app → per-place → CLI; deep-frozen.
-lib/place.js              Place: logical namespace; live `files` Map updated by kernel.
-lib/registry.js           PlacementRegistry + helper absPathOf.
-                          Domain+path → place; mount → place; routeByMount(absPath).
-lib/kernel.js             VFSKernel: facade + orchestrator. Owns cache, projection,
-                          watcher, ACK tracking.
-lib/module-cache.js       ModuleCache: V8 bytecode compilation (companion entries).
-                          Deps injected: { cache, projectInto }. No kernel back-ref.
-lib/compression-cache.js  CompressionCache: gzip/deflate/br/zstd representations.
-                          Deps injected: { cache, projectInto, console }.
-lib/companion.js          NUL-separated companion keys: `<source>\0<tag>`.
-lib/adapters/*            fs-patch.js, require-hook.js, import-hook.mjs.
-                          Each exposes install(kernel) / uninstall().
-lib/bootstrap/*           preload.cjs (--require), register.mjs (--import).
-lib/providers/*           [planned] memory.js (per-thread writable), sea.js (SEA assets).
-index.js                  Public API: FilesystemCache, VfsConfig, Place, VFSKernel.
+                          No Node deps; reader injected. Companion-aware only via keys.
+lib/scanner.js            scan(root, { ext, startPath, followSymlinks }) → Map<key, FileInput>.
+lib/watcher.js            DirWatcher: recursive fs.watch → debounced 'epoch' Map<path, event>.
+lib/place.js              Place (internal): files projection, entry(), visible(), isDirectory().
+lib/place-fs.js           PlaceFs: public per-place facade returned by kernel.fs(name).
+lib/memory-store.js       MemoryStore: mutations of a memory place (owned Buffers + bytecode).
+lib/registry.js           PlaceRegistry (path → place, key) + FsRouter (read / mutate decisions).
+lib/module-cache.js       ModuleCache: V8 cached data companions. Deps injected.
+lib/compression-cache.js  CompressionCache: gzip/deflate/br/zstd companions. Deps injected.
+lib/companion.js          bytecodeKey(src) = src\0require:bytecode; compressedKey(src, enc) = src\0fs:enc.
+lib/stats.js              VfsStats / VfsBigIntStats / VfsDirent — lazy facades over { size, mtimeMs }.
+lib/errors.js             fsError(code, syscall, path) — node:fs-shaped errors.
+lib/kernel.js             VfsKernel: lifecycle, providers, projection, watcher pipeline,
+                          vfs-update broadcast, ACK-before-free, link(), worker projection.
+lib/adapters/fs-patch.js  Table-driven node:fs patch executing FsRouter decisions.
+lib/adapters/module-hook.js  module.registerHooks resolve/load (CJS + ESM) + _compile bytecode.
+lib/bootstrap/register.mjs   `node --import shared-memory-fs/register` (main thread only).
+lib/bootstrap/attach.js      attach(link) for worker threads (preloads do not run in workers).
+index.js                  VfsConfig, VfsKernel, PlaceFs, FilesystemCache, VfsStats, VfsDirent,
+                          attach, `kernel` getter (= VfsKernel.current).
 ```
+
+Removed for good: `domains`, `dir`, root-level `ext/compile/compress/extOnExtra`,
+`preload.cjs`, `require-hook.js`, `import-hook.mjs`, `vfs:` URL scheme, metawatch.
 
 ## Naming
 
-See `/memories/naming.md`. No tautological identifiers (no `place.placement`,
-`placementToPlace`, etc.). Prefer one source of truth and short field names.
+See `/memories/naming.md`. No tautologies, no owner-type prefixes in fields.
+Classes: `VfsConfig`, `VfsKernel`, `PlaceFs`, `PlaceRegistry`, `FsRouter`.
+
+## Place / Domain Model
+
+- `places.<name>` — name **is** the directory under appRoot, the mount, the cache
+  namespace and the snapshot/delta key. ASCII `[A-Za-z0-9][A-Za-z0-9._-]*`, no
+  trailing dot, no Windows reserved names, no two names equal after lowercasing.
+- One provider per place: `sab` (default), `memory`, `sea`, `disk`, `node-default`.
+  `INDEXED` = sab | memory | sea (have a files Map); `SHARED` = sab | sea (bytes in SAB).
+- Domains: `fs`, `require`, `import` — each `false`/absent, `true` (defaults) or object.
+  - `fs: { ext, writable, zeroCopy, compress }`; `require: { ext, compile }` (compile
+    default **true**); `import: { ext }`. Defaults: require ext `js,cjs,json`; import
+    ext `js,mjs,json`; fs ext null = everything.
+- `scanExt` (resolved, internal): null when fs is on without ext, else ordered union
+  fs → require → import. Scanner loads a raw file once; each domain re-checks its ext.
+- Provider rules (config errors): sea+writable; disk|node-default + compile:true (must
+  write `require: { compile: false }`); zeroCopy needs INDEXED; compress needs SHARED;
+  retainRaw:false needs sab and no compile; node-default fs takes no options;
+  `place.maxFileSize <= segmentSize` for SHARED; `maxFileSize <= segmentSize <= limit`.
+- Global: `memory.{limit,segmentSize,maxFileSize}`, `compaction.threshold` (0 = off),
+  `hooks.{fs,module}`, `watch`, `watchTimeout`, `strict`. Booleans must be booleans;
+  CLI (`--vfs.defaults.*`, `--vfs.places.<n>.*`, `--vfs.enable/disable`) coerces
+  "true"/"false"/numbers only. `setNested` rejects `__proto__|prototype|constructor`.
+- `config.raw` — the (merged) input, frozen and cloneable; workers rebuild from it.
 
 ## Invariants (must hold)
 
-- **Zero-copy reads**: workers receive `Buffer.from(sab, offset, length)` views,
-  never per-worker copies of file data.
-- **Frozen config**: VfsConfig is deep-frozen after construction; no runtime mutation.
-- **ACK-before-free**: shared entries replaced/deleted by the main thread are freed
-  only after every live worker ACKs the corresponding `updateId`, or after a worker
-  exits and `handleWorkerExit()` removes it from pending sets.
-- **Segments stay**: empty segments are kept in `Pool.emptySegmentIds` for reuse,
-  never returned to the OS.
-- **Single segment type**: only `baseSegmentSize`-sized segments. Files larger than
-  `maxFileSize` always become disk entries.
-- **No collateral mutation during iteration**: `handleWorkerExit()` collects
-  updateIds first, then frees outside the loop.
-- **One source of truth per concept**: a place's mount lives in `place.mount` (from `config.dir`);
-  derive everything else through `place.mount` / `absPathOf()` / `registry.byMount`.
-- **Companions are internal**: bytecode and compressed representations live under
-  `<source>\0<tag>` keys. Never expose them through `list()`, `exists()`, the path
-  index or the patched `fs`; the NUL separator keeps them from colliding with files.
-- **No mixed versions**: a source and its representations are published in one
-  `file-update`. A representation that fails to rebuild is invalidated through
-  `removals` in that same message, never in a separate delete.
-- **No bogus entries**: compressed bytes exist only in memory, so they are allocated
-  with `{ fallback: false }` — a disk entry would point at the raw file.
-
-## Cache (lib/cache.js)
-
-- Self-contained, no Node.js built-in or external deps.
-- `baseSegmentSize = ceil(maxFileSize / configured) * configured`.
-- `load()` sorts files by descending size before allocating (pack large first).
-- `SegmentRegistry.allocate()` order: best-fit free extent → tail of partial segment
-  → new segment → null (caller decides disk fallback).
-- Entries are internal records; do not leak shape to consumers — use Place API.
-- `compact(threshold)` may legitimately return null. Threshold is supplied by caller.
+- **Zero-copy internally**: projections are `Buffer.from(sab, offset, length)` views.
+  Publicly, `readFile*` returns owned copies; `*View` methods and stream chunks are
+  borrowed views **only** when `fs.zeroCopy: true`, else ENOTSUP / copies.
+- **Frozen config**: deep-frozen after construction; never mutated at runtime.
+- **ACK-before-free**: bytes replaced/removed by the main thread are freed only after
+  every live worker (`getWorkerIds()` ∪ `link()` ports) ACKs the `updateId`, or exits.
+- **Compaction never overwrites ACK-pending bytes**: the emptied segment is _closed_
+  (no allocations) until `used === 0`; only then it joins `emptySegmentIds`.
+- **Segments stay**: emptied segments are reused, never returned to the OS. One
+  segment size; files above `maxFileSize` become disk entries; companions are bounded
+  by the segment size only and always `fallback: false`.
+- **Stable source reads**: `readInto` verifies size+mtime before and after a looped
+  read. Init: any failure aborts `initialize()` (kernel → closed). Watcher: failed
+  source is not published, old source and companions stay, exactly one deferred
+  recheck, then only a real event retries.
+- **No mixed versions**: source + companions of one file are published in one
+  `vfs-update`; a companion that fails to rebuild is listed in `removals` of that same
+  message. Syntax-invalid sources are still published (VFS mirrors current state).
+- **Companions are internal**: `<source>\0…` keys never appear in readdir/exists/
+  routing/patched fs; `compressed API` accepts configured encodings only; bytecode is
+  reachable only through `kernel.bytecode(absPath)`.
+- **Kernel-internal disk I/O bypasses the patch**: scanner/kernel/watcher destructure
+  `node:fs` functions at load time so a strict sandbox never blocks the kernel.
+- **Router decides, adapters execute**: fs-patch and module-hook never read config.
+- **Unpatched fs stays unpatched**: `install()` records every replaced property;
+  `uninstall()` restores them in reverse; `.native` variants are preserved.
 
 ## Kernel (lib/kernel.js)
 
-- Consumer-facing class. Construct with frozen `VfsConfig`, then `await initialize()`.
-- Injects a Node.js reader using `fs.open()` + `fh.read()` into a Buffer view over SAB.
-- Watcher uses metawatch `before` / `change` / `delete` / `after` epoch events.
-- Watch routing goes through `registry.routeByMount(absPath)` — no duplicate logic.
-- `#processChange(ep, ...)` receives the epoch by reference; never close over a mutable
-  `epoch` variable from async code.
-- `#flushEpoch()` emits at most one `file-update` and one `file-delete` per mount per
-  epoch. Old entries are tracked against the last `updateId` of the epoch.
-- No timeout-based forced free.
-- `#trackUpdate()` frees immediately when no workers are registered.
-- `#tryCompact()` runs after freeing entries; tracks `oldEntries` only against the
-  last `updateId` of the compaction batch.
-- `#broadcast()` isolates projection errors from consumer-callback errors via
-  separate try/catch.
-- `pathIndex` (`absPath → {place, key, fileKey}`) is built automatically by
-  `initialize()` and `fromSnapshot()`. No manual seal step. Companion keys
-  are excluded.
-- Projection is incremental: built once on init via `#projectMount()`, mutated
-  thereafter via `#projectInto()` / `#applyUpdate()` / `#applyDelete()`. No full
-  rebuild after compile.
-- `close()` stops the watcher and clears all internal maps.
+- States `new → initializing → ready → closed` (final). `fs()`, `snapshot()`,
+  `watch()`, `link()` require `ready`. `initialize()` failure closes the kernel.
+- Init per place: sab → scan + `cache.load` + project; sea → assets `<name>/…` → load;
+  memory → `MemoryStore`; disk/node-default → nothing. Then bytecode and compression
+  passes for SHARED places.
+- `watch()` starts when `defaults.watch` or any sab place has `fs.writable` (writes go
+  to disk; the watcher brings them into SAB — eventual consistency, no waitForUpdate).
+- Epoch pipeline (`#handleEpoch`): route each event; `delete` → `#unpublish` (source +
+  companions, prefix for dirs); `scan` → `#rescan` (new keys only); `change` →
+  `#refresh` → `#publish` (allocate raw → bytecode → compression → stage). Duplicate
+  publishes within an epoch are dropped (`ep.seen`). One `vfs-update` per epoch.
+- `resolveModule(absPath, domain)` → `{ place, key, file } | { denied } | null`:
+  node-default → null; domain off → denied/null; disk → null; unpublished/invisible/
+  disk-backed → denied (strict) or null.
+- `link()` → `{ vfs: { snapshot, config: raw, appRoot, port }, transferList }`; the
+  kernel posts every `vfs-update` to link ports, reads `ack-update`, and treats port
+  `close` as worker exit.
+- `close()` is final: it stops the watcher, drops deferred work, projections and the
+  caches themselves, so the SAB pool becomes collectable.
+- Worker: `VfsKernel.fromSnapshot(snapshot, config, { appRoot })`; `handleDelta(msg)`.
 
-### Worker side
-
-- `VFSKernel.fromSnapshot(snapshot, config, options)` returns a read-only kernel:
-  no cache, no watcher, no ACK tracking. Builds segmentsMap, projects filesystems,
-  registers places, builds pathIndex.
-- `handleDelta(msg)` applies `file-update` / `file-delete` incrementally
-  (segments, projected files, pathIndex).
-- Workers send `{ name: 'ack-update', updateId }` after each delta.
-
-## Config (lib/config.js)
-
-- Cascade: hardcoded `DEFAULTS` → `raw.defaults` → per-place → CLI overrides.
-- Sizes parsed by `metautil.sizeToBytes()` (binary and decimal units).
-- `fromArgv()` uses a `SKIP` sentinel to avoid double construction.
-- `compile: true` auto-adds `'require'` to `domains`. Main-thread-only flag —
-  workers ignore it.
-- Validation: domain, provider, dir required, dir overlap per domain.
-- `compress` resolves to `{ codecs: [{encoding, options}], ext, retainRaw }`.
-  `options: null` means the codec runs with native zlib defaults — the library
-  never injects its own level. Compression requires provider `sab`;
-  `retainRaw: false` is incompatible with `compile`.
-
-Live config keys (Phase 1 baseline; Phases 3+ may extend):
+## Protocol
 
 ```
-defaults.memory.{limit, segmentSize, maxFileSize}
-defaults.compaction.threshold
-defaults.hooks.{fs, require, import}
-defaults.watchTimeout
-places.<name>.{enabled, domains, dir, provider, ext, maxFileSize, compile}
-places.<name>.compress.{encodings, options, ext, retainRaw}
+snapshot   { segments: [{ id, sab }], places: { <name>: { entries: [[key, entry]] } } }
+vfs-update { name, updateId, places: { <name>: { entries: [[key, entry]], removals: [key] } },
+             newSegments: [{ id, sab }] }
+ack-update { name: 'ack-update', updateId }
+entry      shared { kind, segmentId, offset, length, stat } | disk { kind, path, stat }
+stat       { size, mtimeMs } (+ sourceSize, encoding for compressed companions)
 ```
 
-Removed in Phase 1 (do not reintroduce without a real consumer):
-`mode`, `gc.*`, `policy.*`, `readonly`, `writeNamespace`, `sab-write`, `hooks.diagnostics`.
+## FS Routing (lib/registry.js)
 
-## Place (lib/place.js)
+- `PlaceRegistry.route(abs)` → `null` (outside appRoot), `{ place: null }` (under
+  appRoot, owned by nobody — a managed denial at any depth), or `{ place, key }`
+  ('' = mount root). The router never stats the disk.
+- `FsRouter.read` → `file` (published, visible, in memory) | `dir` (implicit) |
+  `passthrough` (outside, node-default, disk, disk-backed entry, non-strict miss) |
+  `deny EACCES` (strict: unowned path, no fs domain, unpublished/invisible in indexed).
+- `FsRouter.mutate` → `memory` | `passthrough` (node-default, writable sab/disk) |
+  `deny EROFS` (writable false, sea) | `deny EACCES` (strict unowned / no fs domain).
+- Implemented: readFile, stat, lstat, access, realpath, readdir, open (ENOTSUP on
+  virtual entries), existsSync, createReadStream, writeFile, appendFile, unlink,
+  mkdir, rm, rename (cross-place → EXDEV) — sync/callback/promises.
+- Guarded, not implemented: copyFile, cp, opendir, rmdir, chmod/lchmod, chown/lchown,
+  utimes/lutimes, truncate, link, symlink, readlink, statfs, watch, watchFile, glob.
+  They enforce the routing decision and otherwise call through, so an unimplemented
+  API can never bypass or probe the sandbox. Full node:fs compatibility is not
+  promised; anything outside both lists is untouched.
 
-- Constructor `(name, config)`. No provider parameter.
-- `files` is a live Map set by VFSKernel.
-- Read methods return `Buffer | null`, `stat | null`, `boolean`, `string | null`,
-  `string[]`, `Readable | null`.
-- `createReadStream(key, {start, end})` streams SAB data in 64 KB zero-copy chunks
-  (each chunk is `Buffer.from(sab, offset, chunkSize)`). Returns `null` for disk
-  entries or unknown keys.
-- Bytecode read: `place.getCachedData(key)` returns the companion `.cache` entry
-  buffer or null. Exact public name may evolve in Phase 2.
+## PlaceFs (lib/place-fs.js)
 
-## Adapters
+- Reads return `null` when missing; `readdir` throws ENOENT/ENOTDIR. Keys: exact, then
+  `'/' + key`; no other normalization. Mutations take `canonicalKey` (leading slash
+  added; NUL, `..`, backslash rejected).
+- `stat` → lazy `VfsStats` (dirs implicit, `{ bigint }` supported); never cached.
+- `createReadStream(key, { start, end, encoding, highWaterMark, signal })`: explicit
+  ranges are validated (RangeError), end inclusive, default hwm 64 KiB.
+- Memory mutations: write/append/unlink/mkdir(no-op)/rm(recursive, force)/rename
+  (companions follow). Writable sab/disk → `node:fs` sync ops on `pathOf(key)`.
 
-- Adapters use `kernel.resolveFsPath(absPath)` for fs routing and
-  `kernel.dispatchModuleResolve / dispatchModuleLoad` for module routing.
-- `fs-patch.js` — patches read APIs; passthrough when `resolveFsPath` returns null
-  or the entry is disk-backed (`data === null`). Writable APIs not yet implemented.
-- `require-hook.js` — patches `Module._resolveFilename` and
-  `Module.prototype._compile`. When `place.getCachedData(key)` returns a buffer,
-  uses `vm.Script({ cachedData })` and falls back to original `_compile` on
-  rejection or error.
-- `import-hook.mjs` — `resolve` shortcuts to a `vfs:` URL when VFS owns the file;
-  `load` returns source for `vfs:` URLs.
-- Each adapter exports `install(kernel) / uninstall()` and stores the kernel in
-  module scope.
+## Module Hooks (lib/adapters/module-hook.js)
+
+- `module.registerHooks({ resolve, load })` — sync, in-thread, one chain for
+  `require()` and `import`. Domain = `context.conditions.includes('require')`.
+- VFS modules keep **plain `file:` URLs**: identity equals the disk path, so
+  `import.meta.url`, `__filename`, `require.cache` behave normally.
+- require: LOAD_AS_FILE (`exact, .js, .cjs, .json`) then LOAD_AS_DIRECTORY
+  (`package.json` main, `index.*`) over published entries; no exports/imports maps.
+  import: extension mandatory; `.js` in the import domain is ESM, `.cjs` CommonJS;
+  JSON requires `with { type: 'json' }` (validated in `load`).
+- Strict: all candidates denied → `MODULE_NOT_FOUND` / `ERR_MODULE_NOT_FOUND`, never
+  a disk read. Non-strict miss → default resolver.
+- `_compile` patch: `vm.Script` with `cachedData`; `cachedDataRejected` or any
+  preparation error → original compiler once; the wrapper runs **outside** the guard
+  (a throwing module body never re-executes). `module.loaded` is left to Node.
+  `require` for the wrapper mirrors `makeRequireFunction` (`mod.require`, resolve,
+  paths, main, extensions, cache).
+- V8's per-isolate compilation cache masks `cachedDataRejected` for a source already
+  compiled in that isolate — prove acceptance in a worker, not in the compiling thread.
 
 ## Bootstrap
 
-- `preload.cjs` (--require): synchronous; creates kernel, installs CJS hooks, does
-  NOT call `initialize()`. Consumer must initialize before spawning workers.
-- `register.mjs` (--import): top-level await; creates, initializes, installs all
-  hooks, logs ready count.
+- `node --import shared-memory-fs/register app.js -- --vfs.config=… --vfs.*=…`
+  Config file: `--vfs.config` or `vfs.config.{js,cjs,mjs,json}` in cwd. Order: load
+  config → `initialize()` → install hooks (`hooks.fs`, `hooks.module`) → publish
+  `VfsKernel.current`. Failure: uninstall, close, rethrow → entry never runs.
+- Preloads (`--import`/`--require`) do **not** run in worker threads: workers call
+  `attach()` (reads `workerData.vfs` from `kernel.link()`), which projects the
+  snapshot, installs hooks, applies `vfs-update` deltas from the port and ACKs
+  those — and only those — back.
 
-## Required Behavior (do not break)
+## Strict Sandbox
 
-- No per-worker file copies.
-- No mutation of frozen config at runtime.
-- `snapshot()`, delta broadcasting, ACK flow, disk fallback semantics.
-- `handleWorkerExit()` removes the dead worker from all pending ACK sets.
-- `close()` releases watcher and clears state.
+**`strict: true` makes appRoot the sandbox boundary.** Every path under appRoot that
+no place owns is denied with EACCES — at every depth, file or directory alike, and
+without the router ever touching the disk. Consequences to design around:
+
+- A trusted entry point and its package metadata (`package.json`, lockfiles) must
+  live **outside appRoot**, or inside an explicitly configured `node-default` /
+  `disk` place. Under strict, appRoot should contain place directories and nothing
+  else. See `test/fixtures/sandbox` + `strict-app.cjs` for the canonical layout.
+- Indexed mounts: only published, fs-visible entries are readable; unpublished or
+  excluded-ext paths → EACCES, no disk fallback (disk-backed entries excepted).
+- `disk` → managed passthrough with writable policy; `node-default` → ordinary Node.
+  Paths outside appRoot → ordinary Node. Scanner does not follow symlinks.
+- The denial is enforced for every routed API, including the guarded ones: reads,
+  listings (`readdir`, `opendir`, `glob`), copies (`copyFile`, `cp -r`), metadata
+  writes and `watch` / `watchFile`, so a denied path cannot even be probed.
+- Same-process places are not firewalled from each other; isolation = one worker per
+  tenant with its own link.
 
 ## Tests And Docs
 
-- Update tests in the same change as allocator / projection / ACK / watch / placement
-  changes.
-- Keep `doc/` and `README.md` aligned with current branch.
-- Update this file when a stated invariant or a module's responsibilities change.
-- Do not document implementation details that are likely to drift; describe
-  contracts and invariants.
+- `node --test test/*.test.js` (166 tests; one symlink test skips where links are
+  unavailable). `npm run lint` = eslint + prettier. Bootstrap and hooks tests use
+  child processes / workers — never install hooks in the runner process without
+  uninstalling in `after`.
+- Update tests in the same change as allocator / projection / ACK / watch / routing
+  changes. Keep README, `doc/` and this file aligned with the code.

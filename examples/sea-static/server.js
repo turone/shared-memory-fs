@@ -12,8 +12,7 @@
 // Build SEA binary: see README in this directory.
 
 const http = require('node:http');
-const { VfsConfig, VFSKernel } = require('../..');
-const fsPatch = require('../../lib/adapters/fs-patch.js');
+const { VfsConfig, VfsKernel } = require('../..');
 
 const APP_ROOT = __dirname;
 let isSea = false;
@@ -26,20 +25,16 @@ try {
 const config = new VfsConfig({
   defaults: {
     memory: { limit: '512 kib', segmentSize: '64 kib', maxFileSize: '64 kib' },
-    hooks: { fs: false, require: false, import: false },
   },
   places: {
     pub: {
-      domains: ['fs'],
-      dir: 'pub',
       provider: isSea ? 'sea' : 'sab',
-      ext: ['html', 'css', 'js', 'svg', 'json'],
-      extOnExtra: 'warn',
+      fs: { ext: ['html', 'css', 'js', 'svg', 'json'], zeroCopy: true },
     },
   },
 });
 
-const kernel = new VFSKernel(config, { appRoot: APP_ROOT });
+const kernel = new VfsKernel(config, { appRoot: APP_ROOT });
 
 const MIME = {
   html: 'text/html; charset=utf-8',
@@ -51,14 +46,15 @@ const MIME = {
 
 (async () => {
   await kernel.initialize();
-  fsPatch.install(kernel);
 
-  const place = kernel.getPlace('pub');
+  // zeroCopy: the response body is a borrowed view over shared memory —
+  // consumed immediately by res.end(), never mutated or retained.
+  const pub = kernel.fs('pub');
 
   const server = http.createServer((req, res) => {
     const urlPath = req.url.split('?')[0];
     const key = urlPath === '/' ? '/index.html' : urlPath;
-    const data = place.readFile(key);
+    const data = pub.readFileView(key);
     if (!data) {
       res.statusCode = 404;
       return res.end('not found\n');
@@ -72,7 +68,7 @@ const MIME = {
   server.listen(3000, () => {
     const mode = isSea ? 'SEA' : 'disk (sab)';
     console.log(`listening on http://localhost:3000 [${mode}]`);
-    console.log(`pub entries: ${place.files.size}`);
+    console.log(`pub entries: ${pub.readdir('/', { recursive: true }).length}`);
   });
 })().catch((err) => {
   console.error(err);
