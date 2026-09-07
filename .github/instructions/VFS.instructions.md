@@ -95,6 +95,11 @@ Classes: `VfsConfig`, `VfsKernel`, `PlaceFs`, `PlaceRegistry`, `FsRouter`.
   reachable only through `kernel.bytecode(absPath)`.
 - **Kernel-internal disk I/O bypasses the patch**: scanner/kernel/watcher destructure
   `node:fs` functions at load time so a strict sandbox never blocks the kernel.
+- **`watchPath` is a load-bearing workaround, not tidy-up material**: on Windows an
+  8.3 alias in the watched path makes libuv abort the process (nodejs/node#63638).
+  It expands aliases through `fs.realpathSync.native` and never rewrites a path by
+  pattern — resolve or return untouched. Remove only when the engines floor clears
+  every affected release.
 - **Router decides, adapters execute**: fs-patch and module-hook never read config.
 - **Unpatched fs stays unpatched**: `install()` records every replaced property;
   `uninstall()` restores them in reverse; `.native` variants are preserved.
@@ -226,8 +231,9 @@ without the router ever touching the disk. Consequences to design around:
 
 ## Tests And Docs
 
-- `node --test test/*.test.js` (172 tests; one symlink test skips where links are
-  unavailable). `npm run lint` = eslint + prettier. Bootstrap and hooks tests use
+- `node --test test/*.test.js` (176 tests; one symlink test skips where links are
+  unavailable, the 8.3-alias tests skip off Windows). `npm run lint` = eslint +
+  prettier. Bootstrap and hooks tests use
   child processes / workers — never install hooks in the runner process without
   uninstalling in `after`.
 - CI runs both on Linux and Windows across Node 22.22.3 / 22.x / 24.x / 26.x.

@@ -532,6 +532,15 @@ The watcher relies on `fs.watch(dir, { recursive: true })`. That is
 unavailable on AIX and IBM i, where the live-reload features do not
 work; everything else does.
 
+On Windows the watcher resolves a place root through
+`fs.realpathSync.native` when the path contains an 8.3 alias segment
+(`C:\Users\RUNNER~1\...`). Node 24.16.0 through at least 24.20.0 abort
+the process otherwise ([nodejs/node#63638][63638], fixed upstream in
+libuv and being backported). Watch events keep the path form the place
+was configured with, so this is invisible to place keys.
+
+[63638]: https://github.com/nodejs/node/issues/63638
+
 `npm ci` needs no git or SSH access: dependencies resolve over HTTPS
 with lockfile integrity hashes.
 

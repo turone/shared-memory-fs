@@ -298,43 +298,102 @@ describe('watcher: linux edge events', () => {
   });
 });
 
-describe('DirWatcher.watch path form', () => {
-  it('expands 8.3 / alias roots so libuv compares long prefixes', async () => {
-    const os = require('node:os');
-    const { DirWatcher, longPath } = require('../lib/watcher.js');
-    const root = writeTree(tmpDir('watch-alias'), { 'a.txt': 'a' });
-    let alias = root;
-    if (process.platform !== 'win32') {
-      alias = path.join(path.dirname(root), `alias-${path.basename(root)}`);
-      fs.symlinkSync(root, alias);
+// Regression (nodejs/node#63638): libuv's recursive fs.watch on Windows aborts
+// the process when the watched path carries an 8.3 alias segment, so the
+// watcher hands fs.watch the long form. It must expand aliases at any depth,
+// and it must never invent a path it did not resolve -- the earlier heuristic
+// rewrote the alias to os.homedir() and so pointed at a different profile.
+describe('DirWatcher: 8.3 alias roots', () => {
+  const os = require('node:os');
+  const { execFileSync, spawnSync } = require('node:child_process');
+  const { watchPath } = require('../lib/watcher.js');
+  const win = process.platform === 'win32';
+
+  // The 8.3 alias of `dir`, or null when the volume has 8.3 names disabled.
+  // The `dir` header is localized, the short-name column is not.
+  const aliasOf = (dir) => {
+    const parent = path.dirname(dir);
+    const name = path.basename(dir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const out = execFileSync('cmd', ['/c', 'dir', '/x', '/a:d', parent], {
+      encoding: 'utf8',
+    });
+    const re = new RegExp(`\\s(\\S*~\\d\\S*)\\s+${name}\\s*$`, 'm');
+    const found = out.match(re);
+    return found ? path.join(parent, found[1]) : null;
+  };
+
+  it('passes ordinary paths through unchanged', () => {
+    const root = writeTree(tmpDir('watch-plain'), { 'a.txt': 'a' });
+    assert.equal(watchPath(root), path.resolve(root));
+    assert.equal(watchPath(path.join(root, 'sub', '..')), path.resolve(root));
+    rm(root);
+  });
+
+  it('never guesses: an alias it cannot resolve is left alone', (t) => {
+    if (!win) {
+      t.skip('windows only');
+      return;
     }
-    const expanded = longPath(alias);
-    if (process.platform === 'win32') {
-      const home = os.homedir();
-      if (/~[0-9]/.test(os.tmpdir()) && !/~[0-9]/.test(home)) {
-        assert.ok(
-          expanded.toLowerCase().startsWith(home.toLowerCase()),
-          `expected ${expanded} to start with ${home}`,
-        );
-      }
-    } else {
-      assert.equal(expanded, fs.realpathSync(root));
+    // The shape the old heuristic remapped onto os.homedir(): a profile
+    // directory that is not ours. Watching it would be the wrong tree.
+    // UNC and other drives take the same route -- the OS resolves them or
+    // the path is returned untouched; nothing is ever rewritten by pattern.
+    const foreign = path.join(path.dirname(os.homedir()), 'OTHERU~1', 'data');
+    assert.equal(watchPath(foreign), foreign);
+  });
+
+  it('expands an alias mid-path onto the same directory', (t) => {
+    if (!win) {
+      t.skip('windows only');
+      return;
     }
-    const watcher = new DirWatcher({ timeout: 40 });
-    const epochs = [];
-    watcher.on('epoch', (events) => epochs.push(events));
-    watcher.watch(alias);
-    fs.writeFileSync(path.join(root, 'b.txt'), 'b');
-    await until(
-      () =>
-        epochs.some((events) =>
-          [...events.keys()].some((p) => p.endsWith('b.txt')),
-        ),
-      4000,
-    );
-    assert.ok(epochs.length >= 1, 'alias watch published the write');
-    watcher.close();
-    if (alias !== root) fs.rmSync(alias, { force: true });
+    const root = writeTree(tmpDir('watch-alias'), { 'site/a.txt': 'a' });
+    const alias = aliasOf(root);
+    if (!alias) {
+      rm(root);
+      t.skip('8.3 names disabled on this volume');
+      return;
+    }
+    // C:\...\WATCH-~1\site -- the alias is a parent, as with RUNNER~1 on CI.
+    const viaAlias = watchPath(path.join(alias, 'site'));
+    assert.ok(!/~\d/.test(viaAlias), `still short: ${viaAlias}`);
+    assert.equal(viaAlias, watchPath(path.join(root, 'site')));
+    rm(root);
+  });
+
+  it('watches through an alias root without aborting', (t) => {
+    if (!win) {
+      t.skip('windows only');
+      return;
+    }
+    const root = writeTree(tmpDir('watch-abort'), { 'site/deep/a.txt': 'a' });
+    const alias = aliasOf(root);
+    if (!alias) {
+      rm(root);
+      t.skip('8.3 names disabled on this volume');
+      return;
+    }
+    // The abort would take the test reporter with it, so the watch runs in a
+    // child process and its exit code is the assertion.
+    const module = JSON.stringify(require.resolve('../lib/watcher.js'));
+    const child = `
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const { DirWatcher } = require(${module});
+      const [alias, root] = process.argv.slice(1);
+      const watcher = new DirWatcher({ timeout: 30 });
+      watcher.on('error', () => {});
+      watcher.on('epoch', () => {});
+      watcher.watch(alias);
+      setTimeout(() => {
+        fs.writeFileSync(path.join(root, 'site', 'deep', 'b.txt'), 'b');
+        setTimeout(() => watcher.close(), 600);
+      }, 200);
+    `;
+    const res = spawnSync(process.execPath, ['-e', child, alias, root], {
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 0, `libuv abort: ${res.stderr}`);
     rm(root);
   });
 });
