@@ -299,8 +299,8 @@ describe('watcher: linux edge events', () => {
 });
 
 describe('DirWatcher.watch path form', () => {
-  it('watches the real path when the given root is an alias', async () => {
-    const { DirWatcher } = require('../lib/watcher.js');
+  it('expands 8.3 / alias roots so libuv compares long prefixes', async () => {
+    const { DirWatcher, longPath } = require('../lib/watcher.js');
     const root = writeTree(tmpDir('watch-alias'), { 'a.txt': 'a' });
     let alias = root;
     if (process.platform === 'win32') {
@@ -323,6 +323,17 @@ describe('DirWatcher.watch path form', () => {
     } else {
       alias = path.join(path.dirname(root), `alias-${path.basename(root)}`);
       fs.symlinkSync(root, alias);
+    }
+    const expanded = longPath(alias);
+    assert.equal(
+      expanded,
+      path.dirname(fs.realpathSync(path.join(root, 'a.txt'))),
+    );
+    if (process.platform === 'win32') {
+      assert.ok(
+        !/~[0-9]/.test(expanded),
+        `watch path still has an 8.3 segment: ${expanded}`,
+      );
     }
     const watcher = new DirWatcher({ timeout: 40 });
     const epochs = [];
