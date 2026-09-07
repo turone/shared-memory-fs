@@ -298,6 +298,53 @@ describe('watcher: linux edge events', () => {
   });
 });
 
+describe('DirWatcher.watch path form', () => {
+  it('watches the real path when the given root is an alias', async () => {
+    const { DirWatcher } = require('../lib/watcher.js');
+    const root = writeTree(tmpDir('watch-alias'), { 'a.txt': 'a' });
+    let alias = root;
+    if (process.platform === 'win32') {
+      try {
+        const { execFileSync } = require('node:child_process');
+        const escaped = root.replace(/'/g, "''");
+        const short = execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-Command',
+            `$f = New-Object -ComObject Scripting.FileSystemObject; $f.GetFolder('${escaped}').ShortPath`,
+          ],
+          { encoding: 'utf8' },
+        ).trim();
+        if (short) alias = short;
+      } catch {
+        alias = root;
+      }
+    } else {
+      alias = path.join(path.dirname(root), `alias-${path.basename(root)}`);
+      fs.symlinkSync(root, alias);
+    }
+    const watcher = new DirWatcher({ timeout: 40 });
+    const epochs = [];
+    watcher.on('epoch', (events) => epochs.push(events));
+    watcher.watch(alias);
+    fs.writeFileSync(path.join(root, 'b.txt'), 'b');
+    await until(
+      () =>
+        epochs.some((events) =>
+          [...events.keys()].some((p) => p.endsWith('b.txt')),
+        ),
+      4000,
+    );
+    assert.ok(epochs.length >= 1, 'alias watch published the write');
+    watcher.close();
+    if (alias !== root && fs.lstatSync(alias).isSymbolicLink()) {
+      fs.rmSync(alias, { force: true });
+    }
+    rm(root);
+  });
+});
+
 describe('DirWatcher.close', () => {
   it('drops watchers, the debounce timer and the queued epoch', async () => {
     const { DirWatcher } = require('../lib/watcher.js');
