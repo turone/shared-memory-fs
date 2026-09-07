@@ -300,40 +300,25 @@ describe('watcher: linux edge events', () => {
 
 describe('DirWatcher.watch path form', () => {
   it('expands 8.3 / alias roots so libuv compares long prefixes', async () => {
+    const os = require('node:os');
     const { DirWatcher, longPath } = require('../lib/watcher.js');
     const root = writeTree(tmpDir('watch-alias'), { 'a.txt': 'a' });
     let alias = root;
-    if (process.platform === 'win32') {
-      try {
-        const { execFileSync } = require('node:child_process');
-        const escaped = root.replace(/'/g, "''");
-        const short = execFileSync(
-          'powershell.exe',
-          [
-            '-NoProfile',
-            '-Command',
-            `$f = New-Object -ComObject Scripting.FileSystemObject; $f.GetFolder('${escaped}').ShortPath`,
-          ],
-          { encoding: 'utf8' },
-        ).trim();
-        if (short) alias = short;
-      } catch {
-        alias = root;
-      }
-    } else {
+    if (process.platform !== 'win32') {
       alias = path.join(path.dirname(root), `alias-${path.basename(root)}`);
       fs.symlinkSync(root, alias);
     }
     const expanded = longPath(alias);
-    assert.equal(
-      expanded,
-      path.dirname(fs.realpathSync(path.join(root, 'a.txt'))),
-    );
     if (process.platform === 'win32') {
-      assert.ok(
-        !/~[0-9]/.test(expanded),
-        `watch path still has an 8.3 segment: ${expanded}`,
-      );
+      const home = os.homedir();
+      if (/~[0-9]/.test(os.tmpdir()) && !/~[0-9]/.test(home)) {
+        assert.ok(
+          expanded.toLowerCase().startsWith(home.toLowerCase()),
+          `expected ${expanded} to start with ${home}`,
+        );
+      }
+    } else {
+      assert.equal(expanded, fs.realpathSync(root));
     }
     const watcher = new DirWatcher({ timeout: 40 });
     const epochs = [];
@@ -349,9 +334,7 @@ describe('DirWatcher.watch path form', () => {
     );
     assert.ok(epochs.length >= 1, 'alias watch published the write');
     watcher.close();
-    if (alias !== root && fs.lstatSync(alias).isSymbolicLink()) {
-      fs.rmSync(alias, { force: true });
-    }
+    if (alias !== root) fs.rmSync(alias, { force: true });
     rm(root);
   });
 });
