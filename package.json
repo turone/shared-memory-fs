@@ -37,7 +37,7 @@
     "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\""
   },
   "engines": {
-    "node": ">=22.15.0"
+    "node": ">=22.22.3"
   },
   "dependencies": {
     "metautil": "github:turone/metautil#d7794fe4f1589a4b65e8e14ab9b925cccde2a89b"

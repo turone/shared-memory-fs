@@ -303,6 +303,48 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     k.close();
   });
 
+  it('handleWorkerExit during compaction frees relocated bytes', async () => {
+    const KB = 1024;
+    const workers = new Set(['w1']);
+    const empty = writeTree(tmpDir('kernel-compact'), {});
+    const k = await kernel(
+      empty,
+      { site: { fs: true } },
+      {
+        memory: {
+          limit: '16 kib',
+          segmentSize: '4 kib',
+          maxFileSize: '4 kib',
+        },
+        compaction: { threshold: 0.5 },
+      },
+      { getWorkerIds: () => workers },
+    );
+    const input = (n, fill) => ({
+      data: Buffer.alloc(n, fill),
+      stat: { size: n, mtimeMs: 1 },
+    });
+    const a = await k.cache.allocate('site', '/a', input(2 * KB, 'a'));
+    const b = await k.cache.allocate('site', '/b', input(2 * KB, 'b'));
+    const c = await k.cache.allocate('site', '/c', input(200, 'c'));
+    assert.equal(b.segmentId, 1);
+    assert.equal(c.segmentId, 2);
+    k.cache.remove('site', '/a');
+    k.pendingFrees.set(11, {
+      workerIds: new Set(workers),
+      entries: [a],
+    });
+    k.handleWorkerExit('w1');
+    assert.equal(k.cache.entry('site', '/c').segmentId, 1);
+    assert.equal(
+      k.pendingFrees.size,
+      0,
+      'exiting worker is not waited on for the compaction ACK',
+    );
+    k.close();
+    rm(empty);
+  });
+
   it('link() + attach(): a worker gets the projection, deltas and ACKs them', async () => {
     const k = await kernel(root, places, { watchTimeout: 50, watch: true });
     const { vfs, transferList } = k.link();

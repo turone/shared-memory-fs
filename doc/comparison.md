@@ -17,15 +17,15 @@ ecosystem as of 2026.
 | Concern                                | shared-memory-fs                                   | @platformatic/vfs                  | memfs                    |
 | -------------------------------------- | -------------------------------------------------- | ---------------------------------- | ------------------------ |
 | Cross-thread shared bytes (SAB)        | **Yes**                                            | No                                 | No                       |
-| V8 bytecode cache shared between WTs   | **Yes** (`compile: true`)                          | No                                 | No                       |
-| Pre-compressed representations in SAB  | **Yes** (`compress: {...}`)                        | No                                 | No                       |
+| V8 bytecode cache shared between WTs   | **Yes** (CJS `require.compile`)                    | No                                 | No                       |
+| Pre-compressed representations in SAB  | **Yes** (`fs.compress`)                            | No                                 | No                       |
 | `provider: 'sea'` (node:sea assets)    | **Yes**                                            | No                                 | No                       |
 | Multiple mounts in one instance        | **Yes** (`places: {...}`)                          | No (one `mount(prefix)` at a time) | n/a (no mount concept)   |
-| Per-mount ext whitelist + policy       | **Yes** (`ext` + `extOnExtra`)                     | No                                 | No                       |
+| Per-mount ext whitelist                | **Yes** (`fs` / `require` / `import` `.ext`)       | No                                 | No                       |
 | Strict appRoot sandbox (EACCES)        | **Yes** (`strict: true`)                           | Partial via `overlay: false`       | No                       |
-| `node:vfs` core API surface (FD, etc.) | Minimal                                            | **Full (extraction of core PR)**   | Partial                  |
+| `node:vfs` core API surface (FD, etc.) | Minimal (implemented + guarded lists)              | **Full (extraction of core PR)**   | Partial                  |
 | Sqlite persistence provider            | No (deferred)                                      | **Yes**                            | No                       |
-| LOC                                    | ~3000                                              | ~10k+ (full fs surface)            | ~5k                      |
+| LOC                                    | ~3500                                              | ~10k+ (full fs surface)            | ~5k                      |
 | Target use cases                       | Multi-thread server, SEA, hot-reload, multi-tenant | Future `node:vfs` reference impl   | Test mocks, in-memory fs |
 
 ## vs `@platformatic/vfs`
@@ -73,11 +73,12 @@ Hot path tested under [test/cache.test.js](../test/cache.test.js) and
 dozens of `application/lib/*.js` × `n` workers that's literal milliseconds
 per file × n on every spawn.
 
-Our [`compile: true`](../README.md#bytecode--compile-true) per-place
-generates V8 bytecode at init, stores it as a companion entry in the same
-SAB segment. Workers `vm.Script({ cachedData })` it zero-copy;
-`script.cachedDataRejected === false` confirmed in
-[test/adapter-require.test.js](../test/adapter-require.test.js).
+Our `require: { compile: true }` (the default when the require domain is
+on) generates V8 bytecode at init and stores it as an internal companion
+in the same SAB segment. Workers `vm.Script({ cachedData })` it
+zero-copy. Prove `cachedDataRejected === false` in a worker, not in the
+compiling thread — see [test/module-hook.test.js](../test/module-hook.test.js).
+There is no ESM bytecode cache.
 
 #### 3. No pre-compressed representations
 
@@ -86,13 +87,14 @@ which means either compressing the same asset on every request or bolting
 on a separate cache. Neither `@platformatic/vfs` nor `memfs` has a notion
 of several encodings of one file.
 
-Our `compress: { encodings: ['br', 'gzip'] }` builds each representation
-once during `initialize()` and stores it in SAB next to the source, so
-every worker answers from the same bytes with zero copies and zero CPU
-per request. `retainRaw: false` drops the uncompressed copy from memory
-entirely when only compressed responses are served. Representations are
-republished atomically with their source on watcher changes and freed only
-after ACK — see [test/compression.test.js](../test/compression.test.js).
+Our `fs.compress: { encodings: ['br', 'gzip'] }` builds each
+representation once during `initialize()` and stores it in SAB next to
+the source, so every worker answers from the same bytes with zero copies
+and zero CPU per request. `retainRaw: false` drops the uncompressed copy
+from memory entirely when only compressed responses are served.
+Representations are republished atomically with their source on watcher
+changes and freed only after ACK — see
+[test/compression.test.js](../test/compression.test.js).
 
 HTTP negotiation stays in the server: the library reports what it holds
 via `place.storedEncodings(key)` and never inspects `Accept-Encoding`.
@@ -118,16 +120,16 @@ We model mounts as **first-class config**:
 
 ```js
 new VfsConfig({
-  places: {
-    'tenant-a': { dir: 'tenant-a', provider: 'memory', ... },
-    'tenant-b': { dir: 'tenant-b', provider: 'memory', ... },
-    'static':   { dir: 'public', provider: 'sab',    ... },
+  places: {provider: 'memory', fs: { writable: true } },
+    'tenant-b': { provider: 'memory', fs: { writable: true } },
+    static: { fs: true },
   },
 });
 ```
 
-A single `PlacementRegistry` routes any path to the right place via
-`routeByMount(absPath)` — used by fs-patch, require-hook, import-hook,
+Place name **is** the directory under `appRoot`, the mount and the
+snapshot/delta key. `PlaceRegistry` + `FsRouter` route any path; fs-patch
+and module-hook execute those decisions and never read config)` — used by fs-patch, require-hook, import-hook,
 and watcher uniformly.
 
 #### 6. No per-mount extension whitelist
@@ -136,10 +138,10 @@ If `MemoryProvider` is fed `.bak`, `.tmp`, or `.swp` files, they live in
 the VFS forever. There is no policy for "this mount serves only `.html`
 and `.css`; warn me about anything else."
 
-Our `ext: ['html', 'css']` + `extOnExtra: 'silent' | 'warn' | 'error'`
-applies uniformly across scanner init, SEA loader init, memory
-`writeFile`, and watcher single-file changes — see
-[test/ext-whitelist.test.js](../test/ext-whitelist.test.js).
+Each domain has its own `ext`. Scanner `scanExt` is `null` (everything)
+when `fs` is on without `ext`, otherwise the ordered union fs → require
+→ import. The scanner loads a raw file once; each domain re-checks its
+ext. There is no `extOnExtra`.
 
 #### 7. Strict sandbox is coarse
 
@@ -149,10 +151,10 @@ unconditionally. There is no notion of "the project root is a closed
 world; warn me when code reads outside the registered mounts."
 
 Our `strict: true` makes `appRoot` a whitelist by mounts: paths under
-`appRoot` not owned by any place return `EACCES` from the patched fs;
-paths outside `appRoot` pass through untouched. See
-[examples/multi-tenant/](../examples/multi-tenant/) and
-[test/strict.test.js](../test/strict.test.js).
+`appRoot` not owned by any place return `EACCES` from every routed API
+(implemented and guarded); paths outside `appRoot` pass through
+untouched. See [examples/multi-tenant/](../examples/multi-tenant/) and
+[test/fs-patch.test.js](../test/fs-patch.test.js).
 
 #### 8. Persistent SqliteProvider is a separate axis
 
@@ -218,7 +220,7 @@ We are intentionally **narrower** than `@platformatic/vfs`.
 filesystem contract. Our job is to be a focused **multi-thread / SEA /
 bytecode / compression preset** that solves the real problems listed at
 the top of this document, with as little code as possible (~3500 LOC,
-209 tests).
+172 tests).
 
 When `node:vfs` lands (or for users of `@platformatic/vfs` today), the
 natural integration shape is a thin adapter:
@@ -226,7 +228,7 @@ natural integration shape is a thin adapter:
 ```
 class SABProvider extends VirtualProvider {
   // ~50 LOC: openSync/readSync/closeSync wrap place.readFile + cursor
-  // statSync/readdirSync use place.stat / place.list
+  // statSync/readdirSync use place.stat / place.readdir
 }
 ```
 
@@ -234,6 +236,5 @@ Our kernel becomes the backing store; the `VirtualProvider` base class
 gives us the rest of the fs surface for free. That keeps our codebase
 small while making us callable from any `node:vfs`-using application.
 
-This adapter is **not built yet** — it is the next planned milestone
-once core `node:vfs` ships. See `/memories/session/plan.md` for the
-roadmap.
+This adapter is **not built yet**. Full `node:fs` compatibility is not
+promised; see the implemented vs guarded lists in the README.

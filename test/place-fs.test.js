@@ -346,6 +346,22 @@ describe('PlaceFs: memory mutations', () => {
     assert.ok(!mem.exists('/t') && !mem.exists('/t/b/c.txt'));
   });
 
+  it('rm recursive/force combinations', () => {
+    mem.writeFile('/combo/a.txt', 'a');
+    mem.writeFile('/combo/b/c.txt', 'c');
+    assert.throws(() => mem.rm('/combo', { force: true }), {
+      code: 'ENOTEMPTY',
+    });
+    assert.throws(() => mem.rm('/combo-missing', { recursive: true }), {
+      code: 'ENOENT',
+    });
+    mem.rm('/combo-missing', { recursive: true, force: true });
+    mem.rm('/combo/a.txt', { recursive: true });
+    assert.ok(!mem.exists('/combo/a.txt'));
+    mem.rm('/combo', { recursive: true, force: true });
+    assert.ok(!mem.exists('/combo/b/c.txt'));
+  });
+
   it('rename moves source and companions inside the place', () => {
     mem.writeFile('/r1.js', 'module.exports = 4;');
     mem.rename('/r1.js', '/moved/r2.js');
@@ -389,9 +405,14 @@ describe('PlaceFs: writable sab place writes to disk', () => {
     data.appendFile('/b.txt', 'b');
     data.mkdir('/d');
     assert.ok(fs.statSync(path.join(root, 'data', 'd')).isDirectory());
+    data.mkdir('/nested/deep', { recursive: true });
+    assert.ok(
+      fs.statSync(path.join(root, 'data', 'nested', 'deep')).isDirectory(),
+    );
     data.rename('/b.txt', '/d/c.txt');
     data.unlink('/a.txt');
     data.rm('/d', { recursive: true });
+    data.rm('/nested', { recursive: true });
     assert.deepEqual(fs.readdirSync(path.join(root, 'data')), []);
     k.close();
     rm(root);

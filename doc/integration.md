@@ -8,63 +8,63 @@ hooks model, recipes, and design rationale.
 ```
 Main thread                                Worker threads
 ┌──────────────────────────────────┐       ┌──────────────────────────────┐
-│ VFSKernel (full)                 │       │ VFSKernel.fromSnapshot()     │
-│ ├─ VfsConfig (frozen)            │       │ ├─ same VfsConfig            │
+│ VfsKernel (full)                 │       │ attach() / fromSnapshot()    │
+│ ├─ VfsConfig (frozen)            │       │ ├─ same VfsConfig from raw   │
 │ ├─ FilesystemCache               │       │ ├─ projected Maps (zero-copy)│
 │ │  └─ Pool + SegmentRegistry     │       │ ├─ per-thread memory places  │
-│ ├─ PlacementRegistry             │       │ ├─ pathIndex                 │
-│ ├─ Scanner                       │       │ └─ handleDelta()             │
-│ ├─ DirectoryWatcher (epochs)     │       └──────────────────────────────┘
-│ ├─ pathIndex                     │
-│ └─ pendingAcks: updateId→Set     │  snapshot()  ┐
-└──────────────────────────────────┘  ──────────► │ workerData
-                                       broadcast()│
-                                       ──────────►│ parentPort.on('message')
-                                       ◄────────  │ ack-update
+│ ├─ PlaceRegistry + FsRouter      │       │ └─ handleDelta()             │
+│ ├─ scanner                       │       └──────────────────────────────┘
+│ ├─ DirWatcher (epochs)           │  link() → workerData.vfs
+│ └─ pendingFrees: updateId→Set    │  vfs-update ──────────►
+└──────────────────────────────────┘  ack-update  ◄──────────
 SAB segments ─────────── shared physical memory ─────────── zero-copy views
 ```
 
 Invariants:
 
 - Workers never write SAB.
-- ACK-before-free: stale entries are freed only after every active worker has
-  ACK'd the update that supersedes them.
-- Empty segments are recycled, never returned to the OS.
-- Config is deep-frozen at construction.
-- File keys start with `/` and use forward slashes on all platforms.
-- `compile` is main-thread-only; workers ignore it.
+- ACK-before-free: stale entries are freed only after every live worker
+  (`getWorkerIds()` ∪ `link()` ports) ACKs the `updateId`, or exits.
+- Empty segments are recycled, never returned to the OS. Compaction
+  _closes_ a segment until ACK-pending bytes are gone.
+- Config is deep-frozen at construction. Workers rebuild from `config.raw`.
+- Place name **is** the directory under `appRoot`, the mount and the
+  snapshot/delta key.
+- `require.compile` is main-thread-only; there is no ESM bytecode.
 
 ## Provider matrix
 
-|                       | `sab`       | `memory`             | `sea`             | `node-default` | `disk`             |
-| --------------------- | ----------- | -------------------- | ----------------- | -------------- | ------------------ |
-| Source                | scanned dir | empty per-thread     | `node:sea` assets | OS fs          | scanned dir        |
-| Storage               | SAB pool    | per-thread `Map`     | SAB pool          | OS fs          | OS fs (path entry) |
-| Writable              | no          | yes                  | no                | passthrough    | no                 |
-| Shared across workers | yes         | no                   | yes               | n/a            | metadata only      |
-| In `snapshot()`       | yes         | no (recreated empty) | yes               | n/a            | yes (paths)        |
-| Watched               | yes         | no                   | no                | n/a            | yes                |
-| `getCachedData()`     | yes         | yes (auto on write)  | yes               | n/a            | no                 |
+|                       | `sab`                   | `memory`             | `sea`             | `node-default` | `disk`                |
+| --------------------- | ----------------------- | -------------------- | ----------------- | -------------- | --------------------- |
+| Source                | scanned dir             | empty per-thread     | `node:sea` assets | OS fs          | OS path entries       |
+| Storage               | SAB pool                | per-thread `Map`     | SAB pool          | OS fs          | OS fs                 |
+| Writable              | disk + watch            | yes                  | no                | passthrough    | `fs.writable`         |
+| Shared across workers | yes                     | no                   | yes               | n/a            | metadata only         |
+| In `snapshot()`       | yes                     | no (recreated empty) | yes               | n/a            | no                    |
+| Watched               | if watch / writable sab | no                   | no                | n/a            | no                    |
+| Bytecode              | `kernel.bytecode`       | auto on write        | `kernel.bytecode` | n/a            | no (`compile: false`) |
+
+Writable sab writes go to disk; the watcher brings them into SAB
+(eventual consistency, no `waitForUpdate`).
 
 ## Worker message protocol
 
-Main → worker:
+Main → worker (`link()` port):
 
 ```js
-// File update (created or modified)
 {
-  name: 'file-update',
-  target: 'static',                   // place name
-  updateId: 7,                        // monotonic
-  updates: [
-    ['/index.html', { kind:'shared', segmentId:3, offset:0, length:42, stat }],
-    ['/index.html.cache', { kind:'shared', segmentId:3, offset:64, length:128, stat }],
-  ],
-  newSegments: [{ id: 3, sab: SharedArrayBuffer }],   // any newly-allocated
+  name: 'vfs-update',
+  updateId: 7,
+  places: {
+    static: {
+      entries: [
+        ['/index.html', { kind:'shared', segmentId:3, offset:0, length:42, stat }],
+      ],
+      removals: ['/old.html'],
+    },
+  },
+  newSegments: [{ id: 3, sab: SharedArrayBuffer }],
 }
-
-// File delete
-{ name: 'file-delete', target: 'static', updateId: 8, keys: ['/old.html'] }
 ```
 
 Worker → main:
@@ -73,33 +73,34 @@ Worker → main:
 { name: 'ack-update', updateId: 7 }
 ```
 
-Workers must apply the delta with `kernel.handleDelta(msg)` _before_ sending
-the ACK, otherwise the main thread might free SAB regions still in use.
+`attach()` applies `vfs-update` then ACKs **those — and only those** —
+messages. Manual `handleDelta(msg)` must run before the ACK, otherwise
+the main thread may free SAB still in use.
+
+There is no `file-update` / `file-delete`. One `vfs-update` per epoch.
+Source + companions of one file are published together; a companion that
+fails to rebuild is listed in `removals` of the same message.
 
 ## Hooks
 
-Three independent hook layers, all controlled by `defaults.hooks`:
+Two layers, `defaults.hooks.{fs,module}`:
 
-| Layer     | Patches                                                               | Reads                                                                                                       | Writes                                                                                                                   |
-| --------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `fs`      | `node:fs` (sync, callback, promises)                                  | `readFile`, `readFileSync`, `stat`, `statSync`, `existsSync`, `realpathSync`, `createReadStream` + promises | `writeFile`, `writeFileSync`, `unlink`, `unlinkSync`, `mkdirSync` (no-op for memory) + promises — only for memory mounts |
-| `require` | `Module._resolveFilename`, `Module.prototype._compile`                | resolves via VFS, compiles with `cachedData` when available                                                 | —                                                                                                                        |
-| `import`  | ESM loader (`register('shared-memory-fs/adapters/import-hook', ...)`) | resolves + reads source via VFS                                                                             | —                                                                                                                        |
+| Layer    | Mechanism                                              | Notes                                                                                      |
+| -------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `fs`     | table-driven `node:fs` patch (sync/callback/promises)  | Executes `FsRouter` decisions. Implemented vs guarded lists: see README.                   |
+| `module` | `module.registerHooks({ resolve, load })` + `_compile` | One chain for `require()` and `import`. Domain = `context.conditions.includes('require')`. |
 
-In strict mode, every patched read/write checks `kernel.isStrictDenied(path)`
-first and raises `EACCES` for unowned paths under `appRoot`.
-
-Manual install (when not using bootstrap):
+Manual install (when not using `--import shared-memory-fs/register`):
 
 ```js
 const fsPatch = require('shared-memory-fs/adapters/fs-patch');
-const requireHook = require('shared-memory-fs/adapters/require-hook');
+const moduleHook = require('shared-memory-fs/adapters/module-hook');
 fsPatch.install(kernel);
-requireHook.install(kernel);
-
-// ESM:  await register('shared-memory-fs/adapters/import-hook',
-//                     pathToFileURL('./'), { data: { kernel } });
+moduleHook.install(kernel);
 ```
+
+Workers: `attach()` installs whatever the config asks for. Preloads do
+not run in worker threads.
 
 ## Recipes
 
@@ -107,91 +108,92 @@ requireHook.install(kernel);
 
 ```js
 places: {
-  domain: { domains: ['fs'], dir: 'domain',
-            provider: 'sab', ext: ['js'], compile: true },
+  domain: {
+    fs: { ext: ['js'] },
+    require: { ext: ['js'], compile: true },
+  },
 }
 ```
 
-`initialize()` compiles every `.js` once, stores bytecode as `<key>.cache` in
-the same SAB segments, and projects both source and bytecode to workers via
+`initialize()` compiles every matching `.js` once, stores bytecode as an
+internal companion (`<source>\0require:bytecode`) in the same SAB
+segments, and projects both source and bytecode to workers via
 `snapshot()`. Workers `require('/abs/domain/x.js')` and the patched
-`_compile` calls `new vm.Script(wrapped, { cachedData: bytecode })`. V8 skips
-parse + compile for all functions, including lazy ones.
+`_compile` calls `new vm.Script(wrapped, { cachedData })`. V8 skips
+parse + compile for all functions, including lazy ones. There is no ESM
+bytecode cache.
 
-When the watcher detects a source change, it recompiles bytecode in the same
-epoch as the source update, and broadcasts both in one delta.
+When the watcher detects a source change, it recompiles bytecode in the
+same epoch and publishes both in one `vfs-update`.
 
 ### Sharing bytecode with `metavm`
 
-`Place.getCachedData(key)` returns the same `Buffer` shape that
+`kernel.bytecode(absPath)` returns the same `Buffer` shape that
 `metavm.createScript(source, { cachedData })` expects:
 
 ```js
 const metavm = require('metavm');
-const place = kernel.getPlace('domain');
-
-const source = place.readFile('/handler.js').toString('utf8');
-const cachedData = place.getCachedData('/handler.js');
+const abs = path.join(kernel.appRoot, 'domain', 'handler.js');
+const source = kernel.fs('domain').readFile('/handler.js', 'utf8');
+const cachedData = kernel.bytecode(abs);
 
 const script = metavm.createScript(source, {
-  filename: '/handler.js',
+  filename: abs,
   cachedData,
 });
 const handler = script.exports;
 ```
 
-This works in any thread that holds the snapshot — the bytecode lives in SAB
-and is shared zero-copy. If `cachedData` is `null` (place has no `compile` or
-file is non-JS), `metavm` will create cached data on first run as usual.
+This works in any thread that holds the snapshot — the bytecode lives in
+SAB and is shared zero-copy. If `cachedData` is `null` (place has no
+compile, or the file is non-JS), `metavm` creates cached data on first
+run as usual. Prove `cachedDataRejected === false` in a worker, not in
+the compiling thread: V8's per-isolate cache masks rejection there.
 
 ### AI agent / plugin sandbox
 
-Pattern: one writable `memory` place per agent (or per session), strict mode
-on, optional `sab` place for read-only tooling.
+Pattern: one writable `memory` place per agent (or per session), strict
+mode on, optional `sab` place for read-only tooling. The trusted entry
+and `package.json` live **outside `appRoot`**.
 
 ```js
 const config = new VfsConfig({
   defaults: { strict: true },
   places: {
     tools: {
-      domains: ['fs', 'require'],
-      dir: 'tools',
-      provider: 'sab',
-      ext: ['js'],
-      compile: true,
+      fs: { ext: ['js'] },
+      require: { ext: ['js'], compile: true },
     },
     workspace: {
-      domains: ['fs'],
-      dir: 'workspace',
       provider: 'memory',
+      fs: { writable: true },
     },
   },
 });
 
-// In any thread (main or worker — each has its own workspace):
-const ws = kernel.getPlace('workspace');
-ws.writeFile('/notes.md', Buffer.from('# scratch'));
-fs.writeFileSync('/abs/workspace/code.js', 'console.log(1)'); // also routed
-fs.readFileSync('/etc/passwd'); // EACCES
-fs.readFileSync('/abs/elsewhere/file'); // EACCES if under appRoot
+const ws = kernel.fs('workspace');
+ws.writeFile('/notes.md', '# scratch');
+fs.writeFileSync(path.join(appRoot, 'workspace', 'code.js'), 'console.log(1)');
+fs.readFileSync('/etc/passwd'); // ordinary Node (outside appRoot)
+fs.readFileSync(path.join(appRoot, 'elsewhere', 'file')); // EACCES
 ```
 
 Memory places are per-thread, so concurrent agents in different workers
-cannot see each other's scratch state — true isolation without IPC.
+cannot see each other's scratch state. Same-process places are **not**
+firewalled from each other.
 
 ### Static server with pre-compressed assets
 
 ```js
 const config = new VfsConfig({
   places: {
-    static: {
-      domains: ['fs'],
-      dir: 'public',
-      provider: 'sab',
-      compress: {
-        encodings: ['br', 'gzip'],
-        options: { br: { level: 11 }, gzip: { level: 9 } },
-        ext: 'compressible',
+    public: {
+      fs: {
+        compress: {
+          encodings: ['br', 'gzip'],
+          options: { br: { level: 11 }, gzip: { level: 9 } },
+          ext: 'compressible',
+        },
       },
     },
   },
@@ -201,7 +203,7 @@ const config = new VfsConfig({
 Every worker then answers from the same SAB bytes:
 
 ```js
-const place = kernel.getPlace('static');
+const place = kernel.fs('public');
 
 const pick = (key, accept) => {
   const stored = place.storedEncodings(key); // ['raw', 'br', 'gzip']
@@ -231,46 +233,47 @@ const serve = (req, res, key) => {
 };
 ```
 
-Parsing `Accept-Encoding` (q-values, `identity;q=0`, `*`) and choosing a
-preference order are the server's job: the library only reports what it holds.
-With `retainRaw: false` the `'raw'` branch has no SAB bytes — use
-`fs.createReadStream(place.filePath(key))` instead.
+Parsing `Accept-Encoding` is the server's job. With `retainRaw: false`
+the `'raw'` branch has no SAB bytes — use
+`fs.createReadStream(place.pathOf(key))` instead.
 
 ### Single-Executable Application bundling
 
 ```js
 // Build with sea-config.json:
-//   "assets": { "public/index.html": "./dist/index.html",
-//               "public/app.js":     "./dist/app.js" }
+//   "assets": { "pub/index.html": "./dist/index.html",
+//               "pub/app.js":     "./dist/app.js" }
 
 const config = new VfsConfig({
   places: {
-    app: { domains: ['fs'], dir: 'public', provider: 'sea' },
+    pub: { provider: 'sea', fs: true },
   },
 });
 ```
 
-At runtime the kernel calls `sea.getAssetKeys()`, copies each matching asset
-into SAB once, and projects to workers via snapshot. Outside an SEA build the
+At runtime the kernel copies each matching `node:sea` asset into SAB
+once and projects to workers via snapshot. Outside an SEA build the
 provider stays empty and logs a warning — the same code runs unmodified
-during development.
+during development. See [examples/sea-static/](../examples/sea-static/).
 
 ### Generated code with hot reload (no disk)
 
 ```js
 places: {
-  gen: { domains: ['fs', 'require'], dir: 'gen',
-         provider: 'memory', compile: true },
+  gen: {
+    provider: 'memory',
+    fs: { writable: true },
+    require: true,
+  },
 }
 
-// Generate, write, require — all in memory:
-gen.writeFile('/route.js', Buffer.from(generateRouteHandler(spec)));
-const handler = require('/abs/gen/route.js');  // bytecode-cached on write
+const gen = kernel.fs('gen');
+gen.writeFile('/route.js', generateRouteHandler(spec));
+const handler = require(path.join(appRoot, 'gen', 'route.js'));
 
-// Replace at any time:
-gen.writeFile('/route.js', Buffer.from(generateRouteHandler(newSpec)));
-delete require.cache['/abs/gen/route.js'];
-const next = require('/abs/gen/route.js');
+gen.writeFile('/route.js', generateRouteHandler(newSpec));
+delete require.cache[path.join(appRoot, 'gen', 'route.js')];
+const next = require(path.join(appRoot, 'gen', 'route.js'));
 ```
 
 ### Testing with virtual fixtures
@@ -280,10 +283,10 @@ const fs = require('node:fs');
 const fsPatch = require('shared-memory-fs/adapters/fs-patch');
 
 beforeEach(async () => {
-  kernel = new VFSKernel(testConfig, { appRoot: '/test' });
+  kernel = new VfsKernel(testConfig, { appRoot: '/test' });
   await kernel.initialize();
   fsPatch.install(kernel);
-  kernel.getPlace('fixtures').writeFile('/data.json', Buffer.from('{"a":1}'));
+  kernel.fs('fixtures').writeFile('/data.json', '{"a":1}');
 });
 
 afterEach(() => {
@@ -297,10 +300,12 @@ it('reads via patched fs', () => {
 });
 ```
 
+Never leave hooks installed on the test runner: uninstall in `after`.
+
 ## CLI overrides
 
 ```
-node app.js -- \
+node --import shared-memory-fs/register app.js -- \
   --vfs.defaults.memory.limit=512mib \
   --vfs.defaults.strict=true \
   --vfs.hooks.fs=false \
@@ -308,7 +313,8 @@ node app.js -- \
   --vfs.disable=static
 ```
 
-Use `VfsConfig.fromArgv(process.argv, appConfig)` to apply them.
+`VfsConfig.fromArgv(process.argv, appConfig)` applies the same flags
+when you construct the kernel yourself.
 
 ## Comparison with alternatives
 
@@ -318,50 +324,50 @@ proposal), `memfs`, and plain `node:fs`.
 
 ## Design notes
 
-**Why SAB.** A single physical copy of cached files, projected zero-copy into
-N workers. With 100 MiB of cached files and 8 workers, that's ~800 MiB saved
-versus per-worker MemoryProvider.
+**Why SAB.** A single physical copy of cached files, projected zero-copy
+into N workers. With 100 MiB of cached files and 8 workers, that's
+~800 MiB saved versus per-worker copies.
 
-**Why pooled segments.** One SAB per file would exhaust mmap regions quickly.
-A best-fit allocator over 64 MiB segments amortizes the cost; free extents are
-recycled and empty segments stay around to be reused, never returned to the OS.
+**Why pooled segments.** One SAB per file would exhaust mmap regions
+quickly. A best-fit allocator over 64 MiB segments amortizes the cost;
+free extents are recycled and empty segments stay around to be reused,
+never returned to the OS.
 
-**Why companion `.cache` keys.** V8 bytecode could be a second region inside
-each entry, but companion entries (`/x.js` + `/x.js.cache`) keep the
-allocator simple — every entry is one contiguous region — and bytecode flows
-through snapshot, delta, and ACK without special handling.
+**Why companion NUL keys.** V8 bytecode could be a second region inside
+each entry, but companions (`src\0require:bytecode`, `src\0fs:br`) keep
+the allocator simple — every entry is one contiguous region — and they
+flow through snapshot, delta and ACK without special handling. They
+never appear in `readdir` / patched `fs`.
 
-**Why main-thread-only compilation.** N workers compiling the same source is
-N× wasted CPU. The main thread compiles once during `initialize()`, stores
-bytecode in SAB, and workers consume it via `cachedData`. Workers stay
-read-only with respect to SAB.
+**Why main-thread-only compilation.** N workers compiling the same source
+is N× wasted CPU. The main thread compiles once during `initialize()`,
+stores bytecode in SAB, and workers consume it via `cachedData`. Workers
+stay read-only with respect to SAB. ESM has no bytecode cache.
 
-**Why per-thread memory places.** Concurrent agents/sessions in different
-workers must not see each other's scratch state. Memory places are
-deliberately not shared — `fromSnapshot()` instantiates each one empty.
-Cross-worker writable state would require ACK-before-free coordination on
-every write, which defeats the purpose of a fast scratch space.
+**Why per-thread memory places.** Concurrent agents in different workers
+must not see each other's scratch state. Memory places are deliberately
+not shared — `fromSnapshot()` / `attach()` instantiates each one empty.
+Cross-worker writable state would require ACK-before-free on every
+write, which defeats a fast scratch space.
 
-**Why strict mode at the kernel layer.** The patched `fs` is the only
-chokepoint that sees every read attempt; gating there is cheap (one Map
-lookup) and uniform across sync, async, and promises. Application-level
-sandboxing is bypassed by code that imports `node:fs` directly — kernel-level
-sandboxing is not.
+**Why strict mode at the router.** `FsRouter` is the chokepoint that sees
+every routed path; gating there is cheap and uniform across sync,
+callback, promises, and the guarded APIs. Application-level sandboxing
+is bypassed by `require('node:fs')` — kernel-level sandboxing is not.
 
 ## Integration checklist
 
-- [ ] Build `VfsConfig` matching your directory layout and provider mix.
-- [ ] Main: `new VFSKernel(config, { appRoot, broadcast, getWorkerIds })`.
+- [ ] Build `VfsConfig` matching your directory layout (place name =
+      folder = mount).
+- [ ] Main: `new VfsKernel(config, { appRoot })` (or
+      `--import shared-memory-fs/register`).
 - [ ] Main: `await kernel.initialize()` _before_ spawning workers.
-- [ ] Main: pass `kernel.snapshot()` via `workerData`.
-- [ ] Main: `kernel.watch()` after workers are up.
-- [ ] Main: forward `ack-update` → `kernel.handleAck`.
-- [ ] Main: forward worker exit → `kernel.handleWorkerExit`.
+- [ ] Main: `const { vfs, transferList } = kernel.link()`.
+- [ ] Worker: `new Worker(file, { workerData: { vfs }, transferList })`.
+- [ ] Worker: `attach()` first thing (preloads do not run in workers).
 - [ ] Main: `kernel.close()` on shutdown.
-- [ ] Worker: `VFSKernel.fromSnapshot(snapshot, config, { appRoot })`.
-- [ ] Worker: forward `file-update`/`file-delete` → `kernel.handleDelta`,
-      then post `{ name: 'ack-update', updateId }`.
-- [ ] Optional: install hooks (`fs-patch`, `require-hook`, `import-hook`) or
-      use the bootstrap `--require` / `--import` shortcuts.
-- [ ] Optional: enable `defaults.strict` for sandboxed workers.
-- [ ] Optional: add `compile: true` to JS places for V8 bytecode cache.
+- [ ] Optional: `defaults.strict` — entry + `package.json` outside
+      `appRoot`.
+- [ ] Optional: `require: { compile: true }` for CJS bytecode (default
+      when the require domain is on).
+- [ ] Optional: `fs.compress` for pre-compressed SAB representations.

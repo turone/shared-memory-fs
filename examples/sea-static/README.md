@@ -43,7 +43,7 @@ at init. The HTTP handler is unchanged.
 ## What this shows
 
 - One config, two providers — package without rewriting your server code.
-- `ext` whitelist (`html, css, js, svg, json`) keeps the `pub/` mount strict
-  even on disk; `extOnExtra: 'warn'` reports any drift.
-- SEA assets are copied into SAB once at boot, then served zero-copy via the
-  same `place.readFile()` API.
+- `fs.ext` (`html, css, js, svg, json`) keeps the `pub/` mount to those
+  files; unpublished paths stay off the place.
+- SEA assets are copied into SAB once at boot, then served zero-copy via
+  `place.readFileView()` (`fs.zeroCopy: true`).

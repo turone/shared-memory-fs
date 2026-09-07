@@ -1,34 +1,34 @@
 # shared-memory-fs
 
-SharedArrayBuffer-backed virtual filesystem for Node.js worker_threads.
+Pooled SharedArrayBuffer virtual filesystem for Node.js `worker_threads`,
+plus `node:fs` and `module.registerHooks` adapters.
 
-Files are loaded once on the main thread into pooled SAB segments. Workers get
-zero-copy `Buffer` views over the same memory — no per-worker copies, no
-serialization, no IPC for reads. Optional V8 bytecode cache compiles JS once
-and stores bytecode in SAB so workers skip parse + compile entirely.
+Files are loaded once on the main thread into pooled SAB segments. Workers
+get zero-copy `Buffer` views over the same memory — no per-worker copies,
+no serialization, no IPC for reads. Optional V8 bytecode
+(`require.compile`) is compiled once and stored in SAB so workers skip
+parse + compile. There is no ESM bytecode cache.
+
+Requires Node.js ≥ 22.22.3 (`module.registerHooks`; CJS `--import`
+bootstrap of memory-only modules).
 
 ## Features
 
-- **Zero-copy sharing across workers** — `Buffer.from(sab, offset, length)`
-  views, not copies.
-- **Pooled segments** — files packed into 64 MiB SAB segments with best-fit
-  allocation; segments recycled, never returned to OS.
-- **V8 bytecode cache** — `compile: true` per place, bytecode stored in SAB
-  next to source, workers skip V8 parse + compile (including lazy functions).
-- **Pre-compressed representations** — `gzip`, `deflate`, `br`, `zstd` built
-  once at startup and shared from SAB; the source can be dropped from memory
-  entirely. HTTP negotiation stays in your server.
-- **Live reload** — watcher batches changes into epochs, broadcasts deltas,
-  ACK-before-free guarantees no worker reads freed memory.
-- **Four providers** — `sab` (read-only shared cache), `memory` (per-thread
-  writable), `sea` (assets from a Single Executable Application),
-  `node-default` (passthrough).
-- **Strict sandbox mode** — deny disk reads under `appRoot` not owned by any
-  place; safe for AI agents, plugins, untrusted scripts.
-- **Transparent hooks** — patches `node:fs`, `Module._resolveFilename`/
-  `_compile`, and the ESM loader. No app code changes required.
-- **Chunked streaming** — `Place.createReadStream()` streams 64 KB zero-copy
-  chunks from SAB, with HTTP Range support.
+- **Zero-copy sharing** — internal projections are
+  `Buffer.from(sab, offset, length)` views.
+- **Pooled segments** — files packed into 64 MiB SAB segments; emptied
+  segments are reused, never returned to the OS.
+- **V8 bytecode (CJS only)** — `require: { compile: true }` (default when
+  the require domain is on). ESM has no bytecode cache.
+- **Pre-compressed representations** — `gzip`, `deflate`, `br`, `zstd`
+  built once and shared from SAB. HTTP negotiation stays in your server.
+- **Live reload** — watcher batches disk events into epochs, one
+  `vfs-update` per epoch, ACK-before-free.
+- **Five providers** — `sab`, `memory`, `sea`, `disk`, `node-default`.
+- **Strict sandbox** — `strict: true` makes `appRoot` the boundary.
+- **Hooks** — `hooks.fs` patches `node:fs`; `hooks.module` is one
+  `module.registerHooks` chain for `require()` and `import`.
+- **Chunked streaming** — `PlaceFs.createReadStream()` with HTTP Range.
 
 ## Install
 
@@ -36,14 +36,37 @@ and stores bytecode in SAB so workers skip parse + compile entirely.
 npm install shared-memory-fs
 ```
 
-Requires Node.js ≥ 22.15.
+Package exports: `.`, `./register`, `./adapters/fs-patch`,
+`./adapters/module-hook`.
 
 ## Quick start
 
-### Main thread
+Bootstrap (main thread only):
+
+```
+node --import shared-memory-fs/register app.js -- --vfs.config=./vfs.config.cjs
+```
+
+Config file: `--vfs.config=…` or `vfs.config.{js,cjs,mjs,json}` in cwd.
+Order: load config → `initialize()` → install hooks → publish
+`VfsKernel.current`. Failure uninstalls, closes the kernel and rethrows —
+the entry never runs.
+
+Workers do **not** run `--import` / `--require` preloads. Pass
+`kernel.link()` as `workerData.vfs` and call `attach()`:
 
 ```js
-const { VFSKernel, VfsConfig } = require('shared-memory-fs');
+const { attach } = require('shared-memory-fs');
+const kernel = attach(); // reads workerData.vfs
+```
+
+### Manual wiring
+
+Place **name is the directory under `appRoot`**, the mount, the cache
+namespace and the snapshot/delta key. There is no separate `dir` field.
+
+```js
+const { VfsConfig, VfsKernel } = require('shared-memory-fs');
 const { Worker } = require('node:worker_threads');
 
 const config = new VfsConfig({
@@ -52,248 +75,236 @@ const config = new VfsConfig({
   },
   places: {
     static: {
-      domains: ['fs'],
-      dir: 'static',
-      provider: 'sab',
-      ext: ['html', 'css', 'js', 'png', 'svg'],
+      fs: { ext: ['html', 'css', 'js', 'png', 'svg'] },
     },
     lib: {
-      domains: ['fs'], // 'require' added automatically by compile
-      dir: 'lib',
-      provider: 'sab',
-      ext: ['js'],
-      compile: true, // V8 bytecode cache
+      fs: { ext: ['js'] },
+      require: { ext: ['js'], compile: true },
     },
     scratch: {
-      domains: ['fs'],
-      dir: 'scratch',
-      provider: 'memory', // per-thread writable, isolated
+      provider: 'memory',
+      fs: { writable: true },
     },
   },
 });
 
-const threads = new Map();
-const kernel = new VFSKernel(config, {
-  appRoot: process.cwd(),
-  broadcast: (msg) => {
-    for (const t of threads.values()) t.postMessage(msg);
-  },
-  getWorkerIds: () => threads.keys(),
-});
-
+const kernel = new VfsKernel(config, { appRoot: process.cwd() });
 await kernel.initialize();
-kernel.watch();
 
-const snapshot = kernel.snapshot();
-for (let i = 0; i < 4; i++) {
-  const w = new Worker('./worker.js', { workerData: { snapshot } });
-  threads.set(w.threadId, w);
-  w.on('message', (m) => {
-    if (m.name === 'ack-update') kernel.handleAck(m.updateId, w.threadId);
-  });
-  w.on('exit', () => {
-    kernel.handleWorkerExit(w.threadId);
-    threads.delete(w.threadId);
-  });
-}
+const { vfs, transferList } = kernel.link();
+const w = new Worker('./worker.js', {
+  workerData: { vfs },
+  transferList,
+});
 ```
 
-### Worker thread
+Worker:
 
 ```js
-const { VFSKernel, VfsConfig } = require('shared-memory-fs');
-const { parentPort, workerData } = require('node:worker_threads');
+const { attach } = require('shared-memory-fs');
+const kernel = attach();
 
-const config = new VfsConfig({
-  /* same shape as main */
-});
-const kernel = VFSKernel.fromSnapshot(workerData.snapshot, config, {
-  appRoot: process.cwd(),
-});
+const site = kernel.fs('static');
+const html = site.readFile('/index.html'); // owned copy
+const stream = site.createReadStream('/big.mp4');
 
-const place = kernel.getPlace('static');
-const html = place.readFile('/index.html'); // Buffer (zero-copy)
-const stat = place.stat('/index.html'); // { size, mtime, ... }
-const stream = place.createReadStream('/big.mp4'); // chunked Readable
-
-const lib = kernel.getPlace('lib');
-const bytecode = lib.getCachedData('/utils.js'); // V8 bytecode Buffer
-
-const scratch = kernel.getPlace('scratch');
-scratch.writeFile('/note.txt', Buffer.from('hello'));
-const note = scratch.readFile('/note.txt'); // local to this worker
-
-parentPort.on('message', (m) => {
-  if (m.name === 'file-update' || m.name === 'file-delete') {
-    kernel.handleDelta(m);
-    parentPort.postMessage({ name: 'ack-update', updateId: m.updateId });
-  }
-});
+const scratch = kernel.fs('scratch');
+scratch.writeFile('/note.txt', 'hello');
 ```
+
+`kernel.fs(name)` returns a `PlaceFs` for an indexed place with an fs
+domain (`sab` / `memory` / `sea`). Disk and node-default places are
+plain `node:fs` territory.
+
+`readFile*` returns owned copies. `*View` methods and stream chunks are
+borrowed views **only** when `fs.zeroCopy: true`; otherwise they throw
+`ENOTSUP` or copy. Never mutate a borrowed view; never keep it past the
+current operation; `Buffer.from(view)` to retain.
+
+Bytecode is not on `PlaceFs`. Use `kernel.bytecode(absPath)`.
 
 ## Providers
 
-| Provider       | Storage                             | Writable | Shared across workers    | Use case                                                                |
-| -------------- | ----------------------------------- | -------- | ------------------------ | ----------------------------------------------------------------------- |
-| `sab`          | SharedArrayBuffer                   | no       | yes (zero-copy)          | Static assets, modules — the primary use case.                          |
-| `memory`       | Per-thread Map                      | yes      | no — isolated per thread | Tests, AI agent sandboxes, scratch space, hot reload of generated code. |
-| `sea`          | SAB (loaded from `node:sea` assets) | no       | yes                      | Single-Executable Application bundling.                                 |
-| `node-default` | OS filesystem                       | n/a      | n/a                      | Passthrough for paths that should hit real disk.                        |
+| Provider       | Storage          | Writable                  | Shared   | Use case                |
+| -------------- | ---------------- | ------------------------- | -------- | ----------------------- |
+| `sab`          | SAB pool         | `fs.writable` writes disk | yes      | static assets, modules  |
+| `memory`       | per-thread `Map` | yes                       | no       | scratch, generated code |
+| `sea`          | SAB from SEA     | no                        | yes      | single-executable       |
+| `disk`         | OS path entries  | `fs.writable`             | metadata | managed passthrough     |
+| `node-default` | OS filesystem    | n/a                       | n/a      | ordinary Node           |
+
+`INDEXED` = sab | memory | sea (have a files Map). `SHARED` = sab | sea
+(bytes in SAB).
+
+Writable SAB is **eventual consistency**: mutations go to disk; the
+watcher brings them into SAB. There is no `waitForUpdate`. The watcher
+also starts when `defaults.watch` is on.
 
 ### Memory provider
 
-Per-thread writable namespace with the same `Place` API as `sab`. Each thread
-owns its own empty instance after `fromSnapshot()`. Writes via
-`place.writeFile()`/`place.unlink()` or via patched `fs.writeFileSync` are
-local to that thread. JS files are auto-compiled to V8 bytecode if the place
-has `compile: true`.
+Per-thread writable namespace. Each thread owns an empty instance after
+`fromSnapshot()` / `attach()`. Writes via `PlaceFs` or patched
+`fs.writeFileSync` are local to that thread. JS is compiled to V8
+bytecode when `require.compile` is on (the default if `require` is
+enabled).
 
 ```js
 places: {
-  agent: { domains: ['fs', 'require'], dir: 'agent',
-           provider: 'memory', compile: true },
+  agent: {
+    provider: 'memory',
+    fs: { writable: true },
+    require: true, // compile defaults to true
+  },
 }
 
-// In any thread:
-const agent = kernel.getPlace('agent');
-agent.writeFile('/tool.js', Buffer.from('module.exports = () => 42;'));
-const tool = require('/abs/path/agent/tool.js'); // bytecode-cached
+const agent = kernel.fs('agent');
+agent.writeFile('/tool.js', 'module.exports = () => 42;');
+const tool = require('/abs/path/agent/tool.js');
 ```
 
 ### SEA provider
 
-Loads `node:sea` assets matching `dir` into SAB at `initialize()`, then
-behaves exactly like a `sab` place — included in `snapshot()`, propagated to
-workers zero-copy, no watcher.
+Loads `node:sea` assets matching `<name>/…` into SAB at `initialize()`,
+then behaves like a `sab` place — in `snapshot()`, projected to workers,
+no watcher.
 
 ```js
 places: {
-  bundle: { domains: ['fs'], dir: 'public', provider: 'sea' },
+  pub: { provider: 'sea', fs: true },
 }
 ```
 
-A SEA built with `assets: { 'public/index.html': './dist/index.html', ... }`
-exposes those assets to the worker pool with zero per-worker copy.
+A SEA built with `assets: { 'pub/index.html': './dist/index.html', … }`
+exposes those assets with zero per-worker copy.
 
-For testing without an actual SEA, inject a compatible module:
+For tests, inject a compatible module:
 
 ```js
-new VFSKernel(config, { seaModule: { isSea: () => true,
-  getAssetKeys: () => [...], getAsset: (k) => arrayBuffer } });
+new VfsKernel(config, {
+  seaModule: {
+    isSea: () => true,
+    getAssetKeys: () => [...],
+    getAsset: (k) => arrayBuffer,
+  },
+});
 ```
 
 ## Compression
 
-Representations are built once during `initialize()` and stored in SAB next to
-the source, so every worker serves the same compressed bytes zero-copy. HTTP
-negotiation and response headers stay in your server.
+Representations are built once during `initialize()` and stored in SAB
+next to the source. HTTP negotiation stays in your server.
 
 ```js
 places: {
   static: {
-    domains: ['fs'],
-    dir: 'static',
-    provider: 'sab',
-    ext: ['html', 'css', 'js', 'svg', 'png', 'mp4'],
-    compress: {
-      encodings: ['br', 'gzip'],
-      options: { br: { level: 5 } },
-      ext: 'compressible',
-      retainRaw: true,
+    fs: {
+      ext: ['html', 'css', 'js', 'svg', 'png', 'mp4'],
+      compress: {
+        encodings: ['br', 'gzip'],
+        options: { br: { level: 5 } },
+        ext: 'compressible',
+        retainRaw: true,
+      },
     },
   },
 }
 ```
 
-`place.ext` decides what the place contains; `compress.ext` narrows that set to
-the files worth compressing. `'compressible'` expands to a built-in list of
-text-ish formats (html, css, js, json, svg, xml, wasm, ttf, …); already
-compressed media is excluded. Files outside `compress.ext` always keep their
-raw bytes in SAB, so video keeps its zero-copy Range streaming.
+`fs.ext` decides what the place contains; `compress.ext` narrows that
+set. `'compressible'` expands to a built-in list of text-ish formats;
+already-compressed media is excluded.
 
 ```js
-const place = kernel.getPlace('static');
-
+const place = kernel.fs('static');
 place.storedEncodings('/app.css'); // ['raw', 'br', 'gzip']
 const body = place.readFileCompressed('/app.css', 'br');
 const { size, sourceSize } = place.statCompressed('/app.css', 'br');
 ```
 
-**Levels.** A codec listed in `encodings` but missing from `options` runs with
-the native zlib defaults, which are not uniform: brotli defaults to quality 11
-(maximum), while gzip and deflate default to 6 and zstd to 3. A cache that is
-built once and served many times usually wants those raised explicitly.
+A codec listed in `encodings` but missing from `options` runs with native
+zlib defaults (brotli quality 11, gzip/deflate 6, zstd 3).
 
-**`retainRaw: false`** keeps only the compressed representations of the
-selected files in memory; the source stays a disk entry. `place.readFile()` and
-`place.createReadStream()` then return `null` for it, `place.stat()` and
-`place.filePath()` keep working, and the patched `fs` reads it from disk as
-usual. Not compatible with `compile: true`, which builds bytecode from the
-source in SAB.
+**`retainRaw: false`** keeps only compressed bytes in SAB; the source
+stays a disk entry. Requires provider `sab` and no `require.compile`.
+`place.readFile()` then returns `null` for it; patched `fs` reads disk.
 
-**Memory cost.** SAB usage equals the sum of the stored representation sizes:
-rawSize + brSize + gzipSize plus a small amount of metadata.
+Failures are per representation: a codec that does not fit is skipped
+with a warning; `storedEncodings()` reports what actually exists.
 
-**Failures are per representation.** If a codec fails or its output does not
-fit in the pool, that one representation is skipped with a warning naming the
-place, key, encoding and reason; everything else is still published, and
-`storedEncodings()` reports what actually exists.
-
-## Strict sandbox mode
+## Strict sandbox
 
 ```js
 new VfsConfig({ defaults: { strict: true }, places: { ... } });
 ```
 
-When `strict: true`, the patched `fs` raises `EACCES` for any path under
-`appRoot` not owned by any place. Memory mounts remain writable. Paths outside
-`appRoot` (Node internals, `node_modules` in parent dirs, OS) pass through.
+**`strict: true` makes `appRoot` the sandbox boundary.** Every path under
+`appRoot` that no place owns is `EACCES` — at every depth, file or
+directory, without the router touching the disk.
 
-Use cases: untrusted plugins, AI tool execution, multi-tenant workers — give
-each tenant its own `memory` place and fail-closed on everything else.
+- A trusted entry point and `package.json` must live **outside
+  `appRoot`**, or inside an explicit `node-default` / `disk` place.
+  Under strict, `appRoot` should contain place directories and nothing
+  else. See `test/fixtures/sandbox` + `strict-app.cjs`.
+- Indexed mounts: only published, fs-visible entries are readable.
+  Unpublished or excluded-ext paths → `EACCES` (disk-backed entries
+  excepted).
+- Paths outside `appRoot` → ordinary Node. Scanner does not follow
+  symlinks.
+- Guarded (unimplemented) APIs still enforce the routing decision, so a
+  denied path cannot be probed via `copyFile`, `opendir`, `glob`,
+  `watch`, …
+- Same-process places are not firewalled from each other. Isolation =
+  one worker per tenant with its own `link()`.
 
 ## API
 
 ### `VfsConfig`
 
-`new VfsConfig(raw)` — config cascade: hardcoded defaults → `raw.defaults` →
-per-place. Frozen after construction.
+`new VfsConfig(raw)` — hardcoded defaults → `raw.defaults` → per-place.
+Deep-frozen after construction. `config.raw` is the merged input,
+cloneable so workers rebuild from it.
 
-| `defaults.*`           | Type   | Default    | Description                                         |
-| ---------------------- | ------ | ---------- | --------------------------------------------------- |
-| `memory.limit`         | size   | `'1 gib'`  | Total SAB pool budget                               |
-| `memory.segmentSize`   | size   | `'64 mib'` | Base SAB segment size                               |
-| `memory.maxFileSize`   | size   | `'10 mb'`  | Files larger than this are stored as `disk` entries |
-| `compaction.threshold` | number | `0.3`      | Compact a segment when free ratio exceeds this      |
-| `hooks.fs`             | bool   | `true`     | Patch `node:fs`                                     |
-| `hooks.require`        | bool   | `true`     | Patch CJS module resolution                         |
-| `hooks.import`         | bool   | `true`     | Register ESM loader                                 |
-| `watchTimeout`         | number | `1000`     | Watcher debounce (ms)                               |
-| `strict`               | bool   | `false`    | Sandbox mode (see above)                            |
+| `defaults.*`           | Type   | Default    | Description                         |
+| ---------------------- | ------ | ---------- | ----------------------------------- |
+| `memory.limit`         | size   | `'1 gib'`  | Total SAB pool budget               |
+| `memory.segmentSize`   | size   | `'64 mib'` | SAB segment size                    |
+| `memory.maxFileSize`   | size   | `'10 mb'`  | Larger files become disk entries    |
+| `compaction.threshold` | number | `0.3`      | 0 = off; else compact below this    |
+| `hooks.fs`             | bool   | `true`     | Patch `node:fs`                     |
+| `hooks.module`         | bool   | `true`     | `module.registerHooks` + `_compile` |
+| `watch`                | bool   | `false`    | Watch sab places                    |
+| `watchTimeout`         | number | `1000`     | Watcher debounce (ms)               |
+| `strict`               | bool   | `false`    | `appRoot` sandbox                   |
 
-Sizes accept `metautil.sizeToBytes` strings (`'10 mb'`, `'1 gib'`, …) or numbers.
+Sizes accept `metautil.sizeToBytes` strings or numbers. Booleans must be
+booleans.
 
-| `places.<name>.*` | Type     | Default       | Description                                                                    |
-| ----------------- | -------- | ------------- | ------------------------------------------------------------------------------ |
-| `domains`         | string[] | `[]`          | `'fs'`, `'require'`, `'import'`                                                |
-| `dir`             | string   | `<name>`      | First path segment under appRoot (mount)                                       |
-| `provider`        | string   | `'sab'`       | `'sab'`, `'memory'`, `'sea'`, `'node-default'`, `'disk'`                       |
-| `ext`             | string[] | `null`        | Filter by extension (no dots): `['html','css']`                                |
-| `extOnExtra`      | string   | `'silent'`    | What to do with files outside `ext` whitelist: `'silent'`, `'warn'`, `'error'` |
-| `maxFileSize`     | size     | from defaults | Per-place override                                                             |
-| `compile`         | bool     | `false`       | V8 bytecode cache; auto-adds `'require'` to `domains`                          |
-| `compress`        | object   | `null`        | Pre-compressed representations (see below)                                     |
-| `enabled`         | bool     | `true`        | Disable a place without removing it                                            |
+| `places.<name>.*` | Type   | Default       | Description                                         |
+| ----------------- | ------ | ------------- | --------------------------------------------------- |
+| `provider`        | string | `'sab'`       | `sab`, `memory`, `sea`, `disk`, `node-default`      |
+| `enabled`         | bool   | `true`        | Drop a place without removing it                    |
+| `maxFileSize`     | size   | from defaults | SAB/sea only                                        |
+| `fs`              | domain | off           | `true` or `{ ext, writable, zeroCopy, compress }`   |
+| `require`         | domain | off           | `true` or `{ ext, compile }` (compile default true) |
+| `import`          | domain | off           | `true` or `{ ext }`                                 |
 
-| `places.<name>.compress.*` | Type               | Default | Description                                                      |
-| -------------------------- | ------------------ | ------- | ---------------------------------------------------------------- |
-| `encodings`                | string[]           | —       | `'gzip'`, `'deflate'`, `'br'`, `'zstd'`; order is not a priority |
-| `options.<codec>.level`    | number             | native  | Codec level; omitted ⇒ native zlib default                       |
-| `ext`                      | string[] \| string | all     | Extensions to compress, or `'compressible'`                      |
-| `retainRaw`                | bool               | `true`  | Keep the uncompressed source in SAB                              |
+Place name: ASCII `[A-Za-z0-9][A-Za-z0-9._-]*`, no trailing dot, no
+Windows reserved names, unique after lowercasing.
 
-`VfsConfig.fromArgv(argv, appConfig)` — parse `--vfs.*` CLI flags after `--`
-and merge with `appConfig`. Examples:
+Domain defaults: require ext `js,cjs,json`; import ext `js,mjs,json`;
+fs ext `null` = everything. At least one domain must be on.
+
+| `places.<name>.fs.compress.*` | Type               | Default | Description                     |
+| ----------------------------- | ------------------ | ------- | ------------------------------- |
+| `encodings`                   | string[]           | —       | `gzip`, `deflate`, `br`, `zstd` |
+| `options.<codec>.level`       | number             | native  | Codec level                     |
+| `ext`                         | string[] \| string | all     | Or `'compressible'`             |
+| `retainRaw`                   | bool               | `true`  | Keep uncompressed source in SAB |
+
+`VfsConfig.fromArgv(argv, appConfig)` parses `--vfs.*` after `--`:
+`--vfs.defaults.*`, `--vfs.places.<n>.*`, `--vfs.enable` /
+`--vfs.disable`. Coerces `"true"` / `"false"` / numbers only.
+`setNested` rejects `__proto__` | `prototype` | `constructor`.
 
 ```
 node app.js -- --vfs.defaults.memory.limit=512mib \
@@ -302,83 +313,115 @@ node app.js -- --vfs.defaults.memory.limit=512mib \
                --vfs.disable=scratch
 ```
 
-### `VFSKernel` (main thread)
+### `VfsKernel` (main thread)
 
-`new VFSKernel(config, options)`
+`new VfsKernel(config, options)`
 
-| Option         | Default                            | Description                         |
-| -------------- | ---------------------------------- | ----------------------------------- |
-| `appRoot`      | `process.cwd()`                    | Root directory for `dir` resolution |
-| `console`      | `globalThis.console`               | Logger                              |
-| `broadcast`    | no-op                              | `(msg) => {}` — send to all workers |
-| `getWorkerIds` | `() => []`                         | Iterable of active worker IDs       |
-| `seaModule`    | `require('node:sea')` if available | Inject for tests                    |
+| Option         | Default              | Description                    |
+| -------------- | -------------------- | ------------------------------ |
+| `appRoot`      | `process.cwd()`      | Root for place directories     |
+| `console`      | `globalThis.console` | Logger                         |
+| `broadcast`    | no-op                | Extra fan-out besides `link()` |
+| `getWorkerIds` | `() => []`           | Extra ACK set besides links    |
+| `seaModule`    | `node:sea` if any    | Inject for tests               |
 
-| Method                           | Description                                                   |
-| -------------------------------- | ------------------------------------------------------------- |
-| `await initialize()`             | Scan dirs / load SEA / set up memory places, compile bytecode |
-| `snapshot()`                     | `{ segments, filesystems }` to pass via `workerData`          |
-| `watch()`                        | Start watcher, broadcast deltas                               |
-| `handleAck(updateId, workerId)`  | ACK from worker                                               |
-| `handleWorkerExit(workerId)`     | Cleanup                                                       |
-| `close()`                        | Stop watcher, clear state                                     |
-| `getPlace(name)` / `getPlaces()` | Place access                                                  |
-| `resolveFsPath(absPath)`         | `{ place, fileKey }` or `null` (read routing)                 |
-| `routeWrite(absPath)`            | `{ place, fileKey }` for memory mounts only, else `null`      |
-| `isStrictDenied(absPath)`        | `true` if strict mode would deny this path                    |
+States: `new → initializing → ready → closed` (final). `fs()`,
+`snapshot()`, `watch()`, `link()` require `ready`. `initialize()`
+failure closes the kernel.
 
-### `VFSKernel` (worker thread)
+| Method                          | Description                                     |
+| ------------------------------- | ----------------------------------------------- |
+| `await initialize()`            | Scan / SEA / memory, bytecode, compression      |
+| `fs(name)`                      | `PlaceFs` for an indexed fs place               |
+| `snapshot()`                    | `{ segments, places }`                          |
+| `link()`                        | `{ vfs, transferList }` for a worker            |
+| `watch()`                       | Start `DirWatcher` (also auto if writable sab)  |
+| `handleAck(updateId, workerId)` | ACK-before-free                                 |
+| `handleWorkerExit(workerId)`    | Drop that worker from pending frees             |
+| `bytecode(absPath)`             | V8 cached data or `null`                        |
+| `close()`                       | Stop watcher, drop projections, collectable SAB |
 
-`VFSKernel.fromSnapshot(snapshot, config, options)` — read-only kernel:
-projects SAB/SEA segments, instantiates per-thread `memory` places empty.
+`link()` returns `{ vfs: { snapshot, config: raw, appRoot, port },
+transferList }`. The kernel posts every `vfs-update` to the port, reads
+`ack-update`, and treats port `close` as worker exit.
 
-`kernel.handleDelta(msg)` — apply `file-update`/`file-delete` from main.
+### `VfsKernel` (worker)
 
-### `Place`
+Prefer `attach()`. Manual: `VfsKernel.fromSnapshot(snapshot, config, {
+appRoot })` then `handleDelta(msg)` for `vfs-update`.
 
-| Method                                       | Returns          | Description                              |
-| -------------------------------------------- | ---------------- | ---------------------------------------- |
-| `readFile(key)`                              | Buffer \| null   | SAB zero-copy view, or memory-place data |
-| `stat(key)`                                  | object \| null   | File stat                                |
-| `exists(key)`                                | bool             | Key present                              |
-| `list(prefix)`                               | string[]         | Keys under prefix                        |
-| `getCachedData(key)`                         | Buffer \| null   | V8 bytecode companion                    |
-| `readFileCompressed(key, enc)`               | Buffer \| null   | Compressed representation from SAB       |
-| `statCompressed(key, enc)`                   | object \| null   | `{size, sourceSize, encoding, mtimeMs}`  |
-| `storedEncodings(key)`                       | string[]         | Representations present in SAB           |
-| `createReadStream(key, opts)`                | Readable \| null | 64 KB chunked, supports `{start,end}`    |
-| `createReadStreamCompressed(key, enc, opts)` | Readable \| null | Same, over compressed bytes              |
-| `filePath(key)`                              | string \| null   | Disk path (disk entries only)            |
-| `writeFile(key, data)`                       | void             | Memory places only; throws on read-only  |
-| `unlink(key)`                                | bool             | Memory places only; returns existed      |
+`attach()` projects the snapshot, installs hooks the config asks for,
+applies `vfs-update` from the link port and ACKs **those — and only
+those** — back. Publishes `VfsKernel.current` (also the `kernel` getter
+on the package).
+
+### `PlaceFs`
+
+Returned by `kernel.fs(name)`. Reads return `null` when missing;
+`readdir` throws `ENOENT` / `ENOTDIR`. Keys: exact, then `'/' + key`.
+Mutations take a canonical key (leading slash; NUL, `..`, backslash
+rejected).
+
+| Method                                       | Returns                  | Description                         |
+| -------------------------------------------- | ------------------------ | ----------------------------------- |
+| `readFile(key, opts)`                        | Buffer \| string \| null | Owned copy                          |
+| `readFileView(key)`                          | Buffer \| null           | Borrowed; needs `zeroCopy`          |
+| `stat(key, opts)`                            | `VfsStats` \| null       | Lazy; `{ bigint }` ok               |
+| `exists(key)`                                | bool                     | File or implicit directory          |
+| `readdir(key, opts)`                         | string[] \| Dirent[]     | Implicit dirs; lex order            |
+| `createReadStream(key, opts)`                | Readable \| null         | `{ start, end }` inclusive          |
+| `storedEncodings(key)`                       | string[]                 | `'raw'` plus configured codecs      |
+| `readFileCompressed(key, enc)`               | Buffer \| null           | Owned copy                          |
+| `readFileCompressedView(key, enc)`           | Buffer \| null           | Borrowed; needs `zeroCopy`          |
+| `statCompressed(key, enc)`                   | object \| null           | `{ size, sourceSize, encoding, … }` |
+| `createReadStreamCompressed(key, enc, opts)` | Readable \| null         | Range is compressed bytes           |
+| `pathOf(key)`                                | string                   | Absolute OS path                    |
+| `writeFile` / `appendFile` / `unlink`        | void                     | Memory Map or disk (`writable`)     |
+| `mkdir` / `rm` / `rename`                    | void                     | Memory mkdir is a no-op             |
+
+Cross-place `rename` through patched `fs` is `EXDEV`.
+
+## Patched `node:fs`
+
+Implemented (sync / callback / promises): `readFile`, `stat`, `lstat`,
+`access`, `realpath`, `readdir`, `open` (`ENOTSUP` on virtual entries),
+`existsSync`, `createReadStream`, `writeFile`, `appendFile`, `unlink`,
+`mkdir`, `rm`, `rename`.
+
+Guarded, not implemented: `copyFile`, `cp`, `opendir`, `rmdir`,
+`chmod` / `lchmod`, `chown` / `lchown`, `utimes` / `lutimes`,
+`truncate`, `link`, `symlink`, `readlink`, `statfs`, `watch`,
+`watchFile`, `glob`. They enforce the routing decision and otherwise
+call through. Full `node:fs` compatibility is not promised; anything
+outside both lists is untouched.
+
+## Protocol
+
+```
+snapshot   { segments: [{ id, sab }], places: { <name>: { entries: [[key, entry]] } } }
+vfs-update { name, updateId, places: { <name>: { entries, removals } }, newSegments }
+ack-update { name: 'ack-update', updateId }
+entry      shared { kind, segmentId, offset, length, stat } | disk { kind, path, stat }
+stat       { size, mtimeMs }
+```
+
+One `vfs-update` per watcher epoch. Source + companions of one file go
+in that same message. Bytes are freed only after every live worker
+(`getWorkerIds()` ∪ `link()` ports) ACKs the `updateId`, or exits.
 
 ## Examples
 
 Runnable demos under [examples/](examples/):
 
-- [hot-reload-routes/](examples/hot-reload-routes/) — HTTP server whose route
-  handlers are written into a memory place at runtime and served via patched
-  `require()`.
-- [sea-static/](examples/sea-static/) — same static-server code in two
-  packaging modes: plain `node` (`provider: 'sab'`) and Node SEA single
-  executable (`provider: 'sea'`).
-- [multi-tenant/](examples/multi-tenant/) — two memory places + global
-  `strict: true`; shows what the strict whitelist actually enforces.
+- [hot-reload-routes/](examples/hot-reload-routes/) — HTTP server whose
+  route handlers are written into a memory place and `require()`d.
+- [sea-static/](examples/sea-static/) — same static server as `sab` or
+  Node SEA (`provider: 'sea'`).
+- [multi-tenant/](examples/multi-tenant/) — two memory places +
+  `strict: true`.
 
-See also [doc/comparison.md](doc/comparison.md) for a sober comparison
-with `@platformatic/vfs`, `memfs`, and plain `node:fs`.
-
-## Bootstrap (zero-integration)
-
-```
-node --require shared-memory-fs/preload   app.js
-node --import  shared-memory-fs/register   app.mjs
-```
-
-Bootstrap reads `vfs.config.{js,json}` from `cwd` (or `--vfs.config=...`),
-constructs the kernel, installs requested hooks, and exposes the kernel as
-`globalThis.__vfsKernel`. Pair with worker_threads by passing
-`globalThis.__vfsKernel.snapshot()` via `workerData`.
+See [doc/integration.md](doc/integration.md) and
+[doc/comparison.md](doc/comparison.md).
 
 ## Streaming and HTTP Range
 
@@ -392,55 +435,38 @@ res.writeHead(206, {
 stream.pipe(res);
 ```
 
-Each chunk is `Buffer.from(sab, offset, chunkSize)` — zero allocation per
-chunk. Returns `null` for disk entries; fall back to `fs.createReadStream`.
-`createReadStreamCompressed(key, encoding, opts)` does the same over a
-compressed representation, where `start`/`end` address the compressed bytes.
+With `zeroCopy`, each chunk is a borrowed view. Without it, chunks are
+copies. `createReadStreamCompressed` ranges address compressed bytes.
 
 ## Architecture
 
 ```
-Main thread                          Worker threads
-┌─────────────────────┐              ┌────────────────────────┐
-│ VFSKernel           │  snapshot()  │ VFSKernel.fromSnapshot │
-│ ├─ FilesystemCache  │ ──────────►  │ ├─ projected Maps      │
-│ │  └─ Pool+Registry │  workerData  │ ├─ per-thread memory   │
-│ ├─ scanner          │              │ │  places              │
-│ ├─ compileModules() │   broadcast  │ └─ handleDelta()       │
-│ ├─ watcher (epochs) │ ──────────►  │                        │
-│ └─ ACK tracking     │   ◄────────  │ postMessage(ack)       │
-└─────────────────────┘              └────────────────────────┘
-         │
-    SAB segments  ←  shared physical memory  →  zero-copy views
+Main thread                             Worker threads
+┌──────────────────────────┐            ┌─────────────────────────┐
+│ VfsKernel                │  link()    │ attach() / fromSnapshot │
+│ ├─ VfsConfig (frozen)    │ ─────────► │ ├─ projected Maps       │
+│ ├─ FilesystemCache       │  vfs + SAB │ ├─ per-thread memory    │
+│ │  └─ Pool+Registry      │            │ └─ handleDelta()        │
+│ ├─ PlaceRegistry/FsRouter│  vfs-update│                         │
+│ ├─ scanner + DirWatcher  │ ─────────► │                         │
+│ └─ ACK-before-free       │ ◄───────── │ ack-update              │
+└──────────────────────────┘            └─────────────────────────┘
+         SAB segments  ←  shared physical memory  →  zero-copy views
 ```
 
-- **`FilesystemCache`** — pooled SAB allocator (best-fit, free-extent reuse).
-- **`Scanner`** — async directory scanner with extension filtering.
-- **`VfsConfig`** — cascade + validation + deep freeze.
-- **`Place`** — logical namespace; `files` Map of `{data, stat[, path]}`.
-- **`PlacementRegistry`** — domain+path → place; `routeByMount(absPath)`.
-- **`ModuleCache`** — V8 bytecode compilation; deps injected.
-- **`CompressionCache`** — pre-compressed representations; deps injected.
-- **`VFSKernel`** — facade: orchestrates init, projection, watch, ACK, dispatch.
-
-Bytecode and compressed representations are stored as companion entries keyed
-`<source>\0<tag>`. The NUL separator cannot appear in a file name, so they never
-collide with real files and never show up in `list()`, `exists()`, the path
-index or the patched `fs`.
+Companions are internal keys `<source>\0require:bytecode` and
+`<source>\0fs:<enc>`. They never appear in `readdir` / `exists` /
+patched `fs`.
 
 ## Tests
 
 ```
-node --test
+node --test test/*.test.js
 ```
 
-209 tests covering config, cache, scanner, place, kernel, module cache,
-compression, memory provider, SEA provider, strict sandbox, bytecode
-compilation, streaming, snapshot, delta application, ACK flow.
-
-See [doc/integration.md](doc/integration.md) for architecture deep-dive,
-message protocol, recipes (metavm, AI agents, SEA, Platformatic-style use
-cases), and comparison with `node:vfs` / `@platformatic/vfs`.
+172 tests covering config, cache, scanner, place, kernel, module hooks,
+fs-patch, compression, SEA, watcher, bootstrap. One symlink test skips
+where links are unavailable. `npm run lint` = eslint + prettier.
 
 ## License
 

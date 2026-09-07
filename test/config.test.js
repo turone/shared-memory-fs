@@ -471,4 +471,24 @@ describe('VfsConfig.fromArgv', () => {
     );
     assert.equal(Object.prototype.x, undefined);
   });
+
+  it('enable selects places; disable subtracts from the current set', () => {
+    const onlyA = VfsConfig.fromArgv(argv('--vfs.enable=a'), app);
+    assert.deepEqual(
+      onlyA.places.map((p) => p.name),
+      ['a'],
+    );
+    const dropped = VfsConfig.fromArgv(
+      argv('--vfs.enable=a,b', '--vfs.disable=a'),
+      app,
+    );
+    assert.deepEqual(
+      dropped.places.map((p) => p.name),
+      ['b'],
+    );
+    assert.throws(
+      () => VfsConfig.fromArgv(argv('--vfs.disable=nope'), app),
+      /unknown place/,
+    );
+  });
 });

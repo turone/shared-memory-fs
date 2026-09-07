@@ -215,6 +215,104 @@ describe('watcher: unstable source', () => {
     k.close();
     rm(root);
   });
+
+  it('an unstable file does not block the rest of the epoch', async () => {
+    const root = writeTree(tmpDir('watch-partial'), {
+      'site/a.txt': 'a1',
+      'site/b.txt': 'b1',
+    });
+    const k = await kernel(
+      root,
+      { site: { fs: true } },
+      { watch: true, watchTimeout: 60 },
+    );
+    const site = k.fs('site');
+    const realOpen = k.cache.reader;
+    k.cache.reader = async (file, view) => {
+      if (
+        file.path.endsWith(`${path.sep}a.txt`) ||
+        file.path.endsWith('/a.txt')
+      ) {
+        throw new Error('source changed during read');
+      }
+      return realOpen(file, view);
+    };
+    fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'a2');
+    fs.writeFileSync(path.join(root, 'site', 'b.txt'), 'b2');
+    await until(() => site.readFile('/b.txt', 'utf8') === 'b2', 4000);
+    assert.equal(
+      site.readFile('/a.txt', 'utf8'),
+      'a1',
+      'failed source retained',
+    );
+    assert.equal(
+      site.readFile('/b.txt', 'utf8'),
+      'b2',
+      'stable sibling published',
+    );
+    k.close();
+    rm(root);
+  });
+});
+
+describe('watcher: linux edge events', () => {
+  it('staged writes, rename, delete+recreate, and close drop handles', async () => {
+    const root = writeTree(tmpDir('watch-edges'), {
+      'site/a.js': 'module.exports = 1;',
+      'site/page.html': '<p>one</p>',
+    });
+    const k = await kernel(
+      root,
+      { site: { fs: true, require: true } },
+      { watch: true, watchTimeout: 60 },
+    );
+    const site = k.fs('site');
+    const at = (...p) => path.join(root, 'site', ...p);
+
+    const fd = fs.openSync(at('page.html'), 'w');
+    fs.writeSync(fd, '<p>');
+    fs.writeSync(fd, 'two');
+    fs.writeSync(fd, '</p>');
+    fs.closeSync(fd);
+    await until(
+      () => site.readFile('/page.html', 'utf8') === '<p>two</p>',
+      4000,
+    );
+
+    fs.renameSync(at('a.js'), at('z.js'));
+    await until(() => site.exists('/z.js') && !site.exists('/a.js'), 4000);
+    assert.equal(site.readFile('/z.js', 'utf8'), 'module.exports = 1;');
+
+    fs.unlinkSync(at('page.html'));
+    fs.writeFileSync(at('page.html'), '<p>new</p>');
+    await until(
+      () => site.readFile('/page.html', 'utf8') === '<p>new</p>',
+      4000,
+    );
+
+    const handles = k.watcher.watchers.size;
+    assert.ok(handles >= 1);
+    k.close();
+    assert.equal(k.watcher, null);
+    rm(root);
+  });
+});
+
+describe('DirWatcher.close', () => {
+  it('drops watchers, the debounce timer and the queued epoch', async () => {
+    const { DirWatcher } = require('../lib/watcher.js');
+    const root = writeTree(tmpDir('watch-close'), { 'a.txt': 'a' });
+    const watcher = new DirWatcher({ timeout: 5000 });
+    watcher.watch(root);
+    assert.equal(watcher.watchers.size, 1);
+    fs.writeFileSync(path.join(root, 'b.txt'), 'b');
+    await until(() => watcher.queue.size >= 1 || watcher.timer, 2000);
+    watcher.close();
+    assert.equal(watcher.watchers.size, 0);
+    assert.equal(watcher.timer, null);
+    assert.equal(watcher.queue.size, 0);
+    rm(root);
+  });
 });
 
 describe('readInto: stable source reads', () => {

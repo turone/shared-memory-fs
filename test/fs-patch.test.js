@@ -91,13 +91,23 @@ describe('fs-patch: reads over sab and memory places', () => {
     assert.equal(fs.existsSync(at('pub', 'nope')), false);
     assert.equal(fs.existsSync(at('other', 'o.txt')), true);
     fs.accessSync(file);
+    fs.accessSync(file, fs.constants.F_OK);
     fs.accessSync(file, fs.constants.R_OK);
+    fs.accessSync(file, fs.constants.F_OK | fs.constants.R_OK);
     assert.throws(() => fs.accessSync(file, fs.constants.W_OK), {
       code: 'EACCES',
     });
     assert.throws(() => fs.accessSync(file, fs.constants.X_OK), {
       code: 'EACCES',
     });
+    assert.throws(
+      () => fs.accessSync(file, fs.constants.R_OK | fs.constants.W_OK),
+      { code: 'EACCES' },
+    );
+    assert.throws(
+      () => fs.accessSync(file, fs.constants.R_OK | fs.constants.X_OK),
+      { code: 'EACCES' },
+    );
     await fs.promises.access(file);
     assert.equal(fs.realpathSync(file), file);
     assert.equal(await fs.promises.realpath(file), file);
@@ -341,6 +351,12 @@ describe('fs-patch: strict sandbox', () => {
     );
     assert.equal(viaCb.code, 'EACCES');
     assert.equal(fs.existsSync(outside), false);
+    const viaChown = await new Promise((resolve) =>
+      fs.chown(secret, 0, 0, resolve),
+    );
+    assert.equal(viaChown.code, 'EACCES');
+    await assert.rejects(fs.promises.chmod(secret, 0o666), { code: 'EACCES' });
+    await assert.rejects(fs.promises.truncate(secret, 0), { code: 'EACCES' });
   });
 
   it('glob never yields denied paths', async () => {

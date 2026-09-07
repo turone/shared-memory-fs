@@ -8,7 +8,8 @@ applyTo: lib/**, index.js, test/**, doc/**
 # VFS Architecture
 
 `shared-memory-fs` — pooled SharedArrayBuffer virtual filesystem for Node.js
-worker_threads, plus fs / module hooks. Node >= 22.15 (module.registerHooks).
+worker_threads, plus fs / module hooks. Node >= 22.22.3
+(`module.registerHooks`; CJS `--import` bootstrap of memory modules).
 
 ## Module Map
 
@@ -215,7 +216,7 @@ without the router ever touching the disk. Consequences to design around:
 
 ## Tests And Docs
 
-- `node --test test/*.test.js` (166 tests; one symlink test skips where links are
+- `node --test test/*.test.js` (172 tests; one symlink test skips where links are
   unavailable). `npm run lint` = eslint + prettier. Bootstrap and hooks tests use
   child processes / workers — never install hooks in the runner process without
   uninstalling in `after`.
