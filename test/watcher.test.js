@@ -323,10 +323,16 @@ describe('DirWatcher: 8.3 alias roots', () => {
   };
 
   it('passes ordinary paths through unchanged', () => {
-    const root = writeTree(tmpDir('watch-plain'), { 'a.txt': 'a' });
-    assert.equal(watchPath(root), path.resolve(root));
-    assert.equal(watchPath(path.join(root, 'sub', '..')), path.resolve(root));
-    rm(root);
+    // GHA Windows TEMP is C:\Users\RUNNER~1\... — that is an alias root,
+    // not an ordinary path. Probe a long-name directory that has no ~N.
+    const ordinary = win
+      ? path.join(path.parse(os.homedir()).root, 'Users', 'Public', 'vfs-plain')
+      : path.join(os.tmpdir(), 'vfs-plain');
+    assert.equal(watchPath(ordinary), path.resolve(ordinary));
+    assert.equal(
+      watchPath(path.join(ordinary, 'sub', '..')),
+      path.resolve(ordinary),
+    );
   });
 
   it('never guesses: an alias it cannot resolve is left alone', (t) => {
