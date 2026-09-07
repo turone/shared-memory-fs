@@ -20,11 +20,6 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      # lockfile records metautil as git+ssh; Actions has no deploy key.
-      - name: Use HTTPS for GitHub git dependencies
-        run: |
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
       - run: npm ci
       - run: npm test
       - run: npm run lint

@@ -120,6 +120,10 @@ Classes: `VfsConfig`, `VfsKernel`, `PlaceFs`, `PlaceRegistry`, `FsRouter`.
   `close` as worker exit.
 - `close()` is final: it stops the watcher, drops deferred work, projections and the
   caches themselves, so the SAB pool becomes collectable.
+- Adapter API (`routeRead`, `routeMutation`, `resolveModule`, `bytecode`) is for
+  `lib/adapters/*` only: raw routing decisions and borrowed views, without the
+  ownership and ext policies PlaceFs applies. Application code uses `fs(name)`.
+  Do not grow it into a user-facing surface.
 - Worker: `VfsKernel.fromSnapshot(snapshot, config, { appRoot })`; `handleDelta(msg)`.
 
 ## Protocol
@@ -143,14 +147,20 @@ stat       { size, mtimeMs } (+ sourceSize, encoding for compressed companions)
   `deny EACCES` (strict: unowned path, no fs domain, unpublished/invisible in indexed).
 - `FsRouter.mutate` → `memory` | `passthrough` (node-default, writable sab/disk) |
   `deny EROFS` (writable false, sea) | `deny EACCES` (strict unowned / no fs domain).
-- Implemented: readFile, stat, lstat, access, realpath, readdir, open (ENOTSUP on
-  virtual entries), existsSync, createReadStream, writeFile, appendFile, unlink,
-  mkdir, rm, rename (cross-place → EXDEV) — sync/callback/promises.
-- Guarded, not implemented: copyFile, cp, opendir, rmdir, chmod/lchmod, chown/lchown,
-  utimes/lutimes, truncate, link, symlink, readlink, statfs, watch, watchFile, glob.
-  They enforce the routing decision and otherwise call through, so an unimplemented
-  API can never bypass or probe the sandbox. Full node:fs compatibility is not
-  promised; anything outside both lists is untouched.
+- Every path-taking node:fs API falls into one of three groups; anything outside
+  them is untouched and full node:fs compatibility is not promised.
+  1. **Served** for virtual entries (sync/callback/promises): readFile, stat, lstat,
+     access, realpath, readdir, existsSync, createReadStream, writeFile,
+     appendFile, unlink, mkdir, rm, rename (cross-place → EXDEV).
+  2. **Recognized but unsupported**: `open` on a virtual entry → ENOTSUP — SAB and
+     memory entries have no descriptor, so fd-based calls stay unreachable rather
+     than falling through to the OS.
+  3. **Guarded passthrough**: copyFile, cp, opendir, rmdir, chmod/lchmod,
+     chown/lchown, utimes/lutimes, truncate, link, symlink, readlink, statfs,
+     watch, watchFile, glob. They enforce the routing decision and otherwise call
+     through, so an unimplemented API can never bypass or probe the sandbox.
+     `watch` / `watchFile` / `promises.watch` are patched with the sync wrapper:
+     they hand back their result (FSWatcher, async iterator) synchronously.
 
 ## PlaceFs (lib/place-fs.js)
 
@@ -220,5 +230,9 @@ without the router ever touching the disk. Consequences to design around:
   unavailable). `npm run lint` = eslint + prettier. Bootstrap and hooks tests use
   child processes / workers — never install hooks in the runner process without
   uninstalling in `after`.
+- CI runs both on Linux and Windows across Node 22.22.3 / 22.x / 24.x / 26.x.
+  Dependencies must stay installable by a bare `npm ci` — no git or SSH access, so
+  git deps are pinned as HTTPS tarball URLs with lockfile integrity, never as
+  `github:` shorthand (npm rewrites that to `git+ssh` in `resolved`).
 - Update tests in the same change as allocator / projection / ACK / watch / routing
   changes. Keep README, `doc/` and this file aligned with the code.

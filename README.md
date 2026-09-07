@@ -12,6 +12,15 @@ parse + compile. There is no ESM bytecode cache.
 Requires Node.js ≥ 22.22.3 (`module.registerHooks`; CJS `--import`
 bootstrap of memory-only modules).
 
+## Contents
+
+[Features](#features) · [Install](#install) · [Quick start](#quick-start) ·
+[Providers](#providers) · [Compression](#compression) ·
+[Strict sandbox](#strict-sandbox) · [API](#api) ·
+[Patched `node:fs`](#patched-nodefs) · [Errors](#errors) ·
+[Protocol](#protocol) · [Examples](#examples) ·
+[Architecture](#architecture) · [Support](#support)
+
 ## Features
 
 - **Zero-copy sharing** — internal projections are
@@ -121,20 +130,23 @@ borrowed views **only** when `fs.zeroCopy: true`; otherwise they throw
 `ENOTSUP` or copy. Never mutate a borrowed view; never keep it past the
 current operation; `Buffer.from(view)` to retain.
 
-Bytecode is not on `PlaceFs`. Use `kernel.bytecode(absPath)`.
+Bytecode is not on `PlaceFs` — it is [adapter API](#adapter-api).
 
 ## Providers
 
-| Provider       | Storage          | Writable                  | Shared   | Use case                |
-| -------------- | ---------------- | ------------------------- | -------- | ----------------------- |
-| `sab`          | SAB pool         | `fs.writable` writes disk | yes      | static assets, modules  |
-| `memory`       | per-thread `Map` | yes                       | no       | scratch, generated code |
-| `sea`          | SAB from SEA     | no                        | yes      | single-executable       |
-| `disk`         | OS path entries  | `fs.writable`             | metadata | managed passthrough     |
-| `node-default` | OS filesystem    | n/a                       | n/a      | ordinary Node           |
+| Provider       | Storage             | VFS index | Writable                  | Shared across workers |
+| -------------- | ------------------- | --------- | ------------------------- | --------------------- |
+| `sab`          | SAB pool            | yes       | `fs.writable` writes disk | yes, zero-copy        |
+| `memory`       | per-thread `Map`    | yes       | yes                       | no, per-thread        |
+| `sea`          | SAB from SEA assets | yes       | no                        | yes, zero-copy        |
+| `disk`         | OS filesystem       | no        | `fs.writable`             | n/a, managed mount    |
+| `node-default` | OS filesystem       | no        | n/a                       | n/a, ordinary Node    |
 
 `INDEXED` = sab | memory | sea (have a files Map). `SHARED` = sab | sea
-(bytes in SAB).
+(bytes in SAB). `disk` and `node-default` are passthrough mounts: they
+are never scanned and hold no VFS entries. `disk` differs from
+`node-default` only in being _managed_ — the router applies the fs
+domain's writable policy and the strict sandbox to it.
 
 Writable SAB is **eventual consistency**: mutations go to disk; the
 watcher brings them into SAB. There is no `waitForUpdate`. The watcher
@@ -338,12 +350,21 @@ failure closes the kernel.
 | `watch()`                       | Start `DirWatcher` (also auto if writable sab)  |
 | `handleAck(updateId, workerId)` | ACK-before-free                                 |
 | `handleWorkerExit(workerId)`    | Drop that worker from pending frees             |
-| `bytecode(absPath)`             | V8 cached data or `null`                        |
 | `close()`                       | Stop watcher, drop projections, collectable SAB |
 
 `link()` returns `{ vfs: { snapshot, config: raw, appRoot, port },
 transferList }`. The kernel posts every `vfs-update` to the port, reads
 `ack-update`, and treats port `close` as worker exit.
+
+#### Adapter API
+
+`routeRead(absPath)`, `routeMutation(absPath)`,
+`resolveModule(absPath, domain)` and `bytecode(absPath)` exist for
+`lib/adapters/*`, not for application code: they hand back raw routing
+decisions and borrowed views without the ownership and ext policies
+`PlaceFs` applies. `bytecode()` in particular returns a borrowed SAB
+view that the compile hook passes straight to `vm.Script`. Application
+code should use `kernel.fs(name)`.
 
 ### `VfsKernel` (worker)
 
@@ -383,17 +404,42 @@ Cross-place `rename` through patched `fs` is `EXDEV`.
 
 ## Patched `node:fs`
 
-Implemented (sync / callback / promises): `readFile`, `stat`, `lstat`,
-`access`, `realpath`, `readdir`, `open` (`ENOTSUP` on virtual entries),
+With `hooks.fs` on, `node:fs` routes through the kernel. Every path-taking
+API falls into one of three groups; anything outside them is untouched.
+Full `node:fs` compatibility is not promised.
+
+**1. Served for virtual entries** — sync, callback and promises forms:
+`readFile`, `stat`, `lstat`, `access`, `realpath`, `readdir`,
 `existsSync`, `createReadStream`, `writeFile`, `appendFile`, `unlink`,
 `mkdir`, `rm`, `rename`.
 
-Guarded, not implemented: `copyFile`, `cp`, `opendir`, `rmdir`,
-`chmod` / `lchmod`, `chown` / `lchown`, `utimes` / `lutimes`,
+**2. Recognized but unsupported** — routed, then rejected rather than
+silently falling through: `open` on a virtual entry returns `ENOTSUP`,
+because SAB and memory entries have no file descriptor. Descriptor-based
+calls (`read`, `write`, `fstat`, …) are therefore unreachable for virtual
+files and are left alone.
+
+**3. Guarded passthrough** — not implemented, but the routing decision is
+enforced before the call reaches the OS: `copyFile`, `cp`, `opendir`,
+`rmdir`, `chmod` / `lchmod`, `chown` / `lchown`, `utimes` / `lutimes`,
 `truncate`, `link`, `symlink`, `readlink`, `statfs`, `watch`,
-`watchFile`, `glob`. They enforce the routing decision and otherwise
-call through. Full `node:fs` compatibility is not promised; anything
-outside both lists is untouched.
+`watchFile`, `glob`. This is what keeps a denied path from being read,
+listed, copied or probed through an API the VFS does not implement.
+
+## Errors
+
+| Code      | Meaning                                                                                                                                  |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `EACCES`  | Strict sandbox denial: unowned path under `appRoot`, place with no fs domain, or an unpublished / excluded-ext entry in an indexed mount |
+| `EROFS`   | Place has `fs.writable: false` (or provider `sea`)                                                                                       |
+| `ENOTSUP` | No file descriptor for a virtual entry (`open`); `*View` without `fs.zeroCopy`; compressed API for an unconfigured encoding              |
+| `ENOENT`  | Missing key in a writable place; `readdir` of a missing directory                                                                        |
+| `ENOTDIR` | `readdir` of a file                                                                                                                      |
+| `EXDEV`   | `rename` across places                                                                                                                   |
+| `EISDIR`  | `readFile` / `createReadStream` of an implicit directory                                                                                 |
+
+Errors carry the same `code`, `errno`, `syscall` and `path` fields as
+`node:fs`.
 
 ## Protocol
 
@@ -461,12 +507,33 @@ patched `fs`.
 ## Tests
 
 ```
-node --test test/*.test.js
+npm test        # node --test "test/*.test.js"
+npm run lint    # eslint + prettier
 ```
 
 172 tests covering config, cache, scanner, place, kernel, module hooks,
 fs-patch, compression, SEA, watcher, bootstrap. One symlink test skips
-where links are unavailable. `npm run lint` = eslint + prettier.
+where links are unavailable.
+
+## Support
+
+CI runs the suite and the linter on every push:
+
+|         | Node 22.22.3 | Node 22.x | Node 24.x | Node 26.x |
+| ------- | ------------ | --------- | --------- | --------- |
+| Linux   | ✓            | ✓         | ✓         | ✓         |
+| Windows | ✓            | ✓         | ✓         | ✓         |
+
+22.22.3 is the floor: `module.registerHooks` must resolve `require()` of
+modules that exist only in memory. macOS is expected to work (same
+`fs.watch` capabilities as Linux and Windows) but is not in the matrix.
+
+The watcher relies on `fs.watch(dir, { recursive: true })`. That is
+unavailable on AIX and IBM i, where the live-reload features do not
+work; everything else does.
+
+`npm ci` needs no git or SSH access: dependencies resolve over HTTPS
+with lockfile integrity hashes.
 
 ## License
 
