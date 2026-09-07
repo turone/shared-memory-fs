@@ -9,8 +9,9 @@ no serialization, no IPC for reads. Optional V8 bytecode
 (`require.compile`) is compiled once and stored in SAB so workers skip
 parse + compile. There is no ESM bytecode cache.
 
-Requires Node.js ≥ 22.22.3 (`module.registerHooks`; CJS `--import`
-bootstrap of memory-only modules).
+Requires Node.js 22.22.3+ or 24.12.0+ or 26+ (`module.registerHooks`;
+CJS `--import` bootstrap of memory-only modules). Node 24 below 24.12.0
+is unsupported.
 
 ## Contents
 
@@ -519,13 +520,17 @@ where links are unavailable.
 
 CI runs the suite and the linter on every push:
 
-|         | Node 22.22.3 | Node 22.x | Node 24.x | Node 26.x |
-| ------- | ------------ | --------- | --------- | --------- |
-| Linux   | ✓            | ✓         | ✓         | ✓         |
-| Windows | ✓            | ✓         | ✓         | ✓         |
+|         | Node 22.22.3 | Node 22.x | Node 24.12.0 | Node 24.x | Node 26.x |
+| ------- | ------------ | --------- | ------------ | --------- | --------- |
+| Linux   | ✓            | ✓         | ✓            | ✓         | ✓         |
+| Windows | ✓            | ✓         | ✓            | ✓         | ✓         |
 
-22.22.3 is the floor: `module.registerHooks` must resolve `require()` of
-modules that exist only in memory. macOS is expected to work (same
+Engines: `>=22.22.3 <23 || >=24.12.0 <25 || >=26`. Node 22 is supported
+from 22.22.3; Node 24 from 24.12.0. Early Node 24 bypasses
+`registerHooks` for nested `require()` from CJS executed by the ESM
+translator. The limitation is the same on Linux and Windows. ESM and
+disk-backed CommonJS could work on earlier 24.x, but those releases are
+outside the library's supported matrix. macOS is expected to work (same
 `fs.watch` capabilities as Linux and Windows) but is not in the matrix.
 
 The watcher relies on `fs.watch(dir, { recursive: true })`. That is

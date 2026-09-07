@@ -41,7 +41,7 @@ describe('bootstrap: --import shared-memory-fs/register', () => {
     assert.equal(r.code, 0, r.stderr);
     assert.match(
       r.stdout,
-      /OK cjs read=hello-from-bootstrap-fixture cjs=42 generated=generated/,
+      /OK cjs read=hello-from-bootstrap-fixture cjs=42 generated=generated nested=nested-memory/,
     );
   });
 

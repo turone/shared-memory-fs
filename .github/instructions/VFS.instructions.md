@@ -8,8 +8,12 @@ applyTo: lib/**, index.js, test/**, doc/**
 # VFS Architecture
 
 `shared-memory-fs` — pooled SharedArrayBuffer virtual filesystem for Node.js
-worker_threads, plus fs / module hooks. Node >= 22.22.3
-(`module.registerHooks`; CJS `--import` bootstrap of memory modules).
+worker_threads, plus fs / module hooks. Engines:
+`>=22.22.3 <23 || >=24.12.0 <25 || >=26` (`module.registerHooks`).
+Node 22 from 22.22.3; Node 24 from 24.12.0. Early Node 24 bypasses
+registerHooks for nested require() from CJS executed by the ESM
+translator (Linux and Windows alike). ESM and disk-backed CommonJS could
+work on earlier 24.x; those releases are outside the supported matrix.
 
 ## Module Map
 
@@ -236,7 +240,8 @@ without the router ever touching the disk. Consequences to design around:
   prettier. Bootstrap and hooks tests use
   child processes / workers — never install hooks in the runner process without
   uninstalling in `after`.
-- CI runs both on Linux and Windows across Node 22.22.3 / 22.x / 24.x / 26.x.
+- CI runs both on Linux and Windows across Node 22.22.3 / 22.x / 24.12.0 /
+  24.x / 26.x.
   Dependencies must stay installable by a bare `npm ci` — no git or SSH access, so
   git deps are pinned as HTTPS tarball URLs with lockfile integrity, never as
   `github:` shorthand (npm rewrites that to `git+ssh` in `resolved`).
