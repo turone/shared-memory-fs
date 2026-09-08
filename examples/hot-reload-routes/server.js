@@ -22,6 +22,8 @@ const moduleHook = require('../../lib/adapters/module-hook.js');
 
 const APP_ROOT = __dirname;
 const ROUTES_DIR = path.join(APP_ROOT, 'routes');
+const PORT = Number(process.env.PORT || 3000);
+const HOST = '127.0.0.1';
 
 const config = new VfsConfig({
   defaults: {
@@ -45,9 +47,29 @@ const loadRoute = (name) => {
   const abs = path.join(ROUTES_DIR, `${name}.js`);
   try {
     return require(abs);
-  } catch {
+  } catch (error) {
+    void error;
     return null;
   }
+};
+
+const shutdown = async () => {
+  try {
+    fsPatch.uninstall();
+  } catch (error) {
+    void error;
+  }
+  try {
+    moduleHook.uninstall();
+  } catch (error) {
+    void error;
+  }
+  try {
+    kernel.close();
+  } catch (error) {
+    void error;
+  }
+  process.exit(0);
 };
 
 (async () => {
@@ -74,8 +96,12 @@ module.exports = (req, res) => {
     return handler(req, res);
   });
 
-  server.listen(3000, () => {
-    console.log('listening on http://localhost:3000');
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+
+  server.listen(PORT, HOST, () => {
+    const port = server.address().port;
+    console.log(`listening on http://${HOST}:${port}`);
     console.log('routes directory (virtual): ' + ROUTES_DIR);
   });
 

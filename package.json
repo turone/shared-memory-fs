@@ -33,6 +33,7 @@
   ],
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
+    "test:examples": "node --test \"test/examples-smoke.test.js\"",
     "lint": "eslint . && prettier -c \"**/*.js\" \"**/*.json\" \"**/*.md\"",
     "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\""
   },

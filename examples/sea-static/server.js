@@ -6,7 +6,7 @@
 // same place config, swap the provider only when packaging.
 //
 // Modes:
-//   node examples/sea-static/server.js        # provider auto-falls back to disk via sab
+//   PORT=0 node examples/sea-static/server.js  # provider auto-falls back to disk via sab
 //   <built-sea-binary>                         # uses provider:'sea', assets in node:sea
 //
 // Build SEA binary: see README in this directory.
@@ -15,6 +15,8 @@ const http = require('node:http');
 const { VfsConfig, VfsKernel } = require('../..');
 
 const APP_ROOT = __dirname;
+const PORT = Number(process.env.PORT || 3000);
+const HOST = '127.0.0.1';
 let isSea = false;
 try {
   isSea = require('node:sea').isSea();
@@ -44,6 +46,15 @@ const MIME = {
   json: 'application/json; charset=utf-8',
 };
 
+const shutdown = async () => {
+  try {
+    kernel.close();
+  } catch (error) {
+    void error;
+  }
+  process.exit(0);
+};
+
 (async () => {
   await kernel.initialize();
 
@@ -65,9 +76,13 @@ const MIME = {
     return res.end(data);
   });
 
-  server.listen(3000, () => {
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+
+  server.listen(PORT, HOST, () => {
+    const port = server.address().port;
     const mode = isSea ? 'SEA' : 'disk (sab)';
-    console.log(`listening on http://localhost:3000 [${mode}]`);
+    console.log(`listening on http://${HOST}:${port} [${mode}]`);
     console.log(`pub entries: ${pub.readdir('/', { recursive: true }).length}`);
   });
 })().catch((err) => {
