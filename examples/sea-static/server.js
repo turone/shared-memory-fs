@@ -6,7 +6,7 @@
 // same place config, swap the provider only when packaging.
 //
 // Modes:
-//   node examples/sea-static/server.js        # provider auto-falls back to disk via sab
+//   PORT=0 node examples/sea-static/server.js  # provider auto-falls back to disk via sab
 //   <built-sea-binary>                         # uses provider:'sea', assets in node:sea
 //
 // Build SEA binary: see README in this directory.
@@ -15,6 +15,8 @@ const http = require('node:http');
 const { VfsConfig, VfsKernel } = require('../..');
 
 const APP_ROOT = __dirname;
+const PORT = Number(process.env.PORT || 3000);
+const HOST = '127.0.0.1';
 let isSea = false;
 try {
   isSea = require('node:sea').isSea();
@@ -35,6 +37,7 @@ const config = new VfsConfig({
 });
 
 const kernel = new VfsKernel(config, { appRoot: APP_ROOT });
+let server;
 
 const MIME = {
   html: 'text/html; charset=utf-8',
@@ -44,6 +47,36 @@ const MIME = {
   json: 'application/json; charset=utf-8',
 };
 
+const closeKernel = () => {
+  try {
+    kernel.close();
+  } catch (error) {
+    void error;
+  }
+};
+
+let shuttingDown = false;
+const shutdown = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  let exited = false;
+  const done = () => {
+    if (exited) return;
+    exited = true;
+    closeKernel();
+    process.exit(0);
+  };
+  if (!server) {
+    done();
+    return;
+  }
+  if (typeof server.closeAllConnections === 'function') {
+    server.closeAllConnections();
+  }
+  server.close(done);
+  setTimeout(done, 1000).unref();
+};
+
 (async () => {
   await kernel.initialize();
 
@@ -51,7 +84,7 @@ const MIME = {
   // consumed immediately by res.end(), never mutated or retained.
   const pub = kernel.fs('pub');
 
-  const server = http.createServer((req, res) => {
+  server = http.createServer((req, res) => {
     const urlPath = req.url.split('?')[0];
     const key = urlPath === '/' ? '/index.html' : urlPath;
     const data = pub.readFileView(key);
@@ -65,9 +98,13 @@ const MIME = {
     return res.end(data);
   });
 
-  server.listen(3000, () => {
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+
+  server.listen(PORT, HOST, () => {
+    const port = server.address().port;
     const mode = isSea ? 'SEA' : 'disk (sab)';
-    console.log(`listening on http://localhost:3000 [${mode}]`);
+    console.log(`listening on http://${HOST}:${port} [${mode}]`);
     console.log(`pub entries: ${pub.readdir('/', { recursive: true }).length}`);
   });
 })().catch((err) => {
