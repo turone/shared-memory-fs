@@ -37,6 +37,7 @@ const config = new VfsConfig({
 });
 
 const kernel = new VfsKernel(config, { appRoot: APP_ROOT });
+let server;
 
 const MIME = {
   html: 'text/html; charset=utf-8',
@@ -46,13 +47,34 @@ const MIME = {
   json: 'application/json; charset=utf-8',
 };
 
-const shutdown = async () => {
+const closeKernel = () => {
   try {
     kernel.close();
   } catch (error) {
     void error;
   }
-  process.exit(0);
+};
+
+let shuttingDown = false;
+const shutdown = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  let exited = false;
+  const done = () => {
+    if (exited) return;
+    exited = true;
+    closeKernel();
+    process.exit(0);
+  };
+  if (!server) {
+    done();
+    return;
+  }
+  if (typeof server.closeAllConnections === 'function') {
+    server.closeAllConnections();
+  }
+  server.close(done);
+  setTimeout(done, 1000).unref();
 };
 
 (async () => {
@@ -62,7 +84,7 @@ const shutdown = async () => {
   // consumed immediately by res.end(), never mutated or retained.
   const pub = kernel.fs('pub');
 
-  const server = http.createServer((req, res) => {
+  server = http.createServer((req, res) => {
     const urlPath = req.url.split('?')[0];
     const key = urlPath === '/' ? '/index.html' : urlPath;
     const data = pub.readFileView(key);

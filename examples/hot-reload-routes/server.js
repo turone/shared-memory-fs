@@ -35,6 +35,8 @@ const config = new VfsConfig({
 });
 
 const kernel = new VfsKernel(config, { appRoot: APP_ROOT });
+const timers = [];
+let server;
 
 const writeRoute = (name, source) => {
   kernel.fs('routes').writeFile(`/${name}.js`, source);
@@ -53,7 +55,7 @@ const loadRoute = (name) => {
   }
 };
 
-const shutdown = async () => {
+const closeKernel = () => {
   try {
     fsPatch.uninstall();
   } catch (error) {
@@ -69,7 +71,30 @@ const shutdown = async () => {
   } catch (error) {
     void error;
   }
-  process.exit(0);
+};
+
+let shuttingDown = false;
+const shutdown = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const timer of timers) clearTimeout(timer);
+  timers.length = 0;
+  let exited = false;
+  const done = () => {
+    if (exited) return;
+    exited = true;
+    closeKernel();
+    process.exit(0);
+  };
+  if (!server) {
+    done();
+    return;
+  }
+  if (typeof server.closeAllConnections === 'function') {
+    server.closeAllConnections();
+  }
+  server.close(done);
+  setTimeout(done, 1000).unref();
 };
 
 (async () => {
@@ -86,7 +111,7 @@ module.exports = (req, res) => {
 };`,
   );
 
-  const server = http.createServer((req, res) => {
+  server = http.createServer((req, res) => {
     const name = req.url.split('?')[0].replace(/^\//, '') || 'hello';
     const handler = loadRoute(name);
     if (!handler) {
@@ -106,40 +131,46 @@ module.exports = (req, res) => {
   });
 
   // Simulated AI agent: drop new routes into the VFS at runtime.
-  setTimeout(() => {
-    writeRoute(
-      'time',
-      `'use strict';
+  timers.push(
+    setTimeout(() => {
+      writeRoute(
+        'time',
+        `'use strict';
 module.exports = (req, res) => {
   res.end('server time: ' + new Date().toISOString() + '\\n');
 };`,
-    );
-    console.log('[agent] wrote /time route');
-  }, 2000);
+      );
+      console.log('[agent] wrote /time route');
+    }, 2000),
+  );
 
-  setTimeout(() => {
-    writeRoute(
-      'echo',
-      `'use strict';
+  timers.push(
+    setTimeout(() => {
+      writeRoute(
+        'echo',
+        `'use strict';
 module.exports = (req, res) => {
   const q = Object.fromEntries(new URL(req.url, 'http://x').searchParams);
   res.end(JSON.stringify(q) + '\\n');
 };`,
-    );
-    console.log('[agent] wrote /echo route');
-  }, 4000);
+      );
+      console.log('[agent] wrote /echo route');
+    }, 4000),
+  );
 
   // Hot-update an existing route.
-  setTimeout(() => {
-    writeRoute(
-      'hello',
-      `'use strict';
+  timers.push(
+    setTimeout(() => {
+      writeRoute(
+        'hello',
+        `'use strict';
 module.exports = (req, res) => {
   res.end('updated hello! ' + Date.now() + '\\n');
 };`,
-    );
-    console.log('[agent] updated /hello route');
-  }, 6000);
+      );
+      console.log('[agent] updated /hello route');
+    }, 6000),
+  );
 })().catch((err) => {
   console.error(err);
   process.exit(1);

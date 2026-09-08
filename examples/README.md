@@ -10,7 +10,8 @@ is self-contained — no extra build steps unless explicitly noted.
 | [multi-tenant/](multi-tenant/)           | Two memory places under one appRoot + global `strict: true` whitelist; demonstrates the boundary `strict` enforces and where it stops. |
 
 These examples are docs-grade and are also covered by the automated smoke suite
-for this repo: `npm run test:examples`.
+in `test-examples/`, run with `npm run test:examples`. That suite is not part of
+`npm test`.
 
 The smoke suite validates the runnable examples on the supported Linux and
 Windows matrix. It exercises the `sea-static` example in the normal `sab` mode
