@@ -12,7 +12,9 @@ if (!kernel || kernel.state !== 'ready') {
   process.exit(1);
 }
 
-const text = fs.readFileSync(path.join(process.cwd(), 'static', 'hello.txt'), 'utf8').trim();
+const text = fs
+  .readFileSync(path.join(process.cwd(), 'static', 'hello.txt'), 'utf8')
+  .trim();
 const cjs = require('./modules/cjs.cjs');
 const scratch = kernel.fs('scratch');
 scratch.writeFile('/gen.js', 'module.exports = "generated";');

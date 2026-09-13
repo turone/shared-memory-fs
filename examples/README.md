@@ -3,11 +3,11 @@
 Runnable demos covering the main shared-memory-fs use cases. Each subfolder
 is self-contained — no extra build steps unless explicitly noted.
 
-| Example                                  | What it shows                                                                                                                          |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| [hot-reload-routes/](hot-reload-routes/) | `provider: 'memory'` + `require()` hook; HTTP server whose route handlers are written/replaced at runtime by an "AI agent".            |
-| [sea-static/](sea-static/)               | One config, two providers: `'sab'` when running with `node`, `'sea'` when packaged with Node SEA. Same HTTP handler in both modes.     |
-| [multi-tenant/](multi-tenant/)           | Two memory places under one appRoot + global `strict: true` whitelist; demonstrates the boundary `strict` enforces and where it stops. |
+| Example                                  | What it shows                                                                                                                                   |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| [hot-reload-routes/](hot-reload-routes/) | `provider: 'map', origin: 'virtual'` + `require()` hook; HTTP server whose route handlers are written/replaced at runtime by an "AI agent".     |
+| [sea-static/](sea-static/)               | One config, two providers: `'sab'` when running with `node`, `'sea'` when packaged with Node SEA. Same HTTP handler in both modes.              |
+| [multi-tenant/](multi-tenant/)           | Two `map + virtual` places under one appRoot + global `strict: true` whitelist; demonstrates the boundary `strict` enforces and where it stops. |
 
 These examples are docs-grade and are also covered by the automated smoke suite
 in `test-examples/`, run with `npm run test:examples`. That suite is not part of

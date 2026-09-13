@@ -28,13 +28,21 @@ is unsupported.
   `Buffer.from(sab, offset, length)` views.
 - **Pooled segments** — files packed into 64 MiB SAB segments; emptied
   segments are reused, never returned to the OS.
-- **V8 bytecode (CJS only)** — `require: { compile: true }` (default when
-  the require domain is on). ESM has no bytecode cache.
+- **Two content origins** — `origin: 'disk'` (scanner + watcher fill the
+  place) or `origin: 'virtual'` (the application writes the content —
+  from the main thread or, for `sab`, from a worker over the link port).
+- **`fs.script`** — an optional synchronous `prepare` callback transforms
+  a source before it becomes the canonical content (bundling, wrapping,
+  templating…), plus its own V8 bytecode companion for callers that build
+  their own `vm.Script` (`PlaceFs.script()`), independent of `require.compile`.
+- **V8 bytecode** — `require: { compile: true }` (CJS, default when the
+  require domain is on) and/or `fs.script.compile` (bare source, default
+  true when `fs.script` is on). ESM has no bytecode cache.
 - **Pre-compressed representations** — `gzip`, `deflate`, `br`, `zstd`
   built once and shared from SAB. HTTP negotiation stays in your server.
 - **Live reload** — watcher batches disk events into epochs, one
   `vfs-update` per epoch, ACK-before-free.
-- **Five providers** — `sab`, `memory`, `sea`, `disk`, `node-default`.
+- **Five providers** — `sab`, `map`, `sea`, `disk`, `node-default`.
 - **Strict sandbox** — `strict: true` makes `appRoot` the boundary.
 - **Hooks** — `hooks.fs` patches `node:fs`; `hooks.module` is one
   `module.registerHooks` chain for `require()` and `import`.
@@ -85,6 +93,7 @@ const config = new VfsConfig({
   },
   places: {
     static: {
+      // origin defaults to 'disk': scanner + watcher fill it.
       fs: { ext: ['html', 'css', 'js', 'png', 'svg'] },
     },
     lib: {
@@ -92,7 +101,8 @@ const config = new VfsConfig({
       require: { ext: ['js'], compile: true },
     },
     scratch: {
-      provider: 'memory',
+      provider: 'map',
+      origin: 'virtual', // content comes only from application writes
       fs: { writable: true },
     },
   },
@@ -123,7 +133,7 @@ scratch.writeFile('/note.txt', 'hello');
 ```
 
 `kernel.fs(name)` returns a `PlaceFs` for an indexed place with an fs
-domain (`sab` / `memory` / `sea`). Disk and node-default places are
+domain (`sab` / `map` / `sea`). Disk and node-default places are
 plain `node:fs` territory.
 
 `readFile*` returns owned copies. `*View` methods and stream chunks are
@@ -131,40 +141,66 @@ borrowed views **only** when `fs.zeroCopy: true`; otherwise they throw
 `ENOTSUP` or copy. Never mutate a borrowed view; never keep it past the
 current operation; `Buffer.from(view)` to retain.
 
-Bytecode is not on `PlaceFs` — it is [adapter API](#adapter-api).
+Mutations of a `sab + virtual` place cross the allocator (and, when
+configured, the compression threadpool), so they return a **Promise**
+that settles once the new version is published — `await` it. Every other
+place (disk-origin, and `map`, including `map + virtual`) mutates
+synchronously and returns `undefined`; `await` is still correct for both.
+
+Bytecode is not on `PlaceFs` — it is [adapter API](#adapter-api), except
+for `fs.script` bundles, which are `PlaceFs.script(key)` (below).
 
 ## Providers
 
-| Provider       | Storage             | VFS index | Writable                  | Shared across workers |
-| -------------- | ------------------- | --------- | ------------------------- | --------------------- |
-| `sab`          | SAB pool            | yes       | `fs.writable` writes disk | yes, zero-copy        |
-| `memory`       | per-thread `Map`    | yes       | yes                       | no, per-thread        |
-| `sea`          | SAB from SEA assets | yes       | no                        | yes, zero-copy        |
-| `disk`         | OS filesystem       | no        | `fs.writable`             | n/a, managed mount    |
-| `node-default` | OS filesystem       | no        | n/a                       | n/a, ordinary Node    |
+| Provider       | Storage             | VFS index | Origin              | Shared across workers |
+| -------------- | ------------------- | --------- | ------------------- | --------------------- |
+| `sab`          | SAB pool            | yes       | `disk` \| `virtual` | yes, zero-copy        |
+| `map`          | per-thread `Map`    | yes       | `disk` \| `virtual` | no, per-thread        |
+| `sea`          | SAB from SEA assets | yes       | fixed (SEA assets)  | yes, zero-copy        |
+| `disk`         | OS filesystem       | no        | fixed (disk)        | n/a, managed mount    |
+| `node-default` | OS filesystem       | no        | fixed (disk)        | n/a, ordinary Node    |
 
-`INDEXED` = sab | memory | sea (have a files Map). `SHARED` = sab | sea
+`INDEXED` = sab | map | sea (have a files Map). `SHARED` = sab | sea
 (bytes in SAB). `disk` and `node-default` are passthrough mounts: they
 are never scanned and hold no VFS entries. `disk` differs from
 `node-default` only in being _managed_ — the router applies the fs
 domain's writable policy and the strict sandbox to it.
 
-Writable SAB is **eventual consistency**: mutations go to disk; the
-watcher brings them into SAB. There is no `waitForUpdate`. The watcher
+**`origin`** applies only to `sab` and `map`, defaults to `'disk'`, and is
+always explicit in the resolved config:
+
+| provider + origin | content                          | mutations                    | sharing             |
+| ----------------- | -------------------------------- | ---------------------------- | ------------------- |
+| `sab` + `disk`    | scanner + watcher                | to disk, watcher republishes | snapshot/delta      |
+| `sab` + `virtual` | application writes               | main thread or worker RPC    | snapshot/delta      |
+| `map` + `disk`    | scanner + watcher, owned Buffers | to disk, watcher republishes | none (thread-local) |
+| `map` + `virtual` | application writes               | local `Map`, synchronous     | none (thread-local) |
+
+`origin: 'virtual'` requires the fs domain with `writable: true` —
+nothing else can ever give the place content. A virtual place is
+legitimately empty right after `initialize()`; workers project it from
+the snapshot and receive its first file like any other update.
+
+Writable disk-origin SAB/map is **eventual consistency**: mutations go
+to disk; the watcher brings them into the index. There is no
+`waitForUpdate`. A `sab + virtual` mutation, in contrast, resolves its
+Promise only once the new version is already published. The watcher
 also starts when `defaults.watch` is on.
 
-### Memory provider
+### Map provider
 
-Per-thread writable namespace. Each thread owns an empty instance after
-`fromSnapshot()` / `attach()`. Writes via `PlaceFs` or patched
-`fs.writeFileSync` are local to that thread. JS is compiled to V8
-bytecode when `require.compile` is on (the default if `require` is
-enabled).
+Per-thread writable namespace (`origin: 'disk'` or `'virtual'`). Each
+thread owns its own instance after `fromSnapshot()` / `attach()` — it is
+never in the snapshot and mutations of one thread are invisible to
+others. Writes via `PlaceFs` are local to that thread and synchronous.
+JS is compiled to V8 bytecode when `require.compile` and/or
+`fs.script.compile` are on.
 
 ```js
 places: {
   agent: {
-    provider: 'memory',
+    provider: 'map',
+    origin: 'virtual',
     fs: { writable: true },
     require: true, // compile defaults to true
   },
@@ -174,6 +210,54 @@ const agent = kernel.fs('agent');
 agent.writeFile('/tool.js', 'module.exports = () => 42;');
 const tool = require('/abs/path/agent/tool.js');
 ```
+
+### `fs.script` and preparers
+
+`fs.script` marks sources the VFS may transform (`prepare`) and compile
+for callers that build their own `vm.Script` (`PlaceFs.script(key)`) —
+orthogonal to `require.compile`, which serves Node's CJS loader. Both
+may cover the same file with independent companions.
+
+```js
+const config = new VfsConfig({
+  places: {
+    api: {
+      fs: { writable: true, script: { prepare: 'wrap', compile: true } },
+    },
+  },
+});
+const kernel = new VfsKernel(config, {
+  appRoot,
+  preparers: {
+    // Synchronous only; runs on the main thread inside the scanner /
+    // watcher pipeline and inside synchronous Map writes.
+    wrap: (raw, file) => ({
+      source: `(${raw.toString().trim()})`,
+      scriptOptions: { filename: file.path },
+      meta: { key: file.key },
+    }),
+  },
+});
+```
+
+- `prepare(raw: Buffer, file)` → `null` (publish raw) | `string` |
+  `Uint8Array` | `{ source, scriptOptions?, meta? }`. `file` is frozen
+  `{ place, key, path, ext, stat }`.
+- The **prepared source is the canonical content**: every read, stream,
+  `require`/`import`, `script()` and cached data refer to it; the raw
+  input is not kept. In a **virtual** place `appendFile` and `rename` on a
+  prepared key are therefore `ENOTSUP`; a disk-origin place has no such
+  limit — the mutation edits the raw file and the watcher re-prepares it.
+- `fs.script.compile` (default `true`) builds `\0script:bytecode` —
+  cached data of the **bare** canonical source under the preparer's
+  `scriptOptions`. It is independent from `require.compile`'s
+  `\0require:bytecode` (cached data of `Module.wrap(source)`); neither
+  substitutes for the other. A script-compile failure invalidates the
+  whole publication (previous version kept); a require-compile failure
+  is best-effort (only its own companion is dropped).
+- `kernel.fs(name).script(key)` →
+  `{ source, cachedData, scriptOptions, meta } | null`; `ENOTSUP` when the
+  place has no `fs.script`.
 
 ### SEA provider
 
@@ -238,7 +322,8 @@ A codec listed in `encodings` but missing from `options` runs with native
 zlib defaults (brotli quality 11, gzip/deflate 6, zstd 3).
 
 **`retainRaw: false`** keeps only compressed bytes in SAB; the source
-stays a disk entry. Requires provider `sab` and no `require.compile`.
+stays a disk entry. Requires provider `sab`, no `require.compile` and no
+`fs.script`.
 `place.readFile()` then returns `null` for it; patched `fs` reads disk.
 
 Failures are per representation: a codec that does not fit is skipped
@@ -292,20 +377,28 @@ cloneable so workers rebuild from it.
 Sizes accept `metautil.sizeToBytes` strings or numbers. Booleans must be
 booleans.
 
-| `places.<name>.*` | Type   | Default       | Description                                         |
-| ----------------- | ------ | ------------- | --------------------------------------------------- |
-| `provider`        | string | `'sab'`       | `sab`, `memory`, `sea`, `disk`, `node-default`      |
-| `enabled`         | bool   | `true`        | Drop a place without removing it                    |
-| `maxFileSize`     | size   | from defaults | SAB/sea only                                        |
-| `fs`              | domain | off           | `true` or `{ ext, writable, zeroCopy, compress }`   |
-| `require`         | domain | off           | `true` or `{ ext, compile }` (compile default true) |
-| `import`          | domain | off           | `true` or `{ ext }`                                 |
+| `places.<name>.*` | Type   | Default       | Description                                               |
+| ----------------- | ------ | ------------- | --------------------------------------------------------- |
+| `provider`        | string | `'sab'`       | `sab`, `map`, `sea`, `disk`, `node-default`               |
+| `origin`          | string | `'disk'`      | `disk` \| `virtual`; sab/map only                         |
+| `enabled`         | bool   | `true`        | Drop a place without removing it                          |
+| `maxFileSize`     | size   | from defaults | SAB/sea only                                              |
+| `fs`              | domain | off           | `true` or `{ ext, writable, zeroCopy, compress, script }` |
+| `require`         | domain | off           | `true` or `{ ext, compile }` (compile default true)       |
+| `import`          | domain | off           | `true` or `{ ext }`                                       |
 
 Place name: ASCII `[A-Za-z0-9][A-Za-z0-9._-]*`, no trailing dot, no
 Windows reserved names, unique after lowercasing.
 
 Domain defaults: require ext `js,cjs,json`; import ext `js,mjs,json`;
-fs ext `null` = everything. At least one domain must be on.
+fs ext `null` = everything (resolved `fs.ext` is the union of `fs.ext`
+and `fs.script.ext`). At least one domain must be on.
+
+| `places.<name>.fs.script.*` | Type     | Default        | Description                                  |
+| --------------------------- | -------- | -------------- | -------------------------------------------- |
+| `ext`                       | string[] | `['js','cjs']` | Never `mjs`                                  |
+| `prepare`                   | string   | none           | Preparer identifier (see kernel `preparers`) |
+| `compile`                   | bool     | `true`         | Build the `\0script:bytecode` companion      |
 
 | `places.<name>.fs.compress.*` | Type               | Default | Description                     |
 | ----------------------------- | ------------------ | ------- | ------------------------------- |
@@ -330,28 +423,29 @@ node app.js -- --vfs.defaults.memory.limit=512mib \
 
 `new VfsKernel(config, options)`
 
-| Option         | Default              | Description                    |
-| -------------- | -------------------- | ------------------------------ |
-| `appRoot`      | `process.cwd()`      | Root for place directories     |
-| `console`      | `globalThis.console` | Logger                         |
-| `broadcast`    | no-op                | Extra fan-out besides `link()` |
-| `getWorkerIds` | `() => []`           | Extra ACK set besides links    |
-| `seaModule`    | `node:sea` if any    | Inject for tests               |
+| Option         | Default              | Description                                                                          |
+| -------------- | -------------------- | ------------------------------------------------------------------------------------ |
+| `appRoot`      | `process.cwd()`      | Root for place directories                                                           |
+| `console`      | `globalThis.console` | Logger                                                                               |
+| `broadcast`    | no-op                | Extra fan-out besides `link()`                                                       |
+| `getWorkerIds` | `() => []`           | Extra ACK set besides links                                                          |
+| `seaModule`    | `node:sea` if any    | Inject for tests                                                                     |
+| `preparers`    | `{}`                 | `{ id: (raw, file) => ... }` for `fs.script.prepare` — synchronous, main-thread only |
 
 States: `new → initializing → ready → closed` (final). `fs()`,
 `snapshot()`, `watch()`, `link()` require `ready`. `initialize()`
 failure closes the kernel.
 
-| Method                          | Description                                     |
-| ------------------------------- | ----------------------------------------------- |
-| `await initialize()`            | Scan / SEA / memory, bytecode, compression      |
-| `fs(name)`                      | `PlaceFs` for an indexed fs place               |
-| `snapshot()`                    | `{ segments, places }`                          |
-| `link()`                        | `{ vfs, transferList }` for a worker            |
-| `watch()`                       | Start `DirWatcher` (also auto if writable sab)  |
-| `handleAck(updateId, workerId)` | ACK-before-free                                 |
-| `handleWorkerExit(workerId)`    | Drop that worker from pending frees             |
-| `close()`                       | Stop watcher, drop projections, collectable SAB |
+| Method                          | Description                                                              |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `await initialize()`            | Scan / SEA / map, preparers, bytecode, compression                       |
+| `fs(name)`                      | `PlaceFs` for an indexed fs place                                        |
+| `snapshot()`                    | `{ segments, places }`                                                   |
+| `link()`                        | `{ vfs, transferList }` for a worker                                     |
+| `watch()`                       | Start `DirWatcher` (also auto if writable disk-origin)                   |
+| `handleAck(updateId, workerId)` | ACK-before-free                                                          |
+| `handleWorkerExit(workerId)`    | Drop that worker from pending frees                                      |
+| `close()`                       | Stop watcher, reject queued mutations, drop projections, collectable SAB |
 
 `link()` returns `{ vfs: { snapshot, config: raw, appRoot, port },
 transferList }`. The kernel posts every `vfs-update` to the port, reads
@@ -384,22 +478,24 @@ Returned by `kernel.fs(name)`. Reads return `null` when missing;
 Mutations take a canonical key (leading slash; NUL, `..`, backslash
 rejected).
 
-| Method                                       | Returns                  | Description                         |
-| -------------------------------------------- | ------------------------ | ----------------------------------- |
-| `readFile(key, opts)`                        | Buffer \| string \| null | Owned copy                          |
-| `readFileView(key)`                          | Buffer \| null           | Borrowed; needs `zeroCopy`          |
-| `stat(key, opts)`                            | `VfsStats` \| null       | Lazy; `{ bigint }` ok               |
-| `exists(key)`                                | bool                     | File or implicit directory          |
-| `readdir(key, opts)`                         | string[] \| Dirent[]     | Implicit dirs; lex order            |
-| `createReadStream(key, opts)`                | Readable \| null         | `{ start, end }` inclusive          |
-| `storedEncodings(key)`                       | string[]                 | `'raw'` plus configured codecs      |
-| `readFileCompressed(key, enc)`               | Buffer \| null           | Owned copy                          |
-| `readFileCompressedView(key, enc)`           | Buffer \| null           | Borrowed; needs `zeroCopy`          |
-| `statCompressed(key, enc)`                   | object \| null           | `{ size, sourceSize, encoding, … }` |
-| `createReadStreamCompressed(key, enc, opts)` | Readable \| null         | Range is compressed bytes           |
-| `pathOf(key)`                                | string                   | Absolute OS path                    |
-| `writeFile` / `appendFile` / `unlink`        | void                     | Memory Map or disk (`writable`)     |
-| `mkdir` / `rm` / `rename`                    | void                     | Memory mkdir is a no-op             |
+| Method                                       | Returns                                               | Description                                                                   |
+| -------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `readFile(key, opts)`                        | Buffer \| string \| null                              | Owned copy                                                                    |
+| `readFileView(key)`                          | Buffer \| null                                        | Borrowed; needs `zeroCopy`                                                    |
+| `stat(key, opts)`                            | `VfsStats` \| null                                    | Lazy; `{ bigint }` ok                                                         |
+| `exists(key)`                                | bool                                                  | File or implicit directory                                                    |
+| `readdir(key, opts)`                         | string[] \| Dirent[]                                  | Implicit dirs; lex order                                                      |
+| `createReadStream(key, opts)`                | Readable \| null                                      | `{ start, end }` inclusive                                                    |
+| `storedEncodings(key)`                       | string[]                                              | `'raw'` plus configured codecs                                                |
+| `readFileCompressed(key, enc)`               | Buffer \| null                                        | Owned copy                                                                    |
+| `readFileCompressedView(key, enc)`           | Buffer \| null                                        | Borrowed; needs `zeroCopy`                                                    |
+| `statCompressed(key, enc)`                   | object \| null                                        | `{ size, sourceSize, encoding, … }`                                           |
+| `createReadStreamCompressed(key, enc, opts)` | Readable \| null                                      | Range is compressed bytes                                                     |
+| `pathOf(key)`                                | string                                                | Absolute OS path                                                              |
+| `script(key)`                                | `{ source, cachedData, scriptOptions, meta }` \| null | `ENOTSUP` when no `fs.script`                                                 |
+| `meta(key)`                                  | object \| null                                        | Frozen preparer metadata                                                      |
+| `writeFile` / `appendFile` / `unlink`        | void \| Promise                                       | Sync for map/disk; Promise for `sab + virtual`                                |
+| `mkdir` / `rm` / `rename`                    | void \| Promise                                       | `mkdir` is a no-op; prepared keys reject `rename`/`appendFile` with `ENOTSUP` |
 
 Cross-place `rename` through patched `fs` is `EXDEV`.
 
@@ -416,7 +512,7 @@ Full `node:fs` compatibility is not promised.
 
 **2. Recognized but unsupported** — routed, then rejected rather than
 silently falling through: `open` on a virtual entry returns `ENOTSUP`,
-because SAB and memory entries have no file descriptor. Descriptor-based
+because SAB and map entries have no file descriptor. Descriptor-based
 calls (`read`, `write`, `fstat`, …) are therefore unreachable for virtual
 files and are left alone.
 
@@ -461,10 +557,10 @@ in that same message. Bytes are freed only after every live worker
 Runnable demos under [examples/](examples/):
 
 - [hot-reload-routes/](examples/hot-reload-routes/) — HTTP server whose
-  route handlers are written into a memory place and `require()`d.
+  route handlers are written into a `map + virtual` place and `require()`d.
 - [sea-static/](examples/sea-static/) — same static server as `sab` or
   Node SEA (`provider: 'sea'`).
-- [multi-tenant/](examples/multi-tenant/) — two memory places +
+- [multi-tenant/](examples/multi-tenant/) — two `map + virtual` places +
   `strict: true`.
 
 See [doc/integration.md](doc/integration.md) and
@@ -492,7 +588,7 @@ Main thread                             Worker threads
 ┌──────────────────────────┐            ┌─────────────────────────┐
 │ VfsKernel                │  link()    │ attach() / fromSnapshot │
 │ ├─ VfsConfig (frozen)    │ ─────────► │ ├─ projected Maps       │
-│ ├─ FilesystemCache       │  vfs + SAB │ ├─ per-thread memory    │
+│ ├─ FilesystemCache       │  vfs + SAB │ ├─ per-thread map       │
 │ │  └─ Pool+Registry      │            │ └─ handleDelta()        │
 │ ├─ PlaceRegistry/FsRouter│  vfs-update│                         │
 │ ├─ scanner + DirWatcher  │ ─────────► │                         │
@@ -501,9 +597,9 @@ Main thread                             Worker threads
          SAB segments  ←  shared physical memory  →  zero-copy views
 ```
 
-Companions are internal keys `<source>\0require:bytecode` and
-`<source>\0fs:<enc>`. They never appear in `readdir` / `exists` /
-patched `fs`.
+Companions are internal keys `<source>\0require:bytecode`,
+`<source>\0script:bytecode` and `<source>\0fs:<enc>`. They never appear
+in `readdir` / `exists` / patched `fs`.
 
 ## Tests
 

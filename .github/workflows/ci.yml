@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, VFS]
+    branches: [main, VFS, virtual-and-prepared]
   pull_request:
 
 jobs:

@@ -11,7 +11,7 @@ Main thread                                Worker threads
 │ VfsKernel (full)                 │       │ attach() / fromSnapshot()    │
 │ ├─ VfsConfig (frozen)            │       │ ├─ same VfsConfig from raw   │
 │ ├─ FilesystemCache               │       │ ├─ projected Maps (zero-copy)│
-│ │  └─ Pool + SegmentRegistry     │       │ ├─ per-thread memory places  │
+│ │  └─ Pool + SegmentRegistry     │       │ ├─ per-thread map places     │
 │ ├─ PlaceRegistry + FsRouter      │       │ └─ handleDelta()             │
 │ ├─ scanner                       │       └──────────────────────────────┘
 │ ├─ DirWatcher (epochs)           │  link() → workerData.vfs
@@ -22,7 +22,8 @@ SAB segments ─────────── shared physical memory ───�
 
 Invariants:
 
-- Workers never write SAB.
+- Workers never write SAB directly; a `sab + virtual` write from a worker
+  goes through the mutation RPC and is applied by the main kernel.
 - ACK-before-free: stale entries are freed only after every live worker
   (`getWorkerIds()` ∪ `link()` ports) ACKs the `updateId`, or exits.
 - Empty segments are recycled, never returned to the OS. Compaction
@@ -30,19 +31,26 @@ Invariants:
 - Config is deep-frozen at construction. Workers rebuild from `config.raw`.
 - Place name **is** the directory under `appRoot`, the mount and the
   snapshot/delta key.
-- `require.compile` is main-thread-only; there is no ESM bytecode.
+- `require.compile` and `fs.script.compile` are main-thread-only
+  (preparers run only on the main thread); there is no ESM bytecode.
 
 ## Provider matrix
 
-|                       | `sab`                   | `memory`             | `sea`             | `node-default` | `disk`                |
-| --------------------- | ----------------------- | -------------------- | ----------------- | -------------- | --------------------- |
-| Source                | scanned dir             | empty per-thread     | `node:sea` assets | OS fs          | OS path entries       |
-| Storage               | SAB pool                | per-thread `Map`     | SAB pool          | OS fs          | OS fs                 |
-| Writable              | disk + watch            | yes                  | no                | passthrough    | `fs.writable`         |
-| Shared across workers | yes                     | no                   | yes               | n/a            | metadata only         |
-| In `snapshot()`       | yes                     | no (recreated empty) | yes               | n/a            | no                    |
-| Watched               | if watch / writable sab | no                   | no                | n/a            | no                    |
-| Bytecode              | `kernel.bytecode`       | auto on write        | `kernel.bytecode` | n/a            | no (`compile: false`) |
+|                       | `sab` + `disk`                       | `sab` + `virtual`             | `map` + `disk`       | `map` + `virtual`    | `sea`             | `node-default` | `disk`                |
+| --------------------- | ------------------------------------ | ----------------------------- | -------------------- | -------------------- | ----------------- | -------------- | --------------------- |
+| Source                | scanned dir                          | application writes            | scanned dir          | application writes   | `node:sea` assets | OS fs          | OS path entries       |
+| Storage               | SAB pool                             | SAB pool                      | per-thread `Map`     | per-thread `Map`     | SAB pool          | OS fs          | OS fs                 |
+| Writable              | disk + watch                         | main or worker RPC            | disk + watch         | local `Map`, sync    | no                | passthrough    | `fs.writable`         |
+| Shared across workers | yes                                  | yes                           | no                   | no                   | yes               | n/a            | metadata only         |
+| In `snapshot()`       | yes                                  | yes (empty until first write) | no (recreated empty) | no (recreated empty) | yes               | n/a            | no                    |
+| Watched               | yes                                  | no                            | yes                  | no                   | no                | n/a            | no                    |
+| Bytecode              | `kernel.bytecode` / `PlaceFs.script` | same, on publish              | auto on write        | auto on write        | `kernel.bytecode` | n/a            | no (`compile: false`) |
+
+Disk-origin writable places (`sab + disk`, `map + disk`) are **eventual
+consistency**: mutations go to disk, the watcher brings them into the
+index (no `waitForUpdate`). A `sab + virtual` mutation resolves its
+Promise only once the new version is already published — no watcher
+involved.
 
 Writable sab writes go to disk; the watcher brings them into SAB
 (eventual consistency, no `waitForUpdate`).
@@ -152,9 +160,9 @@ the compiling thread: V8's per-isolate cache masks rejection there.
 
 ### AI agent / plugin sandbox
 
-Pattern: one writable `memory` place per agent (or per session), strict
-mode on, optional `sab` place for read-only tooling. The trusted entry
-and `package.json` live **outside `appRoot`**.
+Pattern: one writable `map + virtual` place per agent (or per session),
+strict mode on, optional `sab` place for read-only tooling. The trusted
+entry and `package.json` live **outside `appRoot`**.
 
 ```js
 const config = new VfsConfig({
@@ -165,7 +173,8 @@ const config = new VfsConfig({
       require: { ext: ['js'], compile: true },
     },
     workspace: {
-      provider: 'memory',
+      provider: 'map',
+      origin: 'virtual',
       fs: { writable: true },
     },
   },
@@ -178,7 +187,7 @@ fs.readFileSync('/etc/passwd'); // ordinary Node (outside appRoot)
 fs.readFileSync(path.join(appRoot, 'elsewhere', 'file')); // EACCES
 ```
 
-Memory places are per-thread, so concurrent agents in different workers
+`map` places are per-thread, so concurrent agents in different workers
 cannot see each other's scratch state. Same-process places are **not**
 firewalled from each other.
 
@@ -261,7 +270,8 @@ during development. See [examples/sea-static/](../examples/sea-static/).
 ```js
 places: {
   gen: {
-    provider: 'memory',
+    provider: 'map',
+    origin: 'virtual',
     fs: { writable: true },
     require: true,
   },
@@ -275,6 +285,37 @@ gen.writeFile('/route.js', generateRouteHandler(newSpec));
 delete require.cache[path.join(appRoot, 'gen', 'route.js')];
 const next = require(path.join(appRoot, 'gen', 'route.js'));
 ```
+
+### Preparing sources with `fs.script`
+
+`fs.script` runs a synchronous callback over every raw source before it
+becomes canonical content, and can produce a `vm.Script` cached-data
+companion independent from `require.compile`:
+
+```js
+const kernel = new VfsKernel(config, {
+  appRoot,
+  preparers: {
+    wrap: (raw, file) => ({
+      source: `(${raw.toString().trim()})`,
+      scriptOptions: { filename: file.path },
+    }),
+  },
+});
+// places: { api: { fs: { script: { prepare: 'wrap' } } } }
+
+const bundle = kernel.fs('api').script('/handler.js');
+const script = new vm.Script(bundle.source, {
+  ...bundle.scriptOptions,
+  cachedData: bundle.cachedData,
+});
+const handler = script.runInThisContext();
+```
+
+The prepared source replaces the raw one everywhere (`readFile`, module
+loads, `script()`); the raw input is not retained, so in a **virtual**
+place `appendFile` and `rename` on a prepared key are `ENOTSUP`. In a
+disk-origin place they edit the raw file and the watcher re-prepares it.
 
 ### Testing with virtual fixtures
 
@@ -344,11 +385,12 @@ is N× wasted CPU. The main thread compiles once during `initialize()`,
 stores bytecode in SAB, and workers consume it via `cachedData`. Workers
 stay read-only with respect to SAB. ESM has no bytecode cache.
 
-**Why per-thread memory places.** Concurrent agents in different workers
-must not see each other's scratch state. Memory places are deliberately
+**Why per-thread map places.** Concurrent agents in different workers
+must not see each other's scratch state. `map` places are deliberately
 not shared — `fromSnapshot()` / `attach()` instantiates each one empty.
-Cross-worker writable state would require ACK-before-free on every
-write, which defeats a fast scratch space.
+Cross-worker writable state (`sab + virtual`) goes through the main
+kernel instead, with ACK-before-free and per-key ordering — the right
+trade for shared state, not for a fast per-thread scratch space.
 
 **Why strict mode at the router.** `FsRouter` is the chokepoint that sees
 every routed path; gating there is cheap and uniform across sync,

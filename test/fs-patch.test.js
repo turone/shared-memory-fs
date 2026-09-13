@@ -26,7 +26,7 @@ describe('fs-patch: reads over sab and memory places', () => {
     });
     k = await kernel(root, {
       pub: { fs: { ext: ['html', 'txt'], zeroCopy: true } },
-      mem: { provider: 'memory', fs: { writable: true } },
+      mem: { provider: 'map', origin: 'virtual', fs: { writable: true } },
     });
     fsPatch.install(k);
     fsPatch.install(k); // idempotent
@@ -280,7 +280,7 @@ describe('fs-patch: strict sandbox', () => {
         uploads: { provider: 'disk', fs: { writable: true } },
         ro: { provider: 'disk', fs: true },
         nd: { provider: 'node-default', fs: true },
-        mem: { provider: 'memory', fs: { writable: true } },
+        mem: { provider: 'map', origin: 'virtual', fs: { writable: true } },
       },
       { strict: true },
     );

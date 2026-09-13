@@ -55,7 +55,12 @@ describe('module-hook: CommonJS', () => {
     });
     k = await kernel(root, {
       lib: { require: true },
-      mem: { provider: 'memory', fs: { writable: true }, require: true },
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true },
+        require: true,
+      },
       disk: { provider: 'disk', require: { compile: false } },
     });
     moduleHook.install(k);

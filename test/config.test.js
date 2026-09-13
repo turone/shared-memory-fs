@@ -117,6 +117,7 @@ describe('VfsConfig: domains', () => {
       writable: false,
       zeroCopy: false,
       compress: null,
+      script: null,
     });
     assert.equal(p.require, null);
     assert.equal(p.import, null);
@@ -209,7 +210,7 @@ describe('VfsConfig: providers', () => {
     fails(
       {
         places: {
-          a: { provider: 'memory', fs: { compress: { encodings: ['gzip'] } } },
+          a: { provider: 'map', fs: { compress: { encodings: ['gzip'] } } },
         },
       },
       /compress/,
@@ -218,7 +219,7 @@ describe('VfsConfig: providers', () => {
       { places: { a: { provider: 'node-default', fs: { writable: true } } } },
       /not applicable/,
     );
-    make({ a: { provider: 'memory', fs: { zeroCopy: true, writable: true } } });
+    make({ a: { provider: 'map', fs: { zeroCopy: true, writable: true } } });
   });
 
   it('caps place maxFileSize by segmentSize for shared providers', () => {
@@ -234,7 +235,7 @@ describe('VfsConfig: providers', () => {
   // Only sab and sea store files in the SAB pool, so a cap anywhere else
   // would be silently ignored at runtime.
   it('rejects maxFileSize on providers that never use it', () => {
-    for (const provider of ['memory', 'disk', 'node-default']) {
+    for (const provider of ['map', 'disk', 'node-default']) {
       fails(
         { places: { a: { provider, fs: true, maxFileSize: '1 kib' } } },
         /maxFileSize applies to providers/,

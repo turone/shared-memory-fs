@@ -45,7 +45,6 @@ describe('VfsKernel: lifecycle', () => {
     assert.throws(() => k.fs('site'), /closed/);
     // The pool is unreachable after close, so its segments are collectable.
     assert.equal(k.cache, null);
-    assert.equal(k.moduleCache, null);
     assert.equal(k.compressionCache, null);
     k.handleAck(1, 'w');
     k.handleWorkerExit('w');
@@ -201,10 +200,10 @@ describe('VfsKernel: providers', () => {
 
   it('memory places are empty, per-kernel and writable', async () => {
     const k1 = await kernel(root, {
-      mem: { provider: 'memory', fs: { writable: true } },
+      mem: { provider: 'map', origin: 'virtual', fs: { writable: true } },
     });
     const k2 = await kernel(root, {
-      mem: { provider: 'memory', fs: { writable: true } },
+      mem: { provider: 'map', origin: 'virtual', fs: { writable: true } },
     });
     k1.fs('mem').writeFile('/x', '1');
     assert.equal(k2.fs('mem').exists('/x'), false);
@@ -226,7 +225,7 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
 
   const places = {
     site: { fs: true, require: true },
-    mem: { provider: 'memory', fs: { writable: true } },
+    mem: { provider: 'map', origin: 'virtual', fs: { writable: true } },
     d: { provider: 'disk', fs: true },
   };
 

@@ -1,6 +1,6 @@
 'use strict';
 
-// multi-tenant — two memory-backed tenant mounts under one appRoot, plus a
+// multi-tenant — two `map + virtual` tenant mounts under one appRoot, plus a
 // global `strict: true` that turns appRoot into a place-only whitelist.
 // Demonstrates:
 //   1. Each tenant has its own writable in-memory namespace.
@@ -27,8 +27,18 @@ const config = new VfsConfig({
     strict: true,
   },
   places: {
-    'tenant-a': { provider: 'memory', fs: { writable: true }, require: true },
-    'tenant-b': { provider: 'memory', fs: { writable: true }, require: true },
+    'tenant-a': {
+      provider: 'map',
+      origin: 'virtual',
+      fs: { writable: true },
+      require: true,
+    },
+    'tenant-b': {
+      provider: 'map',
+      origin: 'virtual',
+      fs: { writable: true },
+      require: true,
+    },
   },
 });
 
