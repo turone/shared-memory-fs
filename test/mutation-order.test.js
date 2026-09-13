@@ -212,7 +212,11 @@ describe('mutation ordering: independent keys', () => {
     // Prove /fast.txt is fully published and its Promise settled while
     // /slow.txt is still gated — not just that both eventually finish.
     await fast;
-    assert.deepEqual(order, ['fast'], "fast published before slow's gate opened");
+    assert.deepEqual(
+      order,
+      ['fast'],
+      "fast published before slow's gate opened",
+    );
     assert.equal(v.readFile('/fast.txt', 'utf8'), 'y');
     assert.equal(v.exists('/slow.txt'), false, 'slow is still unpublished');
 
