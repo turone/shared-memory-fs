@@ -8,6 +8,11 @@ module.exports = {
   places: {
     static: { fs: true },
     modules: { require: true, import: true },
-    scratch: { provider: 'memory', fs: { writable: true }, require: true },
+    scratch: {
+      provider: 'map',
+      origin: 'virtual',
+      fs: { writable: true },
+      require: true,
+    },
   },
 };

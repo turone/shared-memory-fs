@@ -120,17 +120,19 @@ We model mounts as **first-class config**:
 
 ```js
 new VfsConfig({
-  places: {provider: 'memory', fs: { writable: true } },
-    'tenant-b': { provider: 'memory', fs: { writable: true } },
+  places: {
+    'tenant-a': { provider: 'map', origin: 'virtual', fs: { writable: true } },
+    'tenant-b': { provider: 'map', origin: 'virtual', fs: { writable: true } },
     static: { fs: true },
   },
 });
 ```
 
 Place name **is** the directory under `appRoot`, the mount and the
-snapshot/delta key. `PlaceRegistry` + `FsRouter` route any path; fs-patch
-and module-hook execute those decisions and never read config)` — used by fs-patch, require-hook, import-hook,
-and watcher uniformly.
+snapshot/delta key. `PlaceRegistry` + `FsRouter` route any path;
+fs-patch and module-hook execute those decisions and never read config
+directly — one routing chokepoint used by fs-patch, require-hook,
+import-hook, and watcher uniformly.
 
 #### 6. No per-mount extension whitelist
 

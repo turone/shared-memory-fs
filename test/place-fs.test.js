@@ -275,7 +275,12 @@ describe('PlaceFs: memory mutations', () => {
   before(async () => {
     root = tmpDir('placefs-mem');
     k = await kernel(root, {
-      mem: { provider: 'memory', fs: { writable: true }, require: true },
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true },
+        require: true,
+      },
     });
     mem = k.fs('mem');
   });
@@ -375,7 +380,11 @@ describe('PlaceFs: memory mutations', () => {
   it('readFileView on memory returns the internal buffer only with zeroCopy', async () => {
     assert.throws(() => mem.readFileView('/log.txt'), { code: 'ENOTSUP' });
     const k2 = await kernel(root, {
-      mem: { provider: 'memory', fs: { writable: true, zeroCopy: true } },
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true, zeroCopy: true },
+      },
     });
     const m2 = k2.fs('mem');
     m2.writeFile('/v.txt', 'view');

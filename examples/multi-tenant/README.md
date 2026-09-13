@@ -1,6 +1,6 @@
 # multi-tenant
 
-Two memory-backed places (`tenant-a`, `tenant-b`) under one appRoot, plus
+Two `map + virtual` places (`tenant-a`, `tenant-b`) under one appRoot, plus
 global `strict: true`.
 
 ## Run
@@ -24,8 +24,8 @@ Expected output:
 
 ## What this shows
 
-- **Multiple memory places coexist** under one `VfsKernel`. Each gets its own
-  writable Map and its own directory under `appRoot`.
+- **Multiple `map + virtual` places coexist** under one `VfsKernel`. Each gets
+  its own writable, thread-local `Map` and its own directory under `appRoot`.
 - **`strict: true` makes appRoot the boundary:** every path under `appRoot`
   that no place owns gets `EACCES` from the patched fs — at any depth, file or
   directory alike, for reads, listings, copies and `watch` alike. Put the entry

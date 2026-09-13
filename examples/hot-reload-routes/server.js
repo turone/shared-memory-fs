@@ -1,7 +1,7 @@
 'use strict';
 
 // hot-reload-routes — minimal HTTP server whose route handlers live in a
-// memory-backed VFS place. An "AI agent" (here: a setInterval) writes new
+// `map + virtual` VFS place. An "AI agent" (here: a setInterval) writes new
 // route files via `kernel.fs('routes').writeFile`. The module hook makes
 // them immediately requirable; old require-cache entries are evicted via
 // `delete require.cache[absPath]` so each request picks up fresh code.
@@ -30,7 +30,12 @@ const config = new VfsConfig({
     memory: { limit: '256 kib', segmentSize: '64 kib', maxFileSize: '8 kib' },
   },
   places: {
-    routes: { provider: 'memory', fs: { writable: true }, require: true },
+    routes: {
+      provider: 'map',
+      origin: 'virtual',
+      fs: { writable: true },
+      require: true,
+    },
   },
 });
 

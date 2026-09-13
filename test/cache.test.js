@@ -72,11 +72,30 @@ describe('FilesystemCache: load', () => {
 
   it('store predicate keeps selected files on disk', async () => {
     const cache = make();
-    await cache.load('p', files({ '/a': 10, '/b': 10 }), {
-      store: (key) => key !== '/b',
-    });
+    const b = { ...input(10), path: '/tmp/b' };
+    await cache.load(
+      'p',
+      new Map([
+        ['/a', input(10)],
+        ['/b', b],
+      ]),
+      {
+        store: (key) => key !== '/b',
+      },
+    );
     assert.equal(cache.entry('p', '/a').kind, 'shared');
     assert.equal(cache.entry('p', '/b').kind, 'disk');
+  });
+
+  it('in-memory input without a disk copy must fit in SAB', async () => {
+    const cache = make();
+    await assert.rejects(
+      cache.load('p', files({ '/big': 3 * KB })),
+      /"\/big" does not fit in SAB and has no disk copy/,
+    );
+    const meta = Object.freeze({ kind: 'custom' });
+    await cache.load('p', new Map([['/m', { ...input(5), meta }]]));
+    assert.equal(cache.entry('p', '/m').meta, meta);
   });
 
   it('uses the injected reader and rolls the extent back when it throws', async () => {
@@ -291,7 +310,13 @@ describe('FilesystemCache: snapshot / projection', () => {
       { kind: 'disk', path: '/x', stat: { size: 1 } },
       map,
     );
-    assert.deepEqual(disk, { data: null, stat: { size: 1 }, path: '/x' });
+    assert.deepEqual(disk, {
+      data: null,
+      stat: { size: 1 },
+      meta: undefined,
+      scriptOptions: undefined,
+      path: '/x',
+    });
   });
 
   it('stats() summarises segments', async () => {
