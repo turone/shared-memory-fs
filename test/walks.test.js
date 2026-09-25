@@ -155,17 +155,20 @@ describe('native walks under strict routing', () => {
     walk.closeSync();
   });
 
-  it('watch: a managed directory, recursive or not, and appRoot', () => {
+  it('watch: managed territory, recursive or not, and appRoot', () => {
     for (const dir of [at('site'), at('site', 'media'), at('mem'), root]) {
       for (const options of [{}, { recursive: true }]) {
         notSupported(watchOutcome(dir, options), 'watch', dir);
       }
     }
-    // A single file keeps a native watcher; a denied path stays EACCES.
-    for (const file of [at('site', 'index.html'), at('site', 'logo.png')]) {
-      assert.equal(watchOutcome(file, {}), 'ok', file);
-    }
+    // A published file: its raw events are not its publications.
+    const published = at('site', 'index.html');
+    notSupported(watchOutcome(published, {}), 'watch', published);
+    // A file of the disk territory is its own content and keeps a native
+    // watcher; a denied path stays EACCES.
+    assert.equal(watchOutcome(at('site', 'logo.png'), {}), 'ok');
     assert.equal(watchOutcome(at('stray'), {}).code, 'EACCES');
+    assert.equal(watchOutcome(at('site', 'late.html'), {}).code, 'EACCES');
   });
 
   it('watch: recursive above appRoot; unrelated trees stay native', () => {
