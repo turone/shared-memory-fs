@@ -211,6 +211,51 @@ describe('virtual hierarchy', () => {
     });
   });
 
+  it('mkdir and unlink answer as a filesystem does, in every thread', async () => {
+    await withPlaces(async (k, { at }) => {
+      const w = worker(k);
+      try {
+        for (const [label, name, place] of [
+          ['map', 'm', k.fs('m')],
+          ['sab', 'v', k.fs('v')],
+          ['worker', 'v', w.kernel.fs('v')],
+        ]) {
+          const dir = `/${label}`;
+          await place.writeFile(`${dir}/f.txt`, 'f');
+          await place.writeFile(`${dir}/d/a.txt`, 'a');
+          const keys = keysOf(k, name);
+          for (const [key, options, code] of [
+            [`${dir}/f.txt/x`, {}, 'ENOTDIR'],
+            [`${dir}/f.txt/x/y`, { recursive: true }, 'ENOTDIR'],
+            [`${dir}/f.txt`, {}, 'EEXIST'],
+            [`${dir}/f.txt`, { recursive: true }, 'EEXIST'],
+            [`${dir}/d`, {}, 'EEXIST'],
+          ]) {
+            const err = await outcome(() => place.mkdir(key, options));
+            refused(err, code, 'mkdir', at(name, key), undefined);
+          }
+          // A directory that exists, or none yet: mkdir creates no entry.
+          await place.mkdir(`${dir}/d`, { recursive: true });
+          await place.mkdir(`${dir}/new/deep`);
+          assert.equal(place.exists(`${dir}/new`), false, label);
+          const err = await outcome(() => place.unlink(`${dir}/d`));
+          refused(err, 'EISDIR', 'unlink', at(name, `${dir}/d`), undefined);
+          assert.deepEqual(keysOf(k, name), keys, `${label}: nothing changed`);
+        }
+        // A file on its way already refuses a directory under it.
+        const v = k.fs('v');
+        const [written, made] = await Promise.allSettled([
+          v.writeFile('/c', 'c'),
+          v.mkdir('/c/x'),
+        ]);
+        assert.equal(written.status, 'fulfilled');
+        assert.equal(made.reason.code, 'ENOTDIR');
+      } finally {
+        w.kernel.close();
+      }
+    });
+  });
+
   it('v: refusals leak no allocation, lock, barrier or pending key', async () => {
     await withPlaces(async (k) => {
       const v = k.fs('v');

@@ -332,9 +332,26 @@ describe('PlaceFs: memory mutations', () => {
 
   it('rejects invalid keys', () => {
     const write = (key) => () => mem.writeFile(key, 'x');
-    for (const key of ['a\u0000b', '../x', '/a/../b', 'a\\b', 42]) {
+    for (const key of [
+      'a\u0000b',
+      '../x',
+      '/a/../b',
+      'a\\b',
+      42,
+      '/a/',
+      '/a//b',
+      '/a/./b',
+      '.',
+    ]) {
       assert.throws(write(key), TypeError, String(key));
     }
+    // A directory operation takes a trailing slash, as node:fs does.
+    mem.mkdir('/slash/', { recursive: true });
+    mem.writeFile('/slash/x.txt', 'x');
+    mem.rename('/slash/', '/slashed/');
+    assert.equal(mem.readFile('/slashed/x.txt', 'utf8'), 'x');
+    mem.rm('/slashed/', { recursive: true });
+    assert.equal(mem.exists('/slashed'), false);
   });
 
   // The place's own directory is its mount: node:fs errors, never a

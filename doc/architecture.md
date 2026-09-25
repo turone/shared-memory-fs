@@ -335,7 +335,9 @@ subtree move — in `map` and `sab` places alike: a file above the key is
 `ENOTDIR`, a directory at it `EISDIR`. A key whose publication has begun
 counts as a file until it commits or fails (`SabStore`'s keys in flight),
 so two mutations running together cannot create `/f` and `/f/x` both as
-files. Directories stay implicit: `mkdir` creates no entry.** _Why:_
+files. Directories stay implicit: `mkdir` creates no entry, but answers
+from the same hierarchy (`checkMkdir`: `EEXIST`, `ENOTDIR`), and `unlink` of
+a directory is `EISDIR`.** _Why:_
 implicit directories let `/f.txt` and `/f.txt/x` both exist — a structure
 no filesystem has, for which listings, `stat`, subtree operations and a
 later copy to disk have no consistent answer. Per-key ordering lets
