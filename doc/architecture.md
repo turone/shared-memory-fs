@@ -57,7 +57,7 @@ SAB segments ──────────── one physical copy ────
 | `lib/config.js`                 | `VfsConfig`: raw → deep-frozen `{ global, places }`; domains, `prepare` index, `fs.fallback` normalization                                                |
 | `lib/cache.js`                  | `Pool` + `SegmentRegistry` + `FilesystemCache`: SAB allocator; `allocate()` places bytes privately, `put()` / `remove()` publish, `compact()` plans moves |
 | `lib/kernel.js`                 | `VfsKernel`: lifecycle, the publication pipeline, epochs (`#flush`), retirement, watcher FIFO, mutation queue + RPC server, `link()`, worker side         |
-| `lib/pipeline.js`               | What a file is: `Preparers`, `prepareInput()`, `bytecodeFor()`                                                                                            |
+| `lib/pipeline.js`               | What a file is: `Preparers`, `prepareInput()`, `bytecodeFor()`, `subtreeMoves()` (what moves without the pipeline)                                        |
 | `lib/compressor.js`             | `Compressor`: codec work only                                                                                                                             |
 | `lib/pins.js`                   | `Pins`: per-thread direct consumers of shared versions                                                                                                    |
 | `lib/serial-queue.js`           | `SerialQueue`: one task at a time, arrival order                                                                                                          |
@@ -393,8 +393,8 @@ raw bytes and miss virtual entries.
   hard link into or out of a place; `watch` of managed territory; recursive
   walks (`readdir`, `opendir`, `watch`, `rm`, `rmdir`) and `rename` of a
   tree that holds places; a directory renamed across a place's boundary (a
-  place's root included) or in a virtual place; guarded mutations in a
-  virtual place. A hidden source is `EACCES`.
+  place's root included); a virtual subtree rename that is not raw-only;
+  guarded mutations in a virtual place. A hidden source is `EACCES`.
 - _Native passthrough outside managed territory_: unrelated paths outside
   `appRoot`, `disk` / `node-default` places, disk-territory files,
   unmanaged paths without strict; and the guarded APIs (`chmod`, `chown`,
@@ -467,8 +467,8 @@ one disk-origin place; across a place's boundary, as a place's root, or as
 a tree that holds places it is `ENOTSUP` (`FsRouter.rename`: `crossing`,
 `unsupported`).** In a virtual place the store moves an ordinary entry
 atomically and keeps its mtime — the preparer of a new extension runs
-once — and refuses a prepared one and a directory (`ENOTSUP`); across a
-virtual boundary a rename is `EXDEV`. _Why:_ the raw file is a disk-origin
+once — and refuses a prepared one (`ENOTSUP`); a directory moves as a
+raw-only subtree (below); across a virtual boundary a rename is `EXDEV`. _Why:_ the raw file is a disk-origin
 place's source of truth: moving it hands on exactly what its publication
 consumes, and each end republishes it by its own rules — the extension
 change of a prepared file is just a new file of the new extension. What made
@@ -479,12 +479,31 @@ readable before it moved; strict routing decides which paths are served, and
 a preparer is a publication step, not an access boundary. Within one
 disk-origin place a directory keeps its policy, and the watcher republishes
 its tree; across a boundary it would change the policy of all its
-descendants at once, hidden files included, with nothing routed. A virtual
-place's directories are implicit: its store moves entries, one publication
-each, not trees. A prepared virtual entry has no raw input,
-and its bundle may embed the old key (`scriptOptions.filename`, `meta`,
-bytecode). A copy and a delete across places would not be atomic, and a
-virtual place is a filesystem of its own.
+descendants at once, hidden files included, with nothing routed. A prepared
+virtual entry has no raw input, and its bundle may embed the old key
+(`scriptOptions.filename`, `meta`, bytecode). A copy and a delete across
+places would not be atomic, and a virtual place is a filesystem of its own.
+
+**A virtual directory renames as a whole subtree when every source under it
+is raw-only — not prepared, not compiled (`require.compile`,
+`fs.script.compile`), without `scriptOptions` or `meta`
+(`subtreeMoves`).** Every source and the companions it has — compressed
+representations — reappear under the new prefix with their bytes, stat and
+mtime, and the old keys go, in one publication: one `vfs-update` for SAB, a
+swap of the entries for a Map. Nothing is prepared, compiled or compressed
+again. SAB copies each version into a fresh allocation and retires the old
+one through ACK-before-free; the move takes the place barrier. One source
+that cannot move refuses the whole subtree (`ENOTSUP`); an existing
+destination (`ENOTEMPTY`, `ENOTDIR`) and a move into itself (`EINVAL`)
+are refused before anything changes; the place's own directory never moves.
+_Why:_ implicit directories are no reason to refuse a rename: a prefix
+rename changes no content, extension or config, so compressed bytes stay
+valid as they are, and recompressing would only cost time. What depends on
+the key cannot be carried over — a preparer's input is not kept, bytecode
+was compiled under the old filename, metadata may name the old path — and
+running the pipeline again is left for later; moving only the other entries
+would split the tree. Copying keeps each projection one physical version,
+so a pin on an old version keeps protecting its bytes.
 
 **`watch` of managed territory is `ENOTSUP` — a place directory, a
 published file, the strict `appRoot`, a recursive watch of a place or of a
@@ -569,6 +588,9 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
 | Feeding a prepared virtual entry's canonical content back in as raw                                             | stale `meta` / filename / bytecode, a silently different input    |
 | Refusing every copy or rename of served content                                                                 | the raw source of truth could not move; the bypass was hidden raw |
 | A cross-place `rename` as a copy and a delete                                                                   | not atomic; a virtual place is a filesystem of its own (`EXDEV`)  |
+| Refusing every virtual directory rename                                                                         | a prefix rename changes no content; raw-only trees can move       |
+| Re-keying a SAB allocation in place on a subtree move                                                           | a pinned version would get a second projection, its pin unheeded  |
+| Recompressing, re-preparing or moving part of a subtree                                                         | wasted work; no raw input; a tree split between two names         |
 | A native watcher for a published file                                                                           | raw disk events are not publications                              |
 | A full copy per stream, or of its unread rest                                                                   | the cost grows with the file; a pin gives the same stability      |
 | Atomics or a global lock per read; pinning a segment or every companion                                         | cross-thread cost on the hot path; holds unrelated bytes          |
@@ -616,6 +638,7 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
 - A copy or a rename hands on the raw input only — never a prepared result
   or a companion; the destination prepares it once, and a virtual
   destination never gets a disk file.
+- A virtual subtree moves in one publication or not at all.
 - Disk territory never leaves its place (`PlaceFs.#within`) and, under
   strict, never serves or lists a cached extension.
 

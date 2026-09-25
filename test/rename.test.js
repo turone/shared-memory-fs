@@ -20,10 +20,10 @@ const {
 // policy of its own place and extension. A hidden source stays EACCES: no
 // new name makes it readable. In a virtual place a rename moves an ordinary
 // entry, whose canonical bytes are its raw input, and refuses a prepared one
-// (ENOTSUP); across a virtual boundary it is EXDEV. A directory moves only
-// within one disk-origin place: across a place's boundary, as a place's
-// root, or in a virtual place, whose directories are implicit, it is
-// ENOTSUP.
+// (ENOTSUP); across a virtual boundary it is EXDEV. A directory moves within
+// one disk-origin place, never across an indexed place's boundary or as its
+// root (ENOTSUP); in a virtual place a subtree of raw sources moves whole,
+// any other stays whole (ENOTSUP).
 
 const calls = { upper: 0, wrap: 0, mark: 0 };
 const PREPARERS = {
@@ -117,6 +117,9 @@ describe('rename routes its source and its destination', () => {
       'app/ro/r.txt': 'r',
       'app/closed/keep.txt': 'keep',
       'app/closed/raw.png': 'hidden',
+      'app/closed/rawdir/x.png': 'hidden',
+      'app/files/d/f.txt': 'f',
+      'app/nd/d/n.txt': 'n',
       'app/stray/s.txt': 'stray',
       'outside/dir/o.txt': 'o',
     });
@@ -142,6 +145,8 @@ describe('rename routes its source and its destination', () => {
         },
         vs2: { origin: 'virtual', fs: { writable: true } },
         vm: { provider: 'map', origin: 'virtual', fs: { writable: true } },
+        files: { provider: 'disk', fs: { writable: true } },
+        nd: { provider: 'node-default', fs: true },
       },
       { strict: true, watch: true, watchTimeout: 60000 },
       { preparers: PREPARERS },
@@ -302,7 +307,7 @@ describe('rename routes its source and its destination', () => {
     }
   });
 
-  it('a directory moves only within one disk-origin place', async () => {
+  it('a disk directory moves within one disk-origin place, never across one', async () => {
     const unrelated = path.join(base, 'outside', 'dir');
     for (const [from, to] of [
       [at('wd', 'pages'), fresh('pages')],
@@ -314,29 +319,61 @@ describe('rename routes its source and its destination', () => {
       await refusedEverywhere(from, to, 'ENOTSUP');
       assert.ok(onDisk(from), 'the source stays');
     }
-    // A virtual place has implicit directories: its entries move, not trees.
-    await k.fs('vs').writeFile('/tree/t.txt', 't');
-    k.fs('vm').writeFile('/tree/t.txt', 't');
-    for (const [name, forms] of [
-      ['vs', ASYNC],
-      ['vm', RENAMES],
-    ]) {
-      await refusedEverywhere(
-        at(name, 'tree'),
-        at(name, 'moved'),
-        'ENOTSUP',
-        forms,
-      );
-      assert.equal(k.fs(name).readFile('/tree/t.txt', 'utf8'), 't', name);
-      assert.equal(k.fs(name).exists('/moved'), false, name);
-    }
-    // Within its place, or outside any, a directory stays node:fs.
+    // A directory strict routing hides stays hidden.
+    await refusedEverywhere(at('closed', 'rawdir'), fresh('rawdir'), 'EACCES');
+    // Within its place, or outside the indexed ones, a directory is node:fs.
     fs.renameSync(at('wd', 'pages'), at('wd', 'docs'));
     assert.equal(readDisk(at('wd', 'docs', 'p.txt'), 'utf8'), 'page');
     fs.renameSync(at('wd', 'docs'), at('wd', 'pages'));
     fs.renameSync(unrelated, `${unrelated}2`);
     fs.renameSync(`${unrelated}2`, unrelated);
     assert.equal(readDisk(path.join(unrelated, 'o.txt'), 'utf8'), 'o');
+    for (const name of ['files', 'nd']) {
+      const moved = fresh(name);
+      fs.renameSync(at(name, 'd'), moved);
+      fs.renameSync(moved, at(name, 'd'));
+      fs.renameSync(at(name), moved);
+      fs.renameSync(moved, at(name));
+      assert.ok(onDisk(at(name, 'd')), name);
+    }
+  });
+
+  it('a raw-only virtual subtree moves; any other subtree stays whole', async () => {
+    const vs = k.fs('vs');
+    const vm = k.fs('vm');
+    for (const [form, rename] of Object.entries(RENAMES)) {
+      const places = form === 'renameSync' ? [vm] : [vs, vm];
+      for (const place of places) {
+        const name = place === vs ? 'vs' : 'vm';
+        await place.writeFile(`/${form}/a.txt`, 'a');
+        await place.writeFile(`/${form}/sub/b.txt`, 'b');
+        await rename(at(name, form), at(name, `${form}-moved`));
+        assert.equal(place.readFile(`/${form}-moved/sub/b.txt`, 'utf8'), 'b');
+        assert.equal(place.exists(`/${form}`), false, `${name}: ${form}`);
+      }
+    }
+    // One prepared source refuses the whole subtree: nothing moves.
+    await vs.writeFile('/mixed/t.txt', 't');
+    await vs.writeFile('/mixed/p.js', 'p');
+    await refusedEverywhere(
+      at('vs', 'mixed'),
+      at('vs', 'other'),
+      'ENOTSUP',
+      ASYNC,
+    );
+    assert.equal(vs.readFile('/mixed/t.txt', 'utf8'), 't');
+    assert.equal(vs.exists('/other'), false);
+    // The place's own directory never moves; a virtual boundary is EXDEV.
+    await refusedEverywhere(at('vs'), at('vs', 'x'), 'ENOTSUP', ASYNC);
+    await refusedEverywhere(at('vm'), fresh('vm'), 'ENOTSUP');
+    await vm.writeFile('/cross/c.txt', 'c');
+    await refusedEverywhere(
+      at('vm', 'cross'),
+      at('vs', 'cross'),
+      'EXDEV',
+      ASYNC,
+    );
+    assert.equal(vm.readFile('/cross/c.txt', 'utf8'), 'c');
   });
 
   it('every form renames; a callback runs once', async () => {

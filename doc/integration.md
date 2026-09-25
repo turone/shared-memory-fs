@@ -431,7 +431,9 @@ const handler = script.runInThisContext();
 - In a **virtual** place `appendFile`, `rename` and copies of a prepared
   key are `ENOTSUP`: its raw input is not kept. Renaming or copying an
   unprepared entry onto an extension with a preparer publishes it through
-  that preparer, once. In a disk-origin place mutations edit the raw file
+  that preparer, once. A directory renames as a whole subtree only when no
+  source under it is prepared or compiled: sources and compressed
+  representations keep their bytes, stat and mtime, in one publication. In a disk-origin place mutations edit the raw file
   and the watcher re-prepares it; a copy or a rename hands on the raw
   file, never the prepared content.
 - `readFile` gives the prepared content; passing it to `writeFile`

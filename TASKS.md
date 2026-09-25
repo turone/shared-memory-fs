@@ -43,9 +43,12 @@ non-strict routing, and both fallbacks.
 - Recursive `rm` / `rmdir` of a tree that holds places: every descendant
   through its own place's mutation policy.
 - A directory renamed across a place's boundary: every descendant through
-  the routing of both ends. A directory renamed in a virtual place: its
-  entries moved in one publication. (A place's root stays where the config
-  puts it.)
+  the routing of both ends. (A place's root stays where the config puts
+  it.)
+- A virtual subtree rename with prepared or compiled sources (raw-only
+  subtrees move today): the pipeline run again under the new keys —
+  preparers need a raw input to keep, bytecode and `scriptOptions` /
+  `meta` the new path — still in one publication.
 - `rename` of a tree that holds places: likely refused for good — moving
   `appRoot` under a running kernel has no consistent meaning; decide first.
 

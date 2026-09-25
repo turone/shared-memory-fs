@@ -330,8 +330,36 @@ describe('PlaceFs: memory mutations', () => {
 
   it('rejects invalid keys', () => {
     const write = (key) => () => mem.writeFile(key, 'x');
-    for (const key of ['', '/', 'a\u0000b', '../x', '/a/../b', 'a\\b', 42]) {
+    for (const key of ['a\u0000b', '../x', '/a/../b', 'a\\b', 42]) {
       assert.throws(write(key), TypeError, String(key));
+    }
+  });
+
+  // The place's own directory is its mount: node:fs errors, never a
+  // TypeError, and it never moves or goes away.
+  it('the place root is a directory that stays', () => {
+    const place = mem;
+    const root = place.pathOf('/');
+    for (const key of ['', '/']) {
+      const fails = (fn, code, syscall) =>
+        assert.throws(fn, (err) => {
+          assert.equal(err.code, code, `${key}: ${syscall}`);
+          assert.equal(err.syscall, syscall);
+          assert.equal(err.path, root);
+          return true;
+        });
+      fails(() => place.writeFile(key, 'x'), 'EISDIR', 'open');
+      fails(() => place.appendFile(key, 'x'), 'EISDIR', 'open');
+      fails(() => place.unlink(key), 'EISDIR', 'unlink');
+      fails(() => place.mkdir(key), 'EEXIST', 'mkdir');
+      fails(() => place.rm(key, { recursive: true }), 'ENOTSUP', 'rm');
+      fails(() => place.rename(key, '/x'), 'ENOTSUP', 'rename');
+      assert.throws(() => place.rename('/x', key), {
+        code: 'ENOTSUP',
+        syscall: 'rename',
+        dest: root,
+      });
+      place.mkdir(key, { recursive: true });
     }
   });
 
