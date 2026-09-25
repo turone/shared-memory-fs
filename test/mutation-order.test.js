@@ -6,9 +6,8 @@ const { Worker } = require('node:worker_threads');
 const path = require('node:path');
 const { tmpDir, rm, kernel, until } = require('./helpers.js');
 
-// Per-key mutation ordering on sab+virtual places. Ported from the
-// tmp/smoke-order.cjs probe (see /memories/repo/script-domain-handoff.md):
-// every scenario here is a deterministic assertion, not a printed log.
+// Per-key mutation ordering on sab+virtual places: every scenario is a
+// deterministic assertion, not a printed log.
 
 const settle = (p) =>
   p.then(
@@ -125,12 +124,7 @@ describe('mutation ordering: same key', () => {
     const k = await kernel(root, {
       v: { origin: 'virtual', fs: { writable: true } },
     });
-    let updates = 0;
-    const { broadcast } = k;
-    k.broadcast = (msg) => {
-      updates++;
-      return broadcast.call(k, msg);
-    };
+    const first = k.nextUpdateId;
     const WORKER = `
       const { parentPort } = require('node:worker_threads');
       const { attach } = require(${JSON.stringify(path.resolve(__dirname, '../index.js'))});
@@ -175,7 +169,11 @@ describe('mutation ordering: same key', () => {
     assert.equal(r2.ok, true);
     const v = k.fs('v');
     assert.ok(['from-1', 'from-2'].includes(v.readFile('/shared.txt', 'utf8')));
-    assert.equal(updates, 2, 'no coalescing: one update per accepted mutation');
+    assert.equal(
+      k.nextUpdateId - first,
+      2,
+      'no coalescing: one update per accepted mutation',
+    );
     await w1.terminate();
     await w2.terminate();
     k.close();
@@ -372,7 +370,41 @@ describe('mutation lifecycle and cleanup', () => {
     assert.match(error.message, /requires a ready kernel/);
     assert.equal(k.mutations.size, 0, 'no lock record survives close()');
     assert.equal(k.links.size, 0);
-    assert.equal(k.pendingFrees.size, 0);
+    assert.equal(k.acks.size, 0);
+    assert.equal(k.retired.size, 0);
+    rm(root);
+  });
+
+  // Regression: the link port is unref'd, so a worker with nothing else to
+  // do used to exit before its own write settled.
+  it('a pending worker mutation keeps the worker alive until it settles', async () => {
+    const root = tmpDir('vfs-order');
+    const k = await kernel(root, {
+      v: { origin: 'virtual', fs: { writable: true } },
+    });
+    const WORKER = `
+      const { parentPort } = require('node:worker_threads');
+      const { attach } = require(${JSON.stringify(path.resolve(__dirname, '../index.js'))});
+      attach()
+        .fs('v')
+        .writeFile('/alive.txt', 'x')
+        .then(() => parentPort.postMessage('settled'));
+    `;
+    const { vfs, transferList } = k.link();
+    const worker = new Worker(WORKER, {
+      eval: true,
+      workerData: { vfs },
+      transferList,
+    });
+    const messages = [];
+    worker.on('message', (m) => messages.push(m));
+    await new Promise((resolve, reject) => {
+      worker.once('exit', resolve);
+      worker.once('error', reject);
+    });
+    assert.deepEqual(messages, ['settled'], 'settled before the worker exited');
+    assert.equal(k.fs('v').readFile('/alive.txt', 'utf8'), 'x');
+    k.close();
     rm(root);
   });
 
@@ -412,7 +444,8 @@ describe('mutation lifecycle and cleanup', () => {
     assert.equal(k.fs('v').exists('/from-worker.txt'), true);
     assert.equal(k.mutations.size, 0, 'no pending-request lock record left');
     assert.equal(k.links.size, 0, "the exited worker's link is gone");
-    assert.equal(k.pendingFrees.size, 0, 'no ACK bookkeeping left for it');
+    assert.equal(k.acks.size, 0, 'no ACK bookkeeping left for it');
+    assert.equal(k.retired.size, 0, 'nothing retired waits for it');
     assert.equal(k.rechecks.size, 0, 'no leaked recheck timer (active handle)');
     k.close();
     rm(root);

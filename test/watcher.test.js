@@ -5,7 +5,16 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { bytecodeKey, compressedKey } = require('../lib/companion.js');
-const { tmpDir, writeTree, rm, kernel, until, sleep } = require('./helpers.js');
+const {
+  tmpDir,
+  writeTree,
+  rm,
+  kernel,
+  until,
+  sleep,
+  tap,
+  quiet,
+} = require('./helpers.js');
 
 // Watcher tests drive real fs.watch events through the kernel pipeline.
 
@@ -14,6 +23,7 @@ describe('watcher pipeline', () => {
   let k;
   let site;
   let msgs;
+  let w;
   const at = (...p) => path.join(root, 'site', ...p);
   const lastUpdate = () => msgs.at(-1);
   const flushed = async (count) => until(() => msgs.length >= count, 4000);
@@ -23,13 +33,14 @@ describe('watcher pipeline', () => {
       'site/a.js': 'module.exports = 1;',
       'site/page.html': '<p>one</p>',
     });
-    msgs = [];
     k = await kernel(
       root,
       { site: { fs: { compress: { encodings: ['gzip'] } }, require: true } },
       { watch: true, watchTimeout: 60 },
-      { broadcast: (m) => msgs.push(m), getWorkerIds: () => ['w'] },
     );
+    // A linked worker stand-in that ACKs only when told to.
+    w = tap(k, { ack: false });
+    msgs = w.messages;
     site = k.fs('site');
   });
 
@@ -65,13 +76,19 @@ describe('watcher pipeline', () => {
     );
     assert.ok(place().files.has(bytecodeKey('/a.js')));
     assert.deepEqual(site.storedEncodings('/a.js'), ['raw', 'gzip']);
-    const pending = k.pendingFrees.get(msg.updateId);
+    const ack = k.acks.get(msg.updateId);
     assert.ok(
-      pending && pending.entries.includes(oldEntry),
+      ack && ack.retired.some((record) => record.entry === oldEntry),
       'old source tracked until ACK',
     );
-    k.handleAck(msg.updateId, 'w');
-    assert.equal(k.pendingFrees.size, 0);
+    assert.deepEqual(
+      msg.places.site.retired.map(([key]) => key).sort(),
+      keys,
+      'source and both companions retired',
+    );
+    k.handleAck(msg.updateId, w.id);
+    assert.equal(k.acks.size, 0);
+    assert.equal(k.retired.size, 0);
   });
 
   it('new directory subtree: files get bytecode and representations in the same epoch', async () => {
@@ -95,7 +112,7 @@ describe('watcher pipeline', () => {
       entries.length,
       'no duplicate publications',
     );
-    for (const m of updates) k.handleAck(m.updateId, 'w');
+    for (const m of updates) k.handleAck(m.updateId, w.id);
   });
 
   it('syntax error: source published, stale bytecode removed in the same message', async () => {
@@ -110,7 +127,7 @@ describe('watcher pipeline', () => {
     assert.ok(msg.places.site.removals.includes(bytecodeKey('/a.js')));
     assert.ok(!place().files.has(bytecodeKey('/a.js')));
     assert.deepEqual(site.storedEncodings('/a.js'), ['raw', 'gzip']);
-    for (const m of msgs.slice(n)) k.handleAck(m.updateId, 'w');
+    for (const m of msgs.slice(n)) k.handleAck(m.updateId, w.id);
   });
 
   it('deleting a directory removes sources and companions in one message', async () => {
@@ -123,24 +140,26 @@ describe('watcher pipeline', () => {
     assert.ok(removals.includes(compressedKey('/mod/y.html', 'gzip')));
     assert.ok(!place().files.has(bytecodeKey('/mod/deep/x.js')));
     assert.deepEqual(site.readdir('/'), ['a.js', 'page.html']);
-    for (const m of msgs.slice(n)) k.handleAck(m.updateId, 'w');
+    for (const m of msgs.slice(n)) k.handleAck(m.updateId, w.id);
   });
 
   it('files outside scanExt never enter the pipeline', async () => {
     const root2 = writeTree(tmpDir('watch-ext'), { 'site/a.html': '<a/>' });
-    const seen = [];
     const k2 = await kernel(
       root2,
       { site: { fs: { ext: ['html'] } } },
       { watch: true, watchTimeout: 60 },
-      { broadcast: (m) => seen.push(m) },
     );
+    const t = tap(k2);
     fs.writeFileSync(path.join(root2, 'site', 'ignored.bin'), 'xx');
     fs.writeFileSync(path.join(root2, 'site', 'b.html'), '<b/>');
     await until(() => k2.fs('site').exists('/b.html'), 4000);
     await sleep(200);
-    assert.ok(!k2.fs('site').exists('/ignored.bin'));
-    const keys = seen.flatMap((m) => m.places.site.entries.map(([key]) => key));
+    assert.equal(k2.cache.entry('site', '/ignored.bin'), null, 'never cached');
+    assert.equal(k2.fs('site').exists('/ignored.bin'), true, 'disk territory');
+    const keys = t
+      .updates()
+      .flatMap((m) => m.places.site.entries.map(([key]) => key));
     assert.deepEqual(keys, ['/b.html']);
     k2.close();
     rm(root2);
@@ -171,6 +190,128 @@ describe('watcher: stale delete event', () => {
     assert.equal(site.exists('/a.txt'), false);
     k.close();
     rm(root);
+  });
+});
+
+// Epochs run strictly one at a time, in arrival order: a slow older epoch
+// never publishes over a newer one. Epochs are emitted by hand; a long
+// debounce keeps real fs.watch events out. The reader is gated after a
+// consistent read of the old content, so only the order decides the result.
+describe('watcher: epoch ordering', () => {
+  const setup = async (console = quiet) => {
+    const root = writeTree(tmpDir('watch-fifo'), { 'site/a.txt': 'OLD1' });
+    const k = await kernel(
+      root,
+      { site: { fs: true } },
+      { watch: true, watchTimeout: 60000 },
+      { console },
+    );
+    tap(k);
+    const abs = path.join(root, 'site', 'a.txt');
+    const gate = Promise.withResolvers();
+    const entered = Promise.withResolvers();
+    const real = k.cache.reader;
+    const reads = [];
+    // Epoch A reads OLD1 completely, then waits for the gate; `fail` makes
+    // it throw there instead.
+    const gateFirst = (fail) => {
+      k.cache.reader = async (file, view) => {
+        reads.push(file.path);
+        await real(file, view);
+        if (reads.length > 1) return;
+        entered.resolve();
+        await gate.promise;
+        if (fail) throw new Error('source changed during read');
+      };
+    };
+    const change = () => k.watcher.emit('epoch', new Map([[abs, 'change']]));
+    const read = () => k.fs('site').readFile('/a.txt', 'utf8');
+    // Updates published since setup, counted where they are sent.
+    const first = k.nextUpdateId;
+    const published = () => k.nextUpdateId - first;
+    const done = () => {
+      gate.resolve();
+      k.close();
+      rm(root);
+    };
+    const ctx = { k, abs, gate, entered, reads, gateFirst, change, read };
+    return { ...ctx, published, done };
+  };
+
+  it('a later epoch waits for the one before it and publishes last', async () => {
+    const ctx = await setup();
+    const { k, abs, gate, entered, reads } = ctx;
+    try {
+      ctx.gateFirst(false);
+      ctx.change();
+      await entered.promise;
+      fs.writeFileSync(abs, 'NEW2');
+      ctx.change();
+      assert.equal(k.watchQueue.size, 2, 'B is queued behind A');
+      assert.equal(reads.length, 1, 'B has not started');
+      assert.equal(ctx.published(), 0, 'nothing published yet');
+      assert.equal(ctx.read(), 'OLD1');
+      gate.resolve();
+      await k.watchQueue.idle;
+      assert.equal(reads.length, 2);
+      assert.equal(ctx.published(), 2, 'A then B, one update each');
+      assert.equal(ctx.read(), 'NEW2');
+      assert.equal(k.watchQueue.size, 0);
+    } finally {
+      ctx.done();
+    }
+  });
+
+  it('a failing epoch does not hold up the next one', async () => {
+    const warnings = [];
+    const ctx = await setup({ ...quiet, warn: (m) => warnings.push(m) });
+    const { k, abs, gate, entered } = ctx;
+    try {
+      ctx.gateFirst(true);
+      ctx.change();
+      await entered.promise;
+      fs.writeFileSync(abs, 'NEW2');
+      ctx.change();
+      assert.equal(k.watchQueue.size, 2);
+      gate.resolve();
+      await k.watchQueue.idle;
+      assert.equal(ctx.published(), 1, 'only B published');
+      assert.equal(ctx.read(), 'NEW2');
+      assert.ok(warnings.some((w) => /not published/.test(w)));
+      assert.equal(k.watchQueue.size, 0);
+    } finally {
+      ctx.done();
+    }
+  });
+
+  it('close() drops queued epochs and publishes nothing afterwards', async () => {
+    const errors = [];
+    const log = (m) => errors.push(m);
+    const ctx = await setup({ ...quiet, warn: log, error: log });
+    const { k, abs, gate, entered } = ctx;
+    const { cache } = k;
+    const put = cache.put.bind(cache);
+    let commits = 0;
+    cache.put = (...args) => {
+      commits++;
+      return put(...args);
+    };
+    try {
+      ctx.gateFirst(false);
+      ctx.change();
+      await entered.promise;
+      fs.writeFileSync(abs, 'NEW2');
+      ctx.change();
+      const idle = k.watchQueue.idle;
+      k.close();
+      gate.resolve();
+      await idle;
+      assert.equal(commits, 0, 'neither A nor B was committed');
+      assert.equal(k.watchQueue.size, 0);
+      assert.deepEqual(errors, [], 'a closed kernel stays quiet');
+    } finally {
+      ctx.done();
+    }
   });
 });
 

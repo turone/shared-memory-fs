@@ -6,7 +6,15 @@ const zlib = require('node:zlib');
 const fs = require('node:fs');
 const path = require('node:path');
 const { compressedKey } = require('../lib/companion.js');
-const { tmpDir, writeTree, rm, kernel, drain, until } = require('./helpers.js');
+const {
+  tmpDir,
+  writeTree,
+  rm,
+  kernel,
+  drain,
+  until,
+  tap,
+} = require('./helpers.js');
 
 describe('compression: representations in SAB', () => {
   let root;
@@ -57,9 +65,10 @@ describe('compression: representations in SAB', () => {
     const gz = site.readFileCompressed('/index.html', 'gzip');
     assert.equal(zlib.gunzipSync(gz).toString(), text);
     assert.ok(!(gz.buffer instanceof SharedArrayBuffer), 'owned copy');
-    const view = site.readFileCompressedView('/index.html', 'br');
-    assert.ok(view.buffer instanceof SharedArrayBuffer);
-    assert.equal(zlib.brotliDecompressSync(view).toString(), text);
+    const lease = site.readFileCompressedView('/index.html', 'br');
+    assert.ok(lease.view.buffer instanceof SharedArrayBuffer);
+    assert.equal(zlib.brotliDecompressSync(lease.view).toString(), text);
+    lease.release();
     const st = site.statCompressed('/index.html', 'gzip');
     assert.equal(st.size, gz.length);
     assert.equal(st.sourceSize, text.length);
@@ -85,11 +94,19 @@ describe('compression: representations in SAB', () => {
 
   it('streams compressed bytes with ranges', async () => {
     const gz = site.readFileCompressed('/index.html', 'gzip');
-    const all = await drain(
+    // zeroCopy place: borrowed chunks, the lease ends with release().
+    const read = async (stream) => {
+      try {
+        return Buffer.from(await drain(stream));
+      } finally {
+        stream.release();
+      }
+    };
+    const all = await read(
       site.createReadStreamCompressed('/index.html', 'gzip'),
     );
     assert.deepEqual(all, gz);
-    const part = await drain(
+    const part = await read(
       site.createReadStreamCompressed('/index.html', 'gzip', {
         start: 2,
         end: 5,
@@ -111,7 +128,7 @@ describe('compression: representations in SAB', () => {
     assert.equal(
       k.routeRead(path.join(root, 'site', compressedKey('index.html', 'gzip')))
         .kind,
-      'passthrough',
+      'disk',
     );
   });
 
@@ -188,13 +205,12 @@ describe('compression: failures are per representation', () => {
     const root = writeTree(tmpDir('compress-watch'), {
       'site/a.txt': 'aaaa'.repeat(10),
     });
-    const msgs = [];
     const k = await kernel(
       root,
       { site: { fs: { compress: { encodings: ['gzip'] } } } },
       { watch: true, watchTimeout: 60 },
-      { broadcast: (m) => msgs.push(m) },
     );
+    const t = tap(k);
     const site = k.fs('site');
     const before = site.readFileCompressed('/a.txt', 'gzip');
     fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'bbbb'.repeat(20));
@@ -205,7 +221,11 @@ describe('compression: failures are per representation', () => {
     const after = site.readFileCompressed('/a.txt', 'gzip');
     assert.notDeepEqual(after, before);
     assert.equal(zlib.gunzipSync(after).toString(), 'bbbb'.repeat(20));
-    const keys = msgs.at(-1).places.site.entries.map(([key]) => key);
+    await until(() => t.updates().length > 0, 2000);
+    const keys = t
+      .updates()
+      .at(-1)
+      .places.site.entries.map(([key]) => key);
     assert.ok(
       keys.includes('/a.txt') && keys.includes(compressedKey('/a.txt', 'gzip')),
     );

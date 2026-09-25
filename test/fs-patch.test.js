@@ -120,13 +120,17 @@ describe('fs-patch: reads over sab and memory places', () => {
   });
 
   it('readdir: sync, callback, promises, options, ENOTDIR', async () => {
+    // hidden.bin is outside fs.ext: listed as disk territory by the
+    // non-strict default `fs.fallback: 'disk'`.
     assert.deepEqual(fs.readdirSync(at('pub')), [
       'big.txt',
+      'hidden.bin',
       'index.html',
       'sub',
     ]);
     assert.deepEqual(fs.readdirSync(at('pub'), { recursive: true }), [
       'big.txt',
+      'hidden.bin',
       'index.html',
       'sub',
       'sub/a.txt',
@@ -136,6 +140,7 @@ describe('fs-patch: reads over sab and memory places', () => {
       dirents.map((d) => [d.name, d.isDirectory()]),
       [
         ['big.txt', false],
+        ['hidden.bin', false],
         ['index.html', false],
         ['sub', true],
       ],
@@ -153,17 +158,19 @@ describe('fs-patch: reads over sab and memory places', () => {
     assert.throws(() => fs.readFileSync(at('pub', 'sub')), { code: 'EISDIR' });
   });
 
-  it('createReadStream: zero-copy chunks honour place setting; errors are emitted', async () => {
+  it('createReadStream: owned chunks even in a zeroCopy place; errors are emitted', async () => {
     const stream = fs.createReadStream(at('pub', 'sub', 'a.txt'), { start: 1 });
     const data = await drain(stream);
     assert.equal(data.toString(), 'aa');
     const chunks = [];
     for await (const c of fs.createReadStream(at('pub', 'index.html')))
       chunks.push(c);
-    assert.ok(
-      chunks[0].buffer instanceof SharedArrayBuffer,
-      'pub has zeroCopy: true',
-    );
+    // node:fs callers never release a lease: they always get copies.
+    assert.ok(!(chunks[0].buffer instanceof SharedArrayBuffer));
+    const text = [];
+    for await (const s of fs.createReadStream(at('pub', 'index.html'), 'utf8'))
+      text.push(s);
+    assert.equal(text.join(''), '<h1>x</h1>', 'string options are encoding');
     const bad = fs.createReadStream(at('pub', 'sub'));
     await assert.rejects(drain(bad), { code: 'EISDIR' });
     const passthrough = await drain(fs.createReadStream(at('other', 'o.txt')));
@@ -271,6 +278,10 @@ describe('fs-patch: strict sandbox', () => {
       'stray/sub/deep.txt': 'deep',
       'nd/n.txt': 'n',
       'root-level.txt': 'root level file',
+      '..private/secret.txt': 'secret',
+      '..cache/c.txt': 'c',
+      '...data/d.txt': 'd',
+      'pub/..private/p.txt': 'inside pub',
     });
     k = await kernel(
       root,
@@ -491,7 +502,7 @@ describe('fs-patch: strict sandbox', () => {
       });
     });
 
-    it('watch and watchFile cannot probe denied paths', () => {
+    it('watch and watchFile cannot probe denied paths', async () => {
       assert.throws(() => fs.watch(at('stray'), () => {}), { code: 'EACCES' });
       assert.throws(() => fs.watch(at('pub', 'missing.txt'), () => {}), {
         code: 'EACCES',
@@ -499,7 +510,47 @@ describe('fs-patch: strict sandbox', () => {
       assert.throws(() => fs.watchFile(at('stray', 's.txt'), () => {}), {
         code: 'EACCES',
       });
-      assert.throws(() => fs.promises.watch(at('stray')), { code: 'EACCES' });
+      // As in node:fs, fs.promises.watch reports errors when iterated.
+      await assert.rejects(fs.promises.watch(at('stray')).next(), {
+        code: 'EACCES',
+      });
+    });
+
+    // Regression: `..private` is a name, not a parent path. It used to be
+    // taken for a path outside appRoot and passed through to the disk.
+    it('dot-prefixed names under appRoot are unmanaged, not outside', async () => {
+      const secret = at('..private', 'secret.txt');
+      assert.throws(() => fs.readFileSync(secret), { code: 'EACCES' });
+      await assert.rejects(fs.promises.readFile(secret), { code: 'EACCES' });
+      assert.equal(fs.existsSync(secret), false);
+      assert.throws(() => fs.writeFileSync(at('..private', 'w.txt'), 'x'), {
+        code: 'EACCES',
+      });
+      assert.throws(() => fs.readdirSync(at('..private')), { code: 'EACCES' });
+      assert.throws(() => fs.opendirSync(at('..private')), { code: 'EACCES' });
+      const dest = outside();
+      assert.throws(() => fs.copyFileSync(secret, dest), { code: 'EACCES' });
+      assert.equal(fs.existsSync(dest), false);
+      assert.throws(() => fs.readFileSync(at('..cache', 'c.txt')), {
+        code: 'EACCES',
+      });
+      assert.throws(() => fs.readFileSync(at('...data', 'd.txt')), {
+        code: 'EACCES',
+      });
+    });
+
+    it('a dot-prefixed directory inside a place belongs to that place', () => {
+      assert.equal(
+        fs.readFileSync(at('pub', '..private', 'p.txt'), 'utf8'),
+        'inside pub',
+      );
+      assert.deepEqual(fs.readdirSync(at('pub', '..private')), ['p.txt']);
+      assert.throws(
+        () => fs.writeFileSync(at('pub', '..private', 'w.txt'), ''),
+        {
+          code: 'EROFS',
+        },
+      );
     });
 
     it('paths outside appRoot keep ordinary Node semantics', async () => {

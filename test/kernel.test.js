@@ -15,6 +15,7 @@ const {
   quiet,
   until,
   sleep,
+  tap,
 } = require('./helpers.js');
 
 describe('VfsKernel: lifecycle', () => {
@@ -45,7 +46,7 @@ describe('VfsKernel: lifecycle', () => {
     assert.throws(() => k.fs('site'), /closed/);
     // The pool is unreachable after close, so its segments are collectable.
     assert.equal(k.cache, null);
-    assert.equal(k.compressionCache, null);
+    assert.equal(k.compressor, null);
     k.handleAck(1, 'w');
     k.handleWorkerExit('w');
   });
@@ -257,7 +258,7 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     const w = VfsKernel.fromSnapshot(k.snapshot(), config(places), {
       appRoot: root,
     });
-    const entry = await k.cache.allocate('site', '/new.txt', {
+    const entry = await k.cache.allocate({
       data: Buffer.from('new'),
       stat: { size: 3, mtimeMs: 1 },
     });
@@ -272,43 +273,49 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     });
     assert.equal(w.fs('site').readFile('/new.txt', 'utf8'), 'new');
     assert.equal(w.fs('site').exists('/a.txt'), false);
-    w.handleDelta({ name: 'other' });
+    assert.deepEqual(w.handleDelta({ name: 'other' }), []);
     k.close();
     w.close();
   });
 
   it('frees only after every worker ACKed or exited; repeated ACKs are harmless', async () => {
-    const workers = new Set(['w1', 'w2']);
-    const k = await kernel(root, places, {}, { getWorkerIds: () => workers });
+    const k = await kernel(root, {
+      v: { origin: 'virtual', fs: { writable: true } },
+    });
+    const w1 = tap(k, { ack: false });
+    const w2 = tap(k, { ack: false });
     let freed = 0;
     const originalFree = k.cache.free.bind(k.cache);
     k.cache.free = (entry) => {
       freed++;
       originalFree(entry);
     };
-    const old = k.cache.entry('site', '/a.txt');
-    // Emulate what an epoch does: track old bytes against an update id.
-    k.pendingFrees.set(7, { workerIds: new Set(workers), entries: [old] });
-    k.handleAck(7, 'w1');
+    const v = k.fs('v');
+    await v.writeFile('/a.txt', 'one');
+    await v.writeFile('/a.txt', 'two');
+    const updateId = k.nextUpdateId;
+    assert.deepEqual([...k.acks.get(updateId).pending], [w1.id, w2.id]);
+    assert.equal(k.retired.size, 1);
+    k.handleAck(updateId, w1.id);
     assert.equal(freed, 0);
-    k.handleAck(7, 'w1');
+    k.handleAck(updateId, w1.id);
     assert.equal(freed, 0);
-    k.handleWorkerExit('w2');
+    k.handleWorkerExit(w2.id);
     assert.equal(freed, 1);
-    k.handleAck(7, 'w2');
-    k.handleAck(99, 'w1');
+    k.handleAck(updateId, w2.id);
+    k.handleAck(99, w1.id);
     assert.equal(freed, 1, 'nothing is freed twice');
-    assert.equal(k.pendingFrees.size, 0);
+    assert.equal(k.acks.size, 0);
+    assert.equal(k.retired.size, 0);
     k.close();
   });
 
-  it('handleWorkerExit during compaction frees relocated bytes', async () => {
+  it('worker exit during compaction frees relocated bytes', async () => {
     const KB = 1024;
-    const workers = new Set(['w1']);
     const empty = writeTree(tmpDir('kernel-compact'), {});
     const k = await kernel(
       empty,
-      { site: { fs: true } },
+      { v: { origin: 'virtual', fs: { writable: true } } },
       {
         memory: {
           limit: '16 kib',
@@ -317,29 +324,28 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
         },
         compaction: { threshold: 0.5 },
       },
-      { getWorkerIds: () => workers },
     );
-    const input = (n, fill) => ({
-      data: Buffer.alloc(n, fill),
-      stat: { size: n, mtimeMs: 1 },
-    });
-    const a = await k.cache.allocate('site', '/a', input(2 * KB, 'a'));
-    const b = await k.cache.allocate('site', '/b', input(2 * KB, 'b'));
-    const c = await k.cache.allocate('site', '/c', input(200, 'c'));
-    assert.equal(b.segmentId, 1);
-    assert.equal(c.segmentId, 2);
-    k.cache.remove('site', '/a');
-    k.pendingFrees.set(11, {
-      workerIds: new Set(workers),
-      entries: [a],
-    });
-    k.handleWorkerExit('w1');
-    assert.equal(k.cache.entry('site', '/c').segmentId, 1);
+    const v = k.fs('v');
+    await v.writeFile('/a', Buffer.alloc(2 * KB, 'a'));
+    await v.writeFile('/b', Buffer.alloc(2 * KB, 'b'));
+    await v.writeFile('/c', Buffer.alloc(200, 'c'));
+    assert.equal(k.cache.entry('v', '/b').segmentId, 1);
+    assert.equal(k.cache.entry('v', '/c').segmentId, 2);
+    const w = tap(k, { ack: false });
+    await v.unlink('/a');
+    assert.equal(k.retired.size, 1, '/a waits for the ACK');
+    const port = k.links.get(w.id);
+    const closed = new Promise((resolve) => port.once('close', resolve));
+    w.port.close();
+    await closed;
+    assert.equal(k.cache.entry('v', '/c').segmentId, 1, '/c was relocated');
+    assert.equal(v.readFile('/c', 'utf8'), 'c'.repeat(200));
     assert.equal(
-      k.pendingFrees.size,
+      k.acks.size,
       0,
-      'exiting worker is not waited on for the compaction ACK',
+      'the exited worker is not waited on for the compaction ACK',
     );
+    assert.equal(k.retired.size, 0);
     k.close();
     rm(empty);
   });
@@ -382,11 +388,11 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     // Change the file: the delta must reach the worker and be ACKed.
     require('node:fs').writeFileSync(path.join(root, 'site', 'a.txt'), 'AAAA');
     await until(() => k.fs('site').readFile('/a.txt', 'utf8') === 'AAAA');
-    await until(() => k.pendingFrees.size === 0, 3000);
-    assert.equal(k.pendingFrees.size, 0, 'worker ACKed the update');
+    await until(() => k.acks.size === 0, 3000);
+    assert.equal(k.acks.size, 0, 'worker ACKed the update');
     assert.deepEqual(
       acks.map((m) => m.name),
-      ['ack-update'],
+      ['vfs-ack'],
       'exactly one ACK, only for the delta',
     );
     worker.postMessage('read');

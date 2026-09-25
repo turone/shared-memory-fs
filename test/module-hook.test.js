@@ -251,6 +251,18 @@ describe('module-hook: strict', () => {
     assert.throws(() => require(path.join(root, 'stray', 'x.js')), {
       code: 'MODULE_NOT_FOUND',
     });
+    // `..private` is a name under appRoot, not a parent path: unmanaged.
+    writeTree(root, {
+      '..private/leak.js': 'module.exports = "leak";',
+      '..private/leak.mjs': 'export default "leak";',
+    });
+    assert.throws(() => require(path.join(root, '..private', 'leak.js')), {
+      code: 'MODULE_NOT_FOUND',
+    });
+    await assert.rejects(
+      import(pathToFileURL(path.join(root, '..private', 'leak.mjs')).href),
+      { code: 'ERR_MODULE_NOT_FOUND' },
+    );
     moduleHook.uninstall();
     // Without strict the same late file loads from disk through Node.
     const k2 = await kernel(root, { lib: { require: true } });
@@ -261,6 +273,35 @@ describe('module-hook: strict', () => {
     k.close();
     k2.close();
     rm(root);
+  });
+});
+
+describe('module-hook: dot-prefixed directories inside a place', () => {
+  it('belong to the place for require and import', async () => {
+    const root = writeTree(tmpDir('modhook-dots'), {
+      'lib/..private/cjs.js': 'module.exports = "inside";',
+      'lib/..private/esm.mjs': 'export default "inside-esm";',
+    });
+    const k = await kernel(
+      root,
+      { lib: { require: { ext: ['js'] }, import: { ext: ['mjs'] } } },
+      { strict: true },
+    );
+    moduleHook.install(k);
+    try {
+      assert.equal(
+        require(path.join(root, 'lib', '..private', 'cjs.js')),
+        'inside',
+      );
+      const mod = await import(
+        pathToFileURL(path.join(root, 'lib', '..private', 'esm.mjs')).href
+      );
+      assert.equal(mod.default, 'inside-esm');
+    } finally {
+      moduleHook.uninstall();
+      k.close();
+      rm(root);
+    }
   });
 });
 

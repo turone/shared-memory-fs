@@ -111,7 +111,10 @@ describe('PlaceFs: reads', () => {
       '<h1>hi</h1>',
     );
     assert.equal(pub.readFile('/nope'), null);
-    assert.equal(pub.readFile('/skip.bin'), null, 'outside fs.ext');
+    // Outside fs.ext: disk territory, served from disk by the non-strict
+    // default `fs.fallback: 'disk'`, never cached.
+    assert.deepEqual(pub.readFile('/skip.bin'), Buffer.from([0, 1]));
+    assert.equal(k.cache.entry('pub', '/skip.bin'), null);
     assert.equal(pub.readFile('/empty.txt').length, 0);
   });
 
@@ -124,9 +127,14 @@ describe('PlaceFs: reads', () => {
     );
   });
 
-  it('readFileView is a borrowed SAB view when zeroCopy is on, ENOTSUP otherwise', () => {
-    const v = pub.readFileView('/index.html');
-    assert.ok(v.buffer instanceof SharedArrayBuffer);
+  it('readFileView is a lease over a SAB view when zeroCopy is on, ENOTSUP otherwise', () => {
+    const lease = pub.readFileView('/index.html');
+    assert.ok(lease.view.buffer instanceof SharedArrayBuffer);
+    assert.equal(lease.view.toString(), '<h1>hi</h1>');
+    assert.equal(typeof lease[Symbol.dispose], 'function');
+    assert.ok(Object.isFrozen(lease));
+    lease.release();
+    lease.release();
     assert.equal(pub.readFileView('/nope'), null);
     const plain = k.fs('plain');
     assert.throws(() => plain.readFileView('/x'), { code: 'ENOTSUP' });
@@ -140,7 +148,8 @@ describe('PlaceFs: reads', () => {
         pub.exists('/') &&
         pub.exists(''),
     );
-    assert.ok(!pub.exists('/nope') && !pub.exists('/skip.bin'));
+    assert.ok(!pub.exists('/nope'));
+    assert.ok(pub.exists('/skip.bin'), 'disk territory');
     const s = pub.stat('/app.js');
     assert.ok(s instanceof VfsStats);
     assert.equal(s.size, 200);
@@ -158,6 +167,7 @@ describe('PlaceFs: reads', () => {
       'empty.txt',
       'img',
       'index.html',
+      'skip.bin',
     ]);
     assert.deepEqual(pub.readdir(''), pub.readdir('/'));
     assert.deepEqual(pub.readdir('/img'), ['deep', 'logo.svg']);
@@ -170,6 +180,7 @@ describe('PlaceFs: reads', () => {
       'img/deep/x.css',
       'img/logo.svg',
       'index.html',
+      'skip.bin',
     ]);
     const dirents = pub.readdir('/img', { withFileTypes: true });
     assert.deepEqual(
@@ -192,31 +203,40 @@ describe('PlaceFs: reads', () => {
   });
 
   it('createReadStream: ranges, chunking, zero-copy chunks', async () => {
-    const all = await drain(pub.createReadStream('/app.js'));
+    // Borrowed chunks: the lease ends with release(), never with the stream.
+    const read = async (stream) => {
+      try {
+        return Buffer.from(await drain(stream));
+      } finally {
+        stream.release();
+      }
+    };
+    const all = await read(pub.createReadStream('/app.js'));
     assert.equal(all.length, 200);
-    const part = await drain(
+    const part = await read(
       pub.createReadStream('/app.js', { start: 10, end: 19 }),
     );
     assert.equal(part.length, 10);
-    const tail = await drain(pub.createReadStream('/app.js', { start: 190 }));
+    const tail = await read(pub.createReadStream('/app.js', { start: 190 }));
     assert.equal(tail.length, 10);
     const chunks = [];
-    for await (const c of pub.createReadStream('/app.js', {
-      highWaterMark: 64,
-    }))
-      chunks.push(c);
+    const stream = pub.createReadStream('/app.js', { highWaterMark: 64 });
+    for await (const c of stream) chunks.push(c);
     assert.deepEqual(
       chunks.map((c) => c.length),
       [64, 64, 64, 8],
     );
     assert.ok(chunks[0].buffer instanceof SharedArrayBuffer, 'zeroCopy chunk');
-    const text = await drain(
-      pub
-        .createReadStream('/index.html', { encoding: 'utf8' })
-        .map((s) => Buffer.from(s)),
-    );
-    assert.equal(text.toString(), '<h1>hi</h1>');
-    assert.equal((await drain(pub.createReadStream('/empty.txt'))).length, 0);
+    stream.release();
+    const text = [];
+    for await (const c of pub.createReadStream('/index.html', 'utf8'))
+      text.push(c);
+    assert.equal(text.join(''), '<h1>hi</h1>');
+    const owned = [];
+    for await (const c of pub.createReadStream('/app.js', { zeroCopy: false }))
+      owned.push(c);
+    assert.ok(!(owned[0].buffer instanceof SharedArrayBuffer), 'per call');
+    assert.equal((await read(pub.createReadStream('/empty.txt'))).length, 0);
     assert.equal(pub.createReadStream('/nope'), null);
   });
 
@@ -388,9 +408,10 @@ describe('PlaceFs: memory mutations', () => {
     });
     const m2 = k2.fs('mem');
     m2.writeFile('/v.txt', 'view');
-    const view = m2.readFileView('/v.txt');
-    view[0] = 0x56;
+    const lease = m2.readFileView('/v.txt');
+    lease.view[0] = 0x56;
     assert.equal(m2.readFile('/v.txt', 'utf8'), 'View');
+    lease.release();
     k2.close();
   });
 });

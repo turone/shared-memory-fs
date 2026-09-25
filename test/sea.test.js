@@ -48,9 +48,9 @@ describe('SEA provider', () => {
       'sub/style.css',
     ]);
     assert.equal(bundle.readFile('/index.html', 'utf8'), '<h1>sea</h1>');
-    assert.ok(
-      bundle.readFileView('/index.html').buffer instanceof SharedArrayBuffer,
-    );
+    const lease = bundle.readFileView('/index.html');
+    assert.ok(lease.view.buffer instanceof SharedArrayBuffer);
+    lease.release();
     assert.ok(
       k.bytecode(path.join(root, 'bundle', 'app.js')),
       'bytecode compiled for sea sources',

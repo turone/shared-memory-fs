@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
 const path = require('node:path');
+const zlib = require('node:zlib');
 
 const REPO = path.resolve(__dirname, '..');
 const IS_WINDOWS = process.platform === 'win32';
@@ -14,6 +15,8 @@ const HTTP_MS = 8000;
 const HOT_RELOAD_MS = 15000;
 const MULTI_TENANT_MS = 10000;
 const SEA_STATIC_MS = 10000;
+const WORKER_STATIC_MS = 15000;
+const PREPARED_SCRIPTS_MS = 10000;
 
 const httpRequest = (url) =>
   new Promise((resolve, reject) => {
@@ -31,6 +34,24 @@ const httpRequest = (url) =>
       });
     });
 
+    req.setTimeout(1000, () => {
+      req.destroy(new Error(`timeout waiting for ${url}`));
+    });
+    req.on('error', reject);
+  });
+
+// Raw bytes and headers of one GET.
+const httpGet = (url, headers = {}) =>
+  new Promise((resolve, reject) => {
+    const req = http.get(url, { agent: false, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        req.destroy();
+        const body = Buffer.concat(chunks);
+        resolve({ statusCode: res.statusCode, headers: res.headers, body });
+      });
+    });
     req.setTimeout(1000, () => {
       req.destroy(new Error(`timeout waiting for ${url}`));
     });
@@ -195,6 +216,25 @@ const startExample = async (script, env = {}) => {
   }
 };
 
+// Every "worker N listening on http://127.0.0.1:PORT" line, as ports by N.
+const waitForWorkers = async (child, count, timeoutMs = READY_MS) => {
+  const started = Date.now();
+  const output = attachOutput(child);
+  while (Date.now() - started < timeoutMs) {
+    if (hasExited(child)) {
+      throw new Error(`child exited early\n${output.text()}`);
+    }
+    const ports = [];
+    const re = /worker (\d+) listening on http:\/\/127\.0\.0\.1:(\d+)/g;
+    for (const [, id, port] of output.text().matchAll(re)) {
+      ports[Number(id) - 1] = Number(port);
+    }
+    if (ports.filter(Boolean).length === count) return ports;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`timeout waiting for workers\n${output.text()}`);
+};
+
 describe('examples smoke', () => {
   it(
     'hot-reload-routes server swaps handlers at runtime',
@@ -305,6 +345,118 @@ describe('examples smoke', () => {
         assert.equal(
           String(css.headers['content-length']),
           String(css.body.length),
+        );
+      } finally {
+        await stopChild(child);
+      }
+    },
+  );
+
+  it(
+    'worker-static serves one shared copy from several workers',
+    { timeout: WORKER_STATIC_MS },
+    async () => {
+      const child = spawn(
+        process.execPath,
+        ['examples/worker-static/server.js'],
+        {
+          cwd: REPO,
+          env: { ...process.env, PORT: '0', WORKERS: '2' },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        },
+      );
+      try {
+        const [p1, p2] = await waitForWorkers(child, 2);
+        const at = (port, key) => `http://127.0.0.1:${port}${key}`;
+        const one = await httpGet(at(p1, '/'));
+        const two = await httpGet(at(p2, '/'));
+        assert.equal(one.statusCode, 200);
+        assert.deepEqual(one.body, two.body, 'both workers serve one copy');
+        assert.equal(one.headers['x-worker'], '1');
+        assert.equal(two.headers['x-worker'], '2');
+        assert.match(one.body.toString(), /shared memory/);
+
+        const raw = await httpGet(at(p1, '/app.js'));
+        const br = await httpGet(at(p2, '/app.js'), {
+          'accept-encoding': 'br',
+        });
+        assert.equal(br.headers['content-encoding'], 'br');
+        assert.deepEqual(zlib.brotliDecompressSync(br.body), raw.body);
+
+        const part = await httpGet(at(p1, '/app.js'), {
+          range: 'bytes=0-15',
+        });
+        assert.equal(part.statusCode, 206);
+        assert.equal(
+          part.headers['content-range'],
+          `bytes 0-15/${raw.body.length}`,
+        );
+        assert.deepEqual(part.body, raw.body.subarray(0, 16));
+
+        const first = JSON.parse(
+          (await httpGet(at(p2, '/live/stats.json'))).body,
+        );
+        const later = await waitForUrl(
+          at(p1, '/live/stats.json'),
+          (res) =>
+            res.statusCode === 200 && JSON.parse(res.body).tick > first.tick,
+        );
+        assert.equal(later.statusCode, 200);
+        assert.equal((await httpGet(at(p1, '/nope.html'))).statusCode, 404);
+      } finally {
+        await stopChild(child);
+      }
+    },
+  );
+
+  it(
+    'prepared-scripts runs prepared handlers with shared cached data',
+    { timeout: PREPARED_SCRIPTS_MS },
+    async () => {
+      const child = spawn(
+        process.execPath,
+        ['examples/prepared-scripts/run.js'],
+        {
+          cwd: REPO,
+          env: { ...process.env },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        },
+      );
+      const output = attachOutput(child);
+      try {
+        const exited = await waitForExit(child, PREPARED_SCRIPTS_MS - 1000);
+        const stdout = output.stdout();
+        assert.equal(exited, true, `prepared-scripts timed out\n${stdout}`);
+        assert.equal(child.exitCode, 0, output.stderr() || stdout);
+        assert.equal(output.stderr(), '');
+        const lines = stdout.split(/\r?\n/);
+        assert.ok(
+          lines.includes(
+            'handlers/hello.handler (hello) -> hello world (cached data accepted)',
+          ),
+          stdout,
+        );
+        assert.ok(
+          lines.includes(
+            'handlers/bye.handler (bye) -> goodbye, world (cached data accepted)',
+          ),
+          stdout,
+        );
+        assert.ok(
+          lines.includes(
+            'rules/greet.handler (greet) -> hi world (cached data accepted)',
+          ),
+          stdout,
+        );
+        assert.ok(
+          lines.some((line) =>
+            line.startsWith(
+              'main thread sees rules/greet.handler as (function (name) {',
+            ),
+          ),
+          stdout,
         );
       } finally {
         await stopChild(child);

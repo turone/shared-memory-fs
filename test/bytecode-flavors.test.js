@@ -9,8 +9,8 @@ const { tmpDir, rm, kernel } = require('./helpers.js');
 
 // Bytecode flavors: fs.script.compile (bare vm.Script, PlaceFs.script()) and
 // require.compile (Module.wrap flavor, consumed by the _compile hook) are
-// two independent companions of the same canonical source. See
-// /memories/repo/script-domain-handoff.md §"Bytecode flavors".
+// two independent companions of the same canonical source
+// (doc/architecture.md, "Preparation").
 
 const wrap = {
   id: (raw, file) => ({
@@ -34,7 +34,12 @@ describe('bytecode flavors: coexistence', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
         },
       },
       {},
@@ -74,7 +79,12 @@ describe('bytecode flavors: coexistence', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
           require: { compile: true },
         },
       },
@@ -159,7 +169,12 @@ describe('bytecode flavors: failure and rollback', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
           require: { compile: true },
         },
       },
@@ -191,7 +206,12 @@ describe('bytecode flavors: failure and rollback', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
         },
       },
       {},

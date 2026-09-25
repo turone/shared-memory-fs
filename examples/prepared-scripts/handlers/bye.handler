@@ -1,0 +1,2 @@
+const polite = name.length > 3;
+return polite ? `goodbye, ${name}` : `bye ${name}`;

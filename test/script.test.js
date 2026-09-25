@@ -8,11 +8,11 @@ const vm = require('node:vm');
 const { Worker } = require('node:worker_threads');
 const { createBytecode } = require('../lib/pipeline.js');
 const { bytecodeKey } = require('../lib/companion.js');
-const { tmpDir, writeTree, rm, kernel, until } = require('./helpers.js');
+const { tmpDir, writeTree, rm, kernel, until, tap } = require('./helpers.js');
 
-// Facts about V8 cached data the script domain relies on. Documented in
-// VFS.instructions.md ("Script Domain And Preparers"); if any of these
-// ever fails on a new Node line, the design note must be revisited.
+// Facts about V8 cached data fs.script relies on (doc/architecture.md,
+// "Publication" and "Preparation"); if any of these ever fails on a new
+// Node line, those decisions must be revisited.
 
 const SOURCE = [
   '// leading comment keeps positions non-trivial',
@@ -127,7 +127,7 @@ describe('script domain: live reload in a linked worker', () => {
   let root;
   let k;
   let worker;
-  let updates;
+  let observer;
   const at = (...p) => path.join(root, 'api', ...p);
 
   const ask = (key) =>
@@ -139,10 +139,9 @@ describe('script domain: live reload in a linked worker', () => {
 
   before(async () => {
     root = writeTree(tmpDir('script-live'), { 'api/h.js': V1 });
-    updates = [];
     k = await kernel(
       root,
-      { api: { fs: { script: { prepare: 'wrap' } } } },
+      { api: { fs: { ext: ['js', 'cjs'], prepare: 'wrap', script: true } } },
       { watch: true, watchTimeout: 60 },
       {
         preparers: {
@@ -153,11 +152,7 @@ describe('script domain: live reload in a linked worker', () => {
         },
       },
     );
-    const { broadcast } = k;
-    k.broadcast = (msg) => {
-      updates.push(msg);
-      return broadcast.call(k, msg);
-    };
+    observer = tap(k);
     const { vfs, transferList } = k.link();
     worker = new Worker(WORKER, {
       eval: true,
@@ -200,9 +195,9 @@ describe('script domain: live reload in a linked worker', () => {
       4000,
     );
     // The worker has applied the delta once its ACK released the old bytes.
-    await until(() => k.pendingFrees.size === 0, 4000);
+    await until(() => k.acks.size === 0 && k.retired.size === 0, 4000);
 
-    const msg = updates.at(-1);
+    const msg = observer.updates().at(-1);
     const keys = msg.places.api.entries.map(([key]) => key).sort();
     assert.deepEqual(keys, ['/h.js', bytecodeKey('/h.js', 'script')].sort());
 
