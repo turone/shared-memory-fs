@@ -465,6 +465,42 @@ describe('single-file copies hand the raw input to the destination', () => {
     );
   });
 
+  it('a copy to disk fails as the copy; cp creates the parent, as node:fs', async () => {
+    await k.fs('vs').writeFile('/p.txt', 'p');
+    const from = at('vs', 'p.txt');
+    const native = external('p');
+    // copyFile creates no directory: ENOENT, as the copy.
+    for (const src of [native, from]) {
+      const to = path.join(fresh('no'), 'x.txt');
+      refusal(
+        await outcome(() => fs.copyFileSync(src, to)),
+        'ENOENT',
+        'copyfile',
+        src,
+        to,
+      );
+    }
+    // cp creates it, in every form.
+    for (const src of [native, from]) {
+      for (const [form, copy] of Object.entries(COPIES)) {
+        if (!form.includes('cp')) continue;
+        const to = path.join(fresh('new'), 'deep', 'x.txt');
+        assert.equal(await outcome(() => copy(src, to)), 'ok', form);
+        assert.equal(readDisk(to, 'utf8'), 'p', form);
+      }
+    }
+    // A directory in the way: EISDIR, as the copy.
+    const dir = fresh('dir');
+    fs.mkdirSync(dir);
+    refusal(
+      await outcome(() => fs.promises.copyFile(from, dir)),
+      'EISDIR',
+      'copyfile',
+      from,
+      dir,
+    );
+  });
+
   it('compression: a companion is never copied as content', async () => {
     // A disk-origin source: the raw disk file, not its gzip companion.
     assert.ok(k.fs('site').storedEncodings('/index.html').includes('gzip'));
