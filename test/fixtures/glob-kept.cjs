@@ -1,9 +1,9 @@
 'use strict';
 
 // Run by test/uninstall.test.js in a plain node process. Unlike a
-// `node --test` child, nothing has used glob yet, so its first use happens
-// while the patch is installed and glob walks with the patched functions
-// from then on — as it would in an application. Prints one JSON line.
+// `node --test` child, nothing has loaded glob yet, so it is loaded while
+// the patch is installed and walks with the patched functions from then on
+// — as it would in an application. Prints one JSON line.
 
 const fs = require('node:fs');
 const path = require('node:path');

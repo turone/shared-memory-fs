@@ -8,6 +8,9 @@ const path = require('node:path');
 const fsPatch = require('../lib/adapters/fs-patch.js');
 const { tmpDir, writeTree, rm, kernel, drain } = require('./helpers.js');
 
+// The disk as it is, behind the patch: captured before any install.
+const { existsSync: onDisk } = fs;
+
 // fs-patch executes router decisions; these tests exercise node:fs itself
 // while the patch is installed. Suites install/uninstall around themselves.
 
@@ -262,7 +265,7 @@ describe('fs-patch: reads over sab and memory places', () => {
   });
 });
 
-describe('fs-patch: strict sandbox', () => {
+describe('fs-patch: strict routing', () => {
   let root;
   let k;
   const at = (...p) => path.join(root, ...p);
@@ -330,10 +333,11 @@ describe('fs-patch: strict sandbox', () => {
     assert.equal(fs.readFileSync(at('pub', 'big.txt')).length, 70 * 1024);
   });
 
-  // Regression: these APIs are not implemented by the patch, so before the
-  // guard they reached libuv directly and read, listed or modified denied
-  // paths behind the sandbox's back.
-  it('unimplemented path APIs cannot bypass the sandbox', async () => {
+  // Regression: before the guards these APIs reached libuv directly and
+  // read, listed or modified denied paths behind the routing's back. Each now
+  // refuses a denied path — opendir is implemented, the others are guarded
+  // or refuse managed sources.
+  it('path APIs the places do not serve cannot bypass strict routing', async () => {
     const secret = at('lib', 'util.js');
     const outside = path.join(os.tmpdir(), 'vfs-leak-probe.txt');
     assert.throws(() => fs.copyFileSync(secret, outside), { code: 'EACCES' });
@@ -413,7 +417,7 @@ describe('fs-patch: strict sandbox', () => {
     assert.equal(fs.existsSync(at('stray', 's.txt')), false);
   });
 
-  // appRoot is the sandbox boundary: an unmanaged entry under it is denied at
+  // appRoot is the routing boundary: an unmanaged entry under it is denied at
   // every depth, whether it is a file or a directory. Previously only depth
   // >= 2 was routed, so an unmanaged first-level directory stayed listable and
   // `cp -r` copied its whole subtree out.
@@ -477,7 +481,7 @@ describe('fs-patch: strict sandbox', () => {
       assert.throws(() => fs.rmSync(at('stray'), { recursive: true }), {
         code: 'EACCES',
       });
-      assert.ok(fs.existsSync(path.join(root, 'stray', 's.txt')) || true);
+      assert.ok(onDisk(path.join(root, 'stray', 's.txt')), 'nothing removed');
     });
 
     it('unmanaged root-level file', () => {

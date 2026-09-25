@@ -262,7 +262,7 @@ describe('watcher: epoch ordering', () => {
     }
   });
 
-  it('a failing epoch does not hold up the next one', async () => {
+  it('a file that fails to publish does not hold up the next epoch', async () => {
     const warnings = [];
     const ctx = await setup({ ...quiet, warn: (m) => warnings.push(m) });
     const { k, abs, gate, entered } = ctx;

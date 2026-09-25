@@ -80,7 +80,11 @@ describe('prepare config: forms', () => {
 
   it('an unrestricted fs takes the object form only', () => {
     rejects({ fs: { prepare: 'content' } }, /needs a finite ext list/);
-    rejects({ fs: { ext: undefined, prepare: 'content' } }, /finite ext/);
+    // `null` is not a way to say "every file": leave `ext` out.
+    rejects(
+      { fs: { ext: null, prepare: 'content' } },
+      /fs\.ext must be a non-empty array of extensions/,
+    );
     const p = placeOf({ fs: { prepare: { code: ['js'], styles: ['css'] } } });
     assert.deepEqual(p.prepare, { js: 'code', css: 'styles' });
     assert.equal(p.fs.ext, null, 'still every file');
@@ -233,6 +237,17 @@ describe('prepare config: errors', () => {
       () => new VfsKernel(cfg, { preparers: { x: 'not a function' } }),
       /preparers\.x is not a function/,
     );
+    // A disabled place names a preparer nobody registered: it is not needed.
+    const ok = new VfsKernel(
+      config({
+        a: { fs: { ext: ['js'], prepare: 'id' } },
+        off: { enabled: false, fs: { ext: ['js'], prepare: 'nope' } },
+      }),
+      { appRoot: root, console: quiet, preparers: { id: (raw) => raw } },
+    );
+    await ok.initialize();
+    assert.equal(ok.state, 'ready');
+    ok.close();
     rm(root);
   });
 });
@@ -700,6 +715,38 @@ describe('prepare pipeline: the preparer contract', () => {
       warnings.some((w) => /not published — fs\.script\.compile/.test(w)),
     );
     done();
+  });
+
+  it('prepare and scriptOptions never turn fs.script on', async () => {
+    const root = tmpDir('vfs-prep-noscript');
+    const k = await kernel(
+      root,
+      {
+        v: {
+          origin: 'virtual',
+          fs: { writable: true, ext: ['js'], prepare: 'wrap' },
+        },
+      },
+      {},
+      {
+        preparers: {
+          wrap: (raw, file) => ({
+            source: `(${raw.toString().trim()})`,
+            scriptOptions: { filename: file.path },
+          }),
+        },
+      },
+    );
+    try {
+      const v = k.fs('v');
+      await v.writeFile('/a.js', 'x => x');
+      assert.equal(v.readFile('/a.js', 'utf8'), '(x => x)');
+      assert.ok(!k.cache.entry('v', bytecodeKey('/a.js', 'script')));
+      assert.throws(() => v.script('/a.js'), { code: 'ENOTSUP' });
+    } finally {
+      k.close();
+      rm(root);
+    }
   });
 });
 

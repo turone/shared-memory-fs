@@ -203,6 +203,18 @@ describe('native walks under strict routing', () => {
       () => fs.rmdirSync(base, { recursive: true }),
       (err) => notSupported(err, 'rmdir', base) ?? true,
     );
+    notSupported(
+      await outcome(() =>
+        viaCallback((cb) => fs.rmdir(base, { recursive: true }, cb)),
+      ),
+      'rmdir',
+      base,
+    );
+    notSupported(
+      await outcome(() => fs.promises.rmdir(base, { recursive: true })),
+      'rmdir',
+      base,
+    );
     assert.equal(readDisk(at('ro', 'keep.txt'), 'utf8'), 'keep');
     // A read-only place stays read-only; unrelated trees are removed.
     assert.throws(() => fs.rmSync(at('ro'), options), { code: 'EROFS' });
@@ -245,6 +257,18 @@ describe('native walks under strict routing', () => {
     const source = other;
     const into = (dest) => outcome(() => fs.promises.cp(source, dest, options));
     notSupported(await into(base), 'cp', source, base);
+    assert.throws(
+      () => fs.cpSync(source, base, options),
+      (err) => notSupported(err, 'cp', source, base) ?? true,
+    );
+    notSupported(
+      await outcome(() =>
+        viaCallback((cb) => fs.cp(source, base, options, cb)),
+      ),
+      'cp',
+      source,
+      base,
+    );
     assert.equal((await into(root)).code, 'EACCES', 'the strict appRoot');
     assert.equal(onDisk(path.join(base, 'o.txt')), false, 'nothing written');
   });

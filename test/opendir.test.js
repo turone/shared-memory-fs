@@ -11,9 +11,11 @@ const { tmpDir, writeTree, rm, kernel } = require('./helpers.js');
 // Disk edits behind the VFS's back: captured before any patch is installed.
 const { writeFileSync: writeDisk, unlinkSync: unlinkDisk } = fs;
 
-// glob keeps the node:fs functions it walks with from its first use. Use it
-// now, before the patch: its walk stays native and every result reaches the
-// patch's filter unfiltered — the case that filter has to hold alone.
+// glob captures the node:fs functions it walks with when it is loaded. A
+// `node --test` child loads it before any test runs; this call makes sure of
+// it under plain node too. Either way glob walks natively here, so every
+// result reaches the patch's filter unfiltered — the case that filter has to
+// hold alone.
 fs.globSync('*', { cwd: __dirname });
 
 // opendir lists the same filtered territory as readdir: published entries

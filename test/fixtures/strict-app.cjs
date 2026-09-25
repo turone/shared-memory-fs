@@ -1,9 +1,9 @@
 'use strict';
 
-// Entry point for the strict bootstrap test. It lives OUTSIDE the sandbox
+// Entry point for the strict bootstrap test. It lives OUTSIDE the strict
 // root (test/fixtures/sandbox) on purpose: with strict: true appRoot is the
-// boundary, so a trusted entry point and its package metadata must sit
-// outside it or in an explicit node-default / disk place.
+// routing boundary, so a trusted entry point and its package metadata must
+// sit outside it or in an explicit node-default / disk place.
 
 const fs = require('node:fs');
 const path = require('node:path');

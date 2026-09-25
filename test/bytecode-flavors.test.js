@@ -241,4 +241,46 @@ describe('bytecode flavors: failure and rollback', () => {
     k.close();
     rm(root);
   });
+
+  it('map: a fs.script.compile failure keeps the previous version too', async () => {
+    const root = tmpDir('bc-script-fail-map');
+    let broken = false;
+    const k = await kernel(
+      root,
+      {
+        m: {
+          provider: 'map',
+          origin: 'virtual',
+          fs: {
+            writable: true,
+            ext: ['js'],
+            prepare: 'id',
+            script: { compile: true },
+          },
+        },
+      },
+      {},
+      {
+        preparers: {
+          id: (raw) =>
+            broken ? '{ not valid js (((' : `(${raw.toString().trim()})`,
+        },
+      },
+    );
+    try {
+      const m = k.fs('m');
+      m.writeFile('/h.js', 'x => x');
+      const before = m.script('/h.js');
+      broken = true;
+      assert.throws(() => m.writeFile('/h.js', 'y => y'));
+      assert.equal(m.readFile('/h.js', 'utf8'), '(x => x)', 'previous version');
+      assert.deepEqual(m.script('/h.js').cachedData, before.cachedData);
+      broken = false;
+      m.writeFile('/h.js', 'x => x * 2');
+      assert.equal(m.readFile('/h.js', 'utf8'), '(x => x * 2)');
+    } finally {
+      k.close();
+      rm(root);
+    }
+  });
 });

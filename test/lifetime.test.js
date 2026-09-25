@@ -104,7 +104,8 @@ describe('lifetime: a stream keeps reading its version', () => {
     const iterator = stream[Symbol.asyncIterator]();
     const { value: first } = await iterator.next();
     await v.writeFile('/a.txt', 'C'.repeat(32));
-    // The freed source and gzip extents merge; an exact fit reuses both.
+    // Unpinned, the freed source and gzip extents would merge and this exact
+    // fit would reuse both; the stream's pin keeps the gzip bytes in place.
     await v.writeFile('/b.txt', 'B'.repeat(64 + gz.length));
     assert.deepEqual(await readAll(iterator, first), gz);
     assert.equal(k.retired.size, 0);
@@ -255,6 +256,39 @@ describe('lifetime: view leases', () => {
     assert.equal(k.retired.size, 0);
     done();
   });
+
+  it('a representation nobody reads is not held', async () => {
+    const { k, v, done } = await virtual({
+      zeroCopy: true,
+      compress: { encodings: ['gzip', 'br'] },
+    });
+    await v.writeFile('/a.txt', 'A'.repeat(64));
+    const lease = v.readFileCompressedView('/a.txt', 'gzip');
+    await v.writeFile('/a.txt', 'C'.repeat(64));
+    assert.deepEqual(
+      k.retirements().map((r) => r.representation),
+      ['fs:gzip'],
+      'the source and br are free at once',
+    );
+    lease.release();
+    assert.equal(k.retired.size, 0);
+    done();
+  });
+
+  it('zero-copy chunks need fs.zeroCopy on the place', async () => {
+    const { v, done } = await virtual({ compress: { encodings: ['gzip'] } });
+    await v.writeFile('/a.txt', 'A'.repeat(64));
+    assert.throws(() => v.createReadStream('/a.txt', { zeroCopy: true }), {
+      code: 'ENOTSUP',
+    });
+    assert.throws(
+      () => v.createReadStreamCompressed('/a.txt', 'gzip', { zeroCopy: true }),
+      { code: 'ENOTSUP' },
+    );
+    const owned = v.createReadStream('/a.txt', { zeroCopy: false });
+    assert.equal(Buffer.concat(await owned.toArray()).length, 64);
+    done();
+  });
 });
 
 describe('lifetime: ACK ordering', () => {
@@ -269,7 +303,7 @@ describe('lifetime: ACK ordering', () => {
       const updateId = k.nextUpdateId;
       const [{ id }] = k.retirements();
       k.handleAck(updateId, w1.id, [id]);
-      assert.equal(freed.length, 0, 'retained before the ACK counts');
+      assert.equal(freed.length, 0, 'nothing is freed before every ACK');
       if (order === 'the last ACK first') {
         k.handleAck(updateId, w2.id);
         assert.equal(freed.length, 0, 'w1 still reads it');

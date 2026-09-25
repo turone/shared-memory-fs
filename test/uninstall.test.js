@@ -14,9 +14,9 @@ const { tmpDir, writeTree, rm, kernel } = require('./helpers.js');
 // kernel is installed it must be node:fs again: native results, native
 // errors, one callback, and never a call into a kernel that is gone.
 //
-// glob keeps the functions it walks with from its first use. A `node --test`
-// child has used it already, so the case where glob kept the patched ones
-// runs in a plain node process: fixtures/glob-kept.cjs.
+// glob captures the node:fs functions it walks with when it is loaded, and a
+// `node --test` child loads it before any test runs. So the case where glob
+// kept the patched ones runs in a plain node process: fixtures/glob-kept.cjs.
 
 const NATIVE = {
   readFileSync: fs.readFileSync,

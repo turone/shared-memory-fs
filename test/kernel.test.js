@@ -239,7 +239,9 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     assert.equal(w.state, 'ready');
     assert.equal(w.fs('site').readFile('/a.txt', 'utf8'), 'aaa');
     assert.ok(w.bytecode(path.join(root, 'site', 'b.js')));
-    assert.ok(w.fs('site').readFileView === undefined || true);
+    assert.throws(() => w.fs('site').readFileView('/a.txt'), {
+      code: 'ENOTSUP',
+    });
     assert.throws(() => w.snapshot(), /main-thread only/);
     assert.throws(() => w.fs('site').writeFile('/x', 'y'), { code: 'EROFS' });
     w.fs('mem').writeFile('/m', 'm');
