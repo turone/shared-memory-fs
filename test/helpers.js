@@ -106,7 +106,6 @@ module.exports = {
   tmpDir,
   writeTree,
   rm,
-  sleep,
   config,
   kernel,
   drain,

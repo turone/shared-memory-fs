@@ -14,7 +14,6 @@ const {
   config,
   quiet,
   until,
-  sleep,
   tap,
 } = require('./helpers.js');
 
@@ -383,10 +382,10 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     await until(() => messages.length === 1 || errors.length > 0);
     assert.deepEqual(errors, []);
     assert.deepEqual(messages, [[null, true, 'aaa']]);
-    // Anything that is not a delta must not produce an ACK.
+    // Anything that is not a delta must not produce an ACK. The port keeps
+    // order: the ping reaches the worker before the delta below, so an ACK
+    // for it would arrive first and break the "exactly one ACK" check.
     port.postMessage({ name: 'ping' });
-    await sleep(100);
-    assert.deepEqual(acks, []);
     // Change the file: the delta must reach the worker and be ACKed.
     require('node:fs').writeFileSync(path.join(root, 'site', 'a.txt'), 'AAAA');
     await until(() => k.fs('site').readFile('/a.txt', 'utf8') === 'AAAA');

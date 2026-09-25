@@ -11,9 +11,9 @@ const {
   rm,
   kernel,
   until,
-  sleep,
   tap,
   quiet,
+  nextMessage,
 } = require('./helpers.js');
 
 // Watcher tests drive real fs.watch events through the kernel pipeline.
@@ -91,7 +91,7 @@ describe('watcher pipeline', () => {
     assert.equal(k.retired.size, 0);
   });
 
-  it('new directory subtree: files get bytecode and representations in the same epoch', async () => {
+  it('new directory subtree: files get bytecode and representations', async () => {
     const n = msgs.length;
     fs.mkdirSync(at('mod', 'deep'), { recursive: true });
     fs.writeFileSync(at('mod', 'deep', 'x.js'), 'module.exports = "x";');
@@ -100,19 +100,9 @@ describe('watcher pipeline', () => {
       () => site.exists('/mod/deep/x.js') && site.exists('/mod/y.html'),
       4000,
     );
-    await sleep(150);
-    const updates = msgs.slice(n);
-    const entries = updates.flatMap((m) =>
-      m.places.site.entries.map(([key]) => key),
-    );
-    assert.ok(entries.includes(bytecodeKey('/mod/deep/x.js')));
-    assert.ok(entries.includes(compressedKey('/mod/y.html', 'gzip')));
-    assert.equal(
-      new Set(entries).size,
-      entries.length,
-      'no duplicate publications',
-    );
-    for (const m of updates) k.handleAck(m.updateId, w.id);
+    assert.ok(place().files.has(bytecodeKey('/mod/deep/x.js')));
+    assert.deepEqual(site.storedEncodings('/mod/y.html'), ['raw', 'gzip']);
+    for (const m of msgs.slice(n)) k.handleAck(m.updateId, w.id);
   });
 
   it('syntax error: source published, stale bytecode removed in the same message', async () => {
@@ -122,7 +112,9 @@ describe('watcher pipeline', () => {
       () => site.readFile('/a.js', 'utf8') === 'module.exports = (;',
       4000,
     );
-    const msg = msgs[n];
+    const msg = msgs
+      .slice(n)
+      .findLast((m) => m.places.site.entries.some(([key]) => key === '/a.js'));
     assert.ok(msg.places.site.entries.some(([key]) => key === '/a.js'));
     assert.ok(msg.places.site.removals.includes(bytecodeKey('/a.js')));
     assert.ok(!place().files.has(bytecodeKey('/a.js')));
@@ -143,26 +135,47 @@ describe('watcher pipeline', () => {
     for (const m of msgs.slice(n)) k.handleAck(m.updateId, w.id);
   });
 
+  // The filter is the kernel's: driven by one epoch, by hand.
   it('files outside scanExt never enter the pipeline', async () => {
     const root2 = writeTree(tmpDir('watch-ext'), { 'site/a.html': '<a/>' });
     const k2 = await kernel(
       root2,
       { site: { fs: { ext: ['html'] } } },
-      { watch: true, watchTimeout: 60 },
+      { watch: true, watchTimeout: 60000 },
     );
-    const t = tap(k2);
-    fs.writeFileSync(path.join(root2, 'site', 'ignored.bin'), 'xx');
-    fs.writeFileSync(path.join(root2, 'site', 'b.html'), '<b/>');
-    await until(() => k2.fs('site').exists('/b.html'), 4000);
-    await sleep(200);
-    assert.equal(k2.cache.entry('site', '/ignored.bin'), null, 'never cached');
-    assert.equal(k2.fs('site').exists('/ignored.bin'), true, 'disk territory');
-    const keys = t
-      .updates()
-      .flatMap((m) => m.places.site.entries.map(([key]) => key));
-    assert.deepEqual(keys, ['/b.html']);
-    k2.close();
-    rm(root2);
+    try {
+      const t = tap(k2);
+      const at2 = (name) => path.join(root2, 'site', name);
+      fs.writeFileSync(at2('ignored.bin'), 'xx');
+      fs.writeFileSync(at2('b.html'), '<b/>');
+      const delivered = nextMessage(t.port);
+      k2.watcher.emit(
+        'epoch',
+        new Map([
+          [at2('ignored.bin'), 'change'],
+          [at2('b.html'), 'change'],
+        ]),
+      );
+      await k2.watchQueue.idle;
+      await delivered;
+      assert.equal(
+        k2.cache.entry('site', '/ignored.bin'),
+        null,
+        'never cached',
+      );
+      assert.equal(
+        k2.fs('site').exists('/ignored.bin'),
+        true,
+        'disk territory',
+      );
+      const keys = t
+        .updates()
+        .flatMap((m) => m.places.site.entries.map(([key]) => key));
+      assert.deepEqual(keys, ['/b.html']);
+    } finally {
+      k2.close();
+      rm(root2);
+    }
   });
 });
 
@@ -175,21 +188,73 @@ describe('watcher: stale delete event', () => {
     const k = await kernel(
       root,
       { site: { fs: true } },
-      { watch: true, watchTimeout: 50 },
+      { watch: true, watchTimeout: 60000 },
     );
-    const site = k.fs('site');
-    const abs = path.join(root, 'site', 'a.txt');
-    k.watcher.emit('epoch', new Map([[abs, 'delete']]));
-    await sleep(200);
-    assert.equal(site.exists('/a.txt'), true, 'live file survives');
-    assert.equal(site.readFile('/a.txt', 'utf8'), 'v1');
-    // A delete of a path that is really gone still unpublishes.
-    fs.unlinkSync(abs);
-    k.watcher.emit('epoch', new Map([[abs, 'delete']]));
-    await until(() => !site.exists('/a.txt'), 2000);
-    assert.equal(site.exists('/a.txt'), false);
-    k.close();
-    rm(root);
+    try {
+      const site = k.fs('site');
+      const abs = path.join(root, 'site', 'a.txt');
+      const deleted = async () => {
+        k.watcher.emit('epoch', new Map([[abs, 'delete']]));
+        await k.watchQueue.idle;
+      };
+      await deleted();
+      assert.equal(site.readFile('/a.txt', 'utf8'), 'v1', 'live file survives');
+      // A delete of a path that is really gone still unpublishes.
+      fs.unlinkSync(abs);
+      await deleted();
+      assert.equal(site.exists('/a.txt'), false);
+    } finally {
+      k.close();
+      rm(root);
+    }
+  });
+});
+
+// A directory rescan and the events of its files may reach one key in one
+// epoch: it is published once.
+describe('watcher: one epoch publishes a key once', () => {
+  it('a new directory and its files', async () => {
+    const root = writeTree(tmpDir('watch-once'), { 'site/a.js': 'a' });
+    const k = await kernel(
+      root,
+      { site: { fs: { compress: { encodings: ['gzip'] } }, require: true } },
+      { watch: true, watchTimeout: 60000 },
+    );
+    try {
+      const t = tap(k);
+      const at = (...p) => path.join(root, 'site', ...p);
+      writeTree(path.join(root, 'site'), {
+        'mod/deep/x.js': 'module.exports = "x";',
+        'mod/y.html': '<y/>',
+      });
+      const delivered = nextMessage(t.port);
+      k.watcher.emit(
+        'epoch',
+        new Map([
+          [at('mod'), 'scan'],
+          [at('mod', 'deep', 'x.js'), 'change'],
+          [at('mod', 'y.html'), 'change'],
+        ]),
+      );
+      await k.watchQueue.idle;
+      await delivered;
+      const [update, ...more] = t.updates();
+      assert.deepEqual(more, [], 'one vfs-update');
+      const keys = update.places.site.entries.map(([key]) => key);
+      assert.deepEqual(
+        keys.sort(),
+        [
+          '/mod/deep/x.js',
+          bytecodeKey('/mod/deep/x.js'),
+          compressedKey('/mod/deep/x.js', 'gzip'),
+          '/mod/y.html',
+          compressedKey('/mod/y.html', 'gzip'),
+        ].sort(),
+      );
+    } finally {
+      k.close();
+      rm(root);
+    }
   });
 });
 
@@ -369,30 +434,38 @@ describe('watcher: unstable source', () => {
         },
       },
     );
-    const site = k.fs('site');
-    // Force the stable-read check to fail: every read sees a "changed" file.
-    const realOpen = k.cache.reader;
-    let attempts = 0;
-    k.cache.reader = async () => {
-      attempts++;
-      throw new Error('source changed during read');
-    };
-    fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'v2');
-    await until(() => attempts >= 1, 4000);
-    await until(() => attempts >= 2, 4000);
-    await sleep(400);
-    assert.equal(
-      attempts,
-      2,
-      'one event attempt + exactly one deferred recheck',
-    );
-    assert.equal(site.readFile('/a.txt', 'utf8'), 'v1', 'old version retained');
-    assert.ok(warnings.some((w) => /not published/.test(w)));
-    k.cache.reader = realOpen;
-    fs.writeFileSync(path.join(root, 'site', 'a.txt'), 'v3');
-    await until(() => site.readFile('/a.txt', 'utf8') === 'v3', 4000);
-    k.close();
-    rm(root);
+    try {
+      const site = k.fs('site');
+      // Every read fails the stable-read check, as if the file kept changing;
+      // the disk is left alone, so the epochs by hand are the only ones.
+      const realOpen = k.cache.reader;
+      let attempts = 0;
+      k.cache.reader = async () => {
+        attempts++;
+        throw new Error('source changed during read');
+      };
+      const abs = path.join(root, 'site', 'a.txt');
+      const changed = async () => {
+        k.watcher.emit('epoch', new Map([[abs, 'change']]));
+        await k.watchQueue.idle;
+      };
+      await changed();
+      assert.equal(attempts, 1);
+      assert.equal(k.rechecks.size, 1, 'one deferred recheck');
+      await until(() => attempts >= 2, 4000);
+      await k.watchQueue.idle;
+      assert.equal(attempts, 2, 'the event, then exactly one recheck');
+      assert.equal(k.rechecks.size, 0, 'and none after it');
+      assert.equal(site.readFile('/a.txt', 'utf8'), 'v1', 'old version kept');
+      assert.ok(warnings.some((w) => /not published/.test(w)));
+      k.cache.reader = realOpen;
+      fs.writeFileSync(abs, 'v3');
+      await changed();
+      assert.equal(site.readFile('/a.txt', 'utf8'), 'v3');
+    } finally {
+      k.close();
+      rm(root);
+    }
   });
 
   it('an unstable file does not block the rest of the epoch', async () => {

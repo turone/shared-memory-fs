@@ -705,7 +705,9 @@ stat        { size, mtimeMs } (+ sourceSize, encoding for compressed companions)
   `k.watchQueue.idle`, observe publication on the main side
   (`k.nextUpdateId`, `k.acks`, `k.retired`, `k.retirements()`), and use
   in-thread links (`test/helpers.js`: `tap`, `worker`, `nextMessage`)
-  instead of timers.
+  instead of timers. Tests over real `fs.watch` events or real workers wait
+  only for a condition to become true (`until`); nothing sleeps to prove
+  that something did not happen.
 - Hooks are installed only inside a test and uninstalled in `after` /
   `finally`; bootstrap tests run child processes.
 - glob captures the `node:fs` functions it walks with when it is loaded,
