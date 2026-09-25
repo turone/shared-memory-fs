@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { bytecodeKey, compressedKey } = require('../lib/companion.js');
+const fsPatch = require('../lib/adapters/fs-patch.js');
 const {
   tmpDir,
   writeTree,
@@ -15,6 +16,15 @@ const {
   quiet,
   nextMessage,
 } = require('./helpers.js');
+
+// The disk behind the patch, captured before any install. Not rmSync: on
+// Node 22 its recursive walk calls the public, patched node:fs.
+const disk = {
+  writeFileSync: fs.writeFileSync,
+  mkdirSync: fs.mkdirSync,
+  unlinkSync: fs.unlinkSync,
+  rmdirSync: fs.rmdirSync,
+};
 
 // Watcher tests drive real fs.watch events through the kernel pipeline.
 
@@ -653,6 +663,98 @@ describe('DirWatcher: 8.3 alias roots', () => {
     });
     assert.equal(res.status, 0, `libuv abort: ${res.stderr}`);
     rm(root);
+  });
+});
+
+// Where recursive fs.watch is not native (Linux), Node builds it over the
+// public node:fs, which fs-patch routes: the watcher walks the tree itself
+// and sees the disk, whatever the patch lists or refuses.
+describe('DirWatcher: the disk, whatever fs-patch routes', () => {
+  for (const strict of [false, true]) {
+    it(`publishes what appears on disk under the patch (strict: ${strict})`, async () => {
+      const root = writeTree(tmpDir('watch-patched'), {
+        'site/a.txt': 'a',
+        'site/sub/b.txt': 'b',
+      });
+      const k = await kernel(
+        root,
+        { site: { fs: { ext: ['txt'] } } },
+        { strict, watch: true, watchTimeout: 30 },
+      );
+      const errors = [];
+      k.watcher.on('error', (err) => errors.push(err));
+      fsPatch.install(k);
+      const at = (...p) => path.join(root, 'site', ...p);
+      const site = k.fs('site');
+      try {
+        disk.writeFileSync(at('new.txt'), 'n');
+        disk.mkdirSync(at('fresh'));
+        disk.writeFileSync(at('fresh', 'c.txt'), 'c');
+        disk.writeFileSync(at('sub', 'b.txt'), 'b2');
+        await until(
+          () =>
+            site.exists('/new.txt') &&
+            site.exists('/fresh/c.txt') &&
+            site.readFile('/sub/b.txt', 'utf8') === 'b2',
+          4000,
+        );
+        assert.equal(site.readFile('/new.txt', 'utf8'), 'n');
+        assert.equal(site.readFile('/fresh/c.txt', 'utf8'), 'c');
+        assert.equal(site.readFile('/sub/b.txt', 'utf8'), 'b2');
+        disk.unlinkSync(at('sub', 'b.txt'));
+        disk.rmdirSync(at('sub'));
+        await until(() => !site.exists('/sub/b.txt'), 4000);
+        assert.equal(site.exists('/sub'), false);
+        assert.deepEqual(errors, []);
+      } finally {
+        fsPatch.uninstall();
+        k.close();
+        rm(root);
+      }
+    });
+  }
+
+  it('walk: a new directory joins the tree, a gone one leaves it', async () => {
+    const { DirWatcher } = require('../lib/watcher.js');
+    const root = writeTree(tmpDir('watch-walk'), {
+      'a.txt': 'a',
+      'sub/b.txt': 'b',
+    });
+    const watcher = new DirWatcher({ timeout: 30, walk: true });
+    const events = new Map();
+    watcher.on('epoch', (epoch) => {
+      for (const [target, event] of epoch) events.set(target, event);
+    });
+    const fresh = path.join(root, 'fresh');
+    try {
+      watcher.watch(root);
+      assert.deepEqual(
+        [...watcher.watchers.keys()].sort(),
+        [root, path.join(root, 'sub')].sort(),
+      );
+      fs.mkdirSync(fresh);
+      await until(() => watcher.watchers.has(fresh), 4000);
+      fs.writeFileSync(path.join(fresh, 'c.txt'), 'c');
+      await until(() => events.has(path.join(fresh, 'c.txt')), 4000);
+      assert.equal(events.get(path.join(fresh, 'c.txt')), 'change');
+      assert.equal(events.get(fresh), 'scan');
+      // Windows holds a watched directory open: its removal is left to
+      // POSIX, where walking is the default. A link to a directory — here
+      // a loop — is never followed.
+      if (process.platform !== 'win32') {
+        const loop = path.join(root, 'loop');
+        fs.symlinkSync(root, loop, 'dir');
+        await until(() => events.has(loop), 4000);
+        assert.equal(watcher.watchers.has(loop), false);
+        fs.rmSync(fresh, { recursive: true });
+        await until(() => events.get(fresh) === 'delete', 4000);
+        assert.equal(events.get(fresh), 'delete');
+        assert.equal(watcher.watchers.has(fresh), false);
+      }
+    } finally {
+      watcher.close();
+      rm(root);
+    }
   });
 });
 

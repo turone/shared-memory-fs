@@ -69,7 +69,7 @@ SAB segments ──────────── one physical copy ────
 | `lib/mutation-queue.js`         | `MutationQueue`: per-(place, key) ordering, exclusive place barrier                                                                                       |
 | `lib/mutation-rpc.js`           | `MutationClient` + `RemoteStore`: worker → main mutations                                                                                                 |
 | `lib/scanner.js`                | `scan()`: directory walk → `Map<key, FileInput>`                                                                                                          |
-| `lib/watcher.js`                | `DirWatcher`: recursive `fs.watch` → debounced epochs; `watchPath()`                                                                                      |
+| `lib/watcher.js`                | `DirWatcher`: `fs.watch` over each place tree (recursive where native, else one per directory) → debounced epochs; `watchPath()`                          |
 | `lib/companion.js`              | companion keys: `src\0require:bytecode`, `src\0script:bytecode`, `src\0fs:<enc>`                                                                          |
 | `lib/stats.js`, `lib/errors.js` | `VfsStats` / `VfsDirent`; node:fs-shaped errors                                                                                                           |
 | `lib/adapters/fs-patch.js`      | table-driven `node:fs` patch executing router decisions                                                                                                   |
@@ -169,6 +169,16 @@ old in the VFS); a FIFO is the simplest correct order, and the debounce
 already batches events. The queue is deliberately separate from the per-key
 `MutationQueue` of virtual places, which never share a key with a watched
 place.
+
+**The watcher sees the disk through `node:fs` as it was when it loaded:
+recursive `fs.watch` where it is native (Windows, macOS), elsewhere one
+plain `fs.watch` per directory, a new one added as an event shows it, the
+ones under a deleted path dropped, a link to a directory never followed.**
+_Why:_ on Linux Node builds recursive `fs.watch` over the public
+`node:fs`, which `fs-patch` routes: it listed the VFS instead of the disk
+and missed new files, and from Node 26.10 a refusal reached it as an
+uncaught exception. One watch per directory is also what inotify costs at
+least.
 
 **Stable source reads: stat before and after a looped read; a failed
 publication keeps the previous version and gets one deferred recheck.**

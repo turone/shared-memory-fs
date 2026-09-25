@@ -1024,9 +1024,11 @@ disk-backed CommonJS could work on earlier 24.x, but those releases are
 outside the library's supported matrix. macOS is expected to work (same
 `fs.watch` capabilities as Linux and Windows) but is not in the matrix.
 
-The watcher relies on `fs.watch(dir, { recursive: true })`. That is
-unavailable on AIX and IBM i, where the live-reload features do not
-work; everything else does.
+The watcher needs `fs.watch`: recursive where Node implements it
+natively (Windows, macOS), elsewhere one watch per directory — Node builds
+its recursive form there over the public `node:fs`, which the patch
+routes. On IBM i, where `fs.watch` is unavailable, the live-reload
+features do not work; on AIX they need AHAFS; everything else does.
 
 On Windows the watcher resolves a place root through
 `fs.realpathSync.native` when the path contains an 8.3 alias segment
