@@ -12,6 +12,7 @@
 // Build SEA binary: see README in this directory.
 
 const http = require('node:http');
+const { finished } = require('node:stream');
 const { VfsConfig, VfsKernel } = require('../..');
 
 const APP_ROOT = __dirname;
@@ -80,22 +81,24 @@ const shutdown = () => {
 (async () => {
   await kernel.initialize();
 
-  // zeroCopy: the response body is a borrowed view over shared memory —
-  // consumed immediately by res.end(), never mutated or retained.
+  // zeroCopy: the response body is a view over shared memory. The socket
+  // may still be writing it after res.end() returns, so the lease ends only
+  // when the response is finished or the client is gone.
   const pub = kernel.fs('pub');
 
   server = http.createServer((req, res) => {
     const urlPath = req.url.split('?')[0];
     const key = urlPath === '/' ? '/index.html' : urlPath;
-    const data = pub.readFileView(key);
-    if (!data) {
+    const lease = pub.readFileView(key);
+    if (!lease) {
       res.statusCode = 404;
       return res.end('not found\n');
     }
+    finished(res, () => lease.release());
     const ext = key.split('.').pop();
     res.setHeader('content-type', MIME[ext] || 'application/octet-stream');
-    res.setHeader('content-length', data.length);
-    return res.end(data);
+    res.setHeader('content-length', lease.view.length);
+    return res.end(lease.view);
   });
 
   process.once('SIGINT', shutdown);

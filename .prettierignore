@@ -1,4 +1,6 @@
-application/tasks/
 package-lock.json
 package.json
 tmp/
+# Local, user-owned agent files: never part of the project, never reformatted.
+CLAUDE.md
+.claude/

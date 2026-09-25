@@ -12,11 +12,12 @@ Main thread                                Worker threads
 │ ├─ VfsConfig (frozen)            │       │ ├─ same VfsConfig from raw   │
 │ ├─ FilesystemCache               │       │ ├─ projected Maps (zero-copy)│
 │ │  └─ Pool + SegmentRegistry     │       │ ├─ per-thread map places     │
-│ ├─ PlaceRegistry + FsRouter      │       │ └─ handleDelta()             │
+│ ├─ PlaceRegistry + FsRouter      │       │ └─ Pins: streams and leases  │
 │ ├─ scanner                       │       └──────────────────────────────┘
-│ ├─ DirWatcher (epochs)           │  link() → workerData.vfs
-│ └─ pendingFrees: updateId→Set    │  vfs-update ──────────►
-└──────────────────────────────────┘  ack-update  ◄──────────
+│ ├─ DirWatcher (FIFO epochs)      │  link() → workerData.vfs
+│ └─ acks + retired (retireId)     │  vfs-update  ──────────►
+└──────────────────────────────────┘  vfs-ack     ◄────────── (+ retained)
+                                      vfs-release ◄──────────
 SAB segments ─────────── shared physical memory ─────────── zero-copy views
 ```
 
@@ -24,15 +25,31 @@ Invariants:
 
 - Workers never write SAB directly; a `sab + virtual` write from a worker
   goes through the mutation RPC and is applied by the main kernel.
-- ACK-before-free: stale entries are freed only after every live worker
-  (`getWorkerIds()` ∪ `link()` ports) ACKs the `updateId`, or exits.
+- A virtual place keeps a filesystem's hierarchy: a key under a file is
+  `ENOTDIR`, a file where a directory is `EISDIR` — whatever the mutation,
+  and also when mutations overlap. A path ending in a separator names a
+  directory, as on POSIX, on every platform: a file the VFS serves or
+  stores, named so, is `ENOTDIR`.
+- One publication pipeline for every source of content: raw input → the
+  preparer of its extension (once) → canonical content → bytecode and
+  compressed companions → one epoch. Allocations stay private until the
+  epoch commits, so snapshots and compaction only ever see published
+  entries, and a failed attempt only frees its own bytes.
+- Watcher epochs (and their rechecks) run strictly one at a time, in
+  arrival order: an older epoch never publishes over a newer one.
+- ACK-before-free, per version: a shared version an update replaces or
+  removes is retired under a temporary `retireId` and freed only when
+  every linked worker has ACKed the update (or exited) **and** no stream or
+  lease in any thread still reads it. Nothing is freed on a timeout.
 - Empty segments are recycled, never returned to the OS. Compaction
-  _closes_ a segment until ACK-pending bytes are gone.
+  _closes_ a segment until its retired bytes are gone and never moves a
+  retired extent.
 - Config is deep-frozen at construction. Workers rebuild from `config.raw`.
 - Place name **is** the directory under `appRoot`, the mount and the
   snapshot/delta key.
-- `require.compile` and `fs.script.compile` are main-thread-only
-  (preparers run only on the main thread); there is no ESM bytecode.
+- Preparation and `require.compile` / `fs.script.compile` of shared places
+  are main-thread-only; there is no ESM bytecode. A worker prepares only
+  writes to its own `map` places, with `attach({ preparers })`.
 
 ## Provider matrix
 
@@ -47,13 +64,31 @@ Invariants:
 | Bytecode              | `kernel.bytecode` / `PlaceFs.script` | same, on publish              | auto on write        | auto on write        | `kernel.bytecode` | n/a            | no (`compile: false`) |
 
 Disk-origin writable places (`sab + disk`, `map + disk`) are **eventual
-consistency**: mutations go to disk, the watcher brings them into the
-index (no `waitForUpdate`). A `sab + virtual` mutation resolves its
-Promise only once the new version is already published — no watcher
-involved.
+consistency**: mutations go to disk — copies and renames through the
+patched `fs` included — and the watcher brings them into the index (no
+`waitForUpdate`). A `sab + virtual` mutation, a copy into the place
+included, resolves its Promise only once the new version is already
+published — no watcher involved.
 
-Writable sab writes go to disk; the watcher brings them into SAB
-(eventual consistency, no `waitForUpdate`).
+Disk-origin places also decide what happens to a path they do not serve,
+with `fs.fallback` (resolved explicitly: `'deny'` under strict, `'disk'`
+otherwise). A **partial disk cache** keeps the extensions it serves hot in
+SAB and leaves the rest on disk:
+
+```js
+places: {
+  public: {
+    fs: { ext: ['html', 'css', 'js'], fallback: 'disk' }, // media from disk
+  },
+}
+```
+
+Under strict, `public/logo.png` is then read from disk while
+`public/app.js` is served only from the VFS (a `.js` file on disk that is
+not published stays `EACCES`); listings merge both and show a `.js` file
+only once it is published. The fallback never reaches another place or an
+unmanaged sibling, `fs.writable` stays its own policy, and `require` /
+`import` never fall back.
 
 ## Worker message protocol
 
@@ -69,6 +104,8 @@ Main → worker (`link()` port):
         ['/index.html', { kind:'shared', segmentId:3, offset:0, length:42, stat }],
       ],
       removals: ['/old.html'],
+      // Every shared version this update replaces or removes.
+      retired: [['/index.html', 41], ['/old.html', 42]],
     },
   },
   newSegments: [{ id: 3, sab: SharedArrayBuffer }],
@@ -78,25 +115,54 @@ Main → worker (`link()` port):
 Worker → main:
 
 ```js
-{ name: 'ack-update', updateId: 7 }
+{ name: 'vfs-ack', updateId: 7, retained: [41] } // a stream still reads it
+{ name: 'vfs-release', retireIds: [41] }         // its last consumer is done
 ```
 
-`attach()` applies `vfs-update` then ACKs **those — and only those** —
-messages. Manual `handleDelta(msg)` must run before the ACK, otherwise
-the main thread may free SAB still in use.
+`attach()` is the only worker transport (`link()` on the main side). The
+worker kernel applies each `vfs-update` synchronously and ACKs **those —
+and only those** — messages. Before applying, it looks up the retired
+keys in its projection: a version one of its streams or leases still
+reads is bound to its `retireId` and reported in `retained`, in the same
+ACK — so it is held before the ACK can free anything. When the last local
+consumer of that version is done, one `vfs-release` follows. Pinning a
+current version is local bookkeeping: no IPC per chunk, per stream or for
+a version that is never retired while in use. A worker that exits drops
+all its ACKs and holds.
 
 There is no `file-update` / `file-delete`. One `vfs-update` per epoch.
 Source + companions of one file are published together; a companion that
 fails to rebuild is listed in `removals` of the same message.
+`kernel.retirements()` lists what is still held — representation, bytes,
+age, and whether it waits for ACKs or for consumers — for debugging.
+
+### Streams and views
+
+A `PlaceFs` stream or view lease pins the version it started with; see
+[README → Lifetime of shared bytes](../README.md#lifetime-of-shared-bytes).
+Prefer `pipeline(stream, destination)`: it destroys the source when the
+destination fails. After a manual `stream.pipe(res)`, destroy the source
+yourself when `res` closes or aborts — a paused, abandoned source keeps
+its version pinned. Zero-copy chunks may outlive the stream in a socket's
+write queue, so a zero-copy stream is released only by `release()`:
+
+```js
+const stream = files.createReadStream(key, { start, end });
+try {
+  await pipeline(stream, res);
+} finally {
+  stream.release();
+}
+```
 
 ## Hooks
 
 Two layers, `defaults.hooks.{fs,module}`:
 
-| Layer    | Mechanism                                              | Notes                                                                                      |
-| -------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `fs`     | table-driven `node:fs` patch (sync/callback/promises)  | Executes `FsRouter` decisions. Implemented vs guarded lists: see README.                   |
-| `module` | `module.registerHooks({ resolve, load })` + `_compile` | One chain for `require()` and `import`. Domain = `context.conditions.includes('require')`. |
+| Layer    | Mechanism                                              | Notes                                                                                         |
+| -------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `fs`     | table-driven `node:fs` patch (sync/callback/promises)  | Executes `FsRouter` decisions: implemented, recognized but unsupported, passthrough (README). |
+| `module` | `module.registerHooks({ resolve, load })` + `_compile` | One chain for `require()` and `import`. Domain = `context.conditions.includes('require')`.    |
 
 Manual install (when not using `--import shared-memory-fs/register`):
 
@@ -158,7 +224,7 @@ compile, or the file is non-JS), `metavm` creates cached data on first
 run as usual. Prove `cachedDataRejected === false` in a worker, not in
 the compiling thread: V8's per-isolate cache masks rejection there.
 
-### AI agent / plugin sandbox
+### AI agent / plugin workspace
 
 Pattern: one writable `map + virtual` place per agent (or per session),
 strict mode on, optional `sab` place for read-only tooling. The trusted
@@ -189,7 +255,10 @@ fs.readFileSync(path.join(appRoot, 'elsewhere', 'file')); // EACCES
 
 `map` places are per-thread, so concurrent agents in different workers
 cannot see each other's scratch state. Same-process places are **not**
-firewalled from each other.
+firewalled from each other, and strict mode is a routing policy for code
+that goes through `node:fs` and the module hooks — not a security
+boundary for untrusted code: worker threads share one process and do not
+replace OS-level isolation.
 
 ### Static server with pre-compressed assets
 
@@ -243,8 +312,9 @@ const serve = (req, res, key) => {
 ```
 
 Parsing `Accept-Encoding` is the server's job. With `retainRaw: false`
-the `'raw'` branch has no SAB bytes — use
-`fs.createReadStream(place.pathOf(key))` instead.
+the `'raw'` branch still works: the source is not in SAB, so `readFile()`
+and `createReadStream()` read it from disk themselves (`readFileView()`
+returns `null`).
 
 ### Single-Executable Application bundling
 
@@ -286,25 +356,65 @@ delete require.cache[path.join(appRoot, 'gen', 'route.js')];
 const next = require(path.join(appRoot, 'gen', 'route.js'));
 ```
 
-### Preparing sources with `fs.script`
+### Preparing sources
 
-`fs.script` runs a synchronous callback over every raw source before it
-becomes canonical content, and can produce a `vm.Script` cached-data
-companion independent from `require.compile`:
+A preparer is declared inside a domain — `fs`, `require` or `import` —
+next to its `ext`, and registered as a function in the kernel option
+`preparers` (functions never enter the cloneable config). The declaring
+domain only owns the configuration; the result is the file's one
+canonical content, which every domain serves. The library ships the
+mechanism only — no Babel, CSS, HTML, SVG or image preparers.
+
+**API sources** — one preparer for the domain's extensions, plus script
+bundles compiled from the prepared source:
+
+```js
+fs: {
+  ext: ['js'],
+  prepare: 'api',
+  script: { ext: ['js'], compile: true },
+}
+```
+
+**Several content types** — explicit routing by extension:
+
+```js
+fs: {
+  ext: ['js', 'css', 'html', 'svg'],
+  prepare: { api: ['js'], styles: ['css'], markup: ['html', 'svg'] },
+}
+```
+
+**Overlapping domains** — `.js` goes through `api` once; that one prepared
+source is what `fs` reads, `fs.script.compile` turns into
+`\0script:bytecode` (bare source, the preparer's `scriptOptions`) and
+`require.compile` turns into `\0require:bytecode` (`Module.wrap(source)`).
+Declaring `prepare` for `js` in `require` too would be a config error,
+even with the same name:
+
+```js
+fs: {
+  ext: ['js', 'css'],
+  prepare: { api: ['js'], styles: ['css'] },
+  script: { ext: ['js'], compile: true },
+},
+require: { ext: ['js'], compile: true },
+```
 
 ```js
 const kernel = new VfsKernel(config, {
   appRoot,
   preparers: {
-    wrap: (raw, file) => ({
+    api: (raw, file) => ({
       source: `(${raw.toString().trim()})`,
       scriptOptions: { filename: file.path },
     }),
+    styles: (raw) => minifyCss(raw.toString()),
+    markup: (raw) => minifyMarkup(raw.toString()),
   },
 });
-// places: { api: { fs: { script: { prepare: 'wrap' } } } }
 
-const bundle = kernel.fs('api').script('/handler.js');
+const bundle = kernel.fs('application').script('/handler.js');
 const script = new vm.Script(bundle.source, {
   ...bundle.scriptOptions,
   cachedData: bundle.cachedData,
@@ -312,10 +422,28 @@ const script = new vm.Script(bundle.source, {
 const handler = script.runInThisContext();
 ```
 
-The prepared source replaces the raw one everywhere (`readFile`, module
-loads, `script()`); the raw input is not retained, so in a **virtual**
-place `appendFile` and `rename` on a prepared key are `ENOTSUP`. In a
-disk-origin place they edit the raw file and the watcher re-prepares it.
+- The short form covers the domain's own finite `ext` (an unrestricted
+  `fs` must use the object form; `fs.script.ext` is never its scope); the
+  object form must stay inside a finite domain `ext`. Neither adds
+  extensions to a domain.
+- Key, path, extension and type of the file do not change. The raw disk
+  file stays the source of truth; the raw input is not kept next to the
+  prepared content in SAB.
+- Preparers are synchronous and run once per publication attempt — scan,
+  watcher, SEA, virtual writes from any thread, `map` writes — never on
+  read. A preparer error or a failing `fs.script.compile` publishes
+  nothing; a failing `require.compile` only drops its own companion.
+- In a **virtual** place `appendFile`, `rename` and copies of a prepared
+  key are `ENOTSUP`: its raw input is not kept. Renaming or copying an
+  unprepared entry onto an extension with a preparer publishes it through
+  that preparer, once. A directory renames as a whole subtree only when no
+  source under it is prepared or compiled: sources and compressed
+  representations keep their bytes, stat and mtime, in one publication. In a disk-origin place mutations edit the raw file
+  and the watcher re-prepares it; a copy or a rename hands on the raw
+  file, never the prepared content.
+- `readFile` gives the prepared content; passing it to `writeFile`
+  elsewhere is a new publication the destination may prepare again, not a
+  raw-preserving copy — `copyFile` hands on the raw input.
 
 ### Testing with virtual fixtures
 
@@ -357,11 +485,12 @@ node --import shared-memory-fs/register app.js -- \
 `VfsConfig.fromArgv(process.argv, appConfig)` applies the same flags
 when you construct the kernel yourself.
 
-## Comparison with alternatives
+## Alternatives and decisions
 
-See [comparison.md](comparison.md) for a detailed comparison with
-`@platformatic/vfs` (the direct extraction of the `node:vfs` core
-proposal), `memfs`, and plain `node:fs`.
+[alternatives.md](alternatives.md) compares the library with `node:vfs`
+(the virtual file system in Node.js core), `@platformatic/vfs`, `memfs` and
+plain `node:fs`. [architecture.md](architecture.md) records the design
+decisions and their reasons.
 
 ## Design notes
 
@@ -394,8 +523,11 @@ trade for shared state, not for a fast per-thread scratch space.
 
 **Why strict mode at the router.** `FsRouter` is the chokepoint that sees
 every routed path; gating there is cheap and uniform across sync,
-callback, promises, and the guarded APIs. Application-level sandboxing
-is bypassed by `require('node:fs')` — kernel-level sandboxing is not.
+callback, promises, and the guarded APIs, and a check in application
+code would be bypassed by `require('node:fs')`. It stays a routing
+policy: containment is lexical (only a real `..` component leaves
+`appRoot`), symlinks are not resolved, and code that reaches the OS by
+other means is not contained.
 
 ## Integration checklist
 

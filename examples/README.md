@@ -3,11 +3,13 @@
 Runnable demos covering the main shared-memory-fs use cases. Each subfolder
 is self-contained — no extra build steps unless explicitly noted.
 
-| Example                                  | What it shows                                                                                                                                   |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| [hot-reload-routes/](hot-reload-routes/) | `provider: 'map', origin: 'virtual'` + `require()` hook; HTTP server whose route handlers are written/replaced at runtime by an "AI agent".     |
-| [sea-static/](sea-static/)               | One config, two providers: `'sab'` when running with `node`, `'sea'` when packaged with Node SEA. Same HTTP handler in both modes.              |
-| [multi-tenant/](multi-tenant/)           | Two `map + virtual` places under one appRoot + global `strict: true` whitelist; demonstrates the boundary `strict` enforces and where it stops. |
+| Example                                  | What it shows                                                                                                                                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [hot-reload-routes/](hot-reload-routes/) | `provider: 'map', origin: 'virtual'` + `require()` hook; HTTP server whose route handlers are written/replaced at runtime by an "AI agent".                                                |
+| [sea-static/](sea-static/)               | One config, two providers: `'sab'` when running with `node`, `'sea'` when packaged with Node SEA. Same HTTP handler in both modes.                                                         |
+| [multi-tenant/](multi-tenant/)           | Two `map + virtual` places under one appRoot + global `strict: true` whitelist; demonstrates the boundary `strict` enforces and where it stops.                                            |
+| [worker-static/](worker-static/)         | Static HTTP from several worker threads over one SAB copy: `link()` / `attach()`, view leases, zero-copy Range streams, br / gzip representations, live reload of disk and virtual places. |
+| [prepared-scripts/](prepared-scripts/)   | `prepare` + `fs.script`: handler sources prepared once, run in a worker with shared V8 cached data, and updated from the worker through a `sab + virtual` place.                           |
 
 These examples are docs-grade and are also covered by the automated smoke suite
 in `test-examples/`, run with `npm run test:examples`. That suite is not part of

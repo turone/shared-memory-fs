@@ -18,8 +18,6 @@ const input = (size, fill) => ({
   data: buf(size, fill),
   stat: { size, mtimeMs: 1 },
 });
-const files = (spec) =>
-  new Map(Object.entries(spec).map(([k, n]) => [k, input(n)]));
 
 const bytes = (cache, entry) =>
   Buffer.from(
@@ -28,27 +26,29 @@ const bytes = (cache, entry) =>
     entry.length,
   );
 
-describe('FilesystemCache: load', () => {
-  it('packs large files first and keeps the entry map', async () => {
+// allocate + put: the two steps of a publication.
+const publish = async (cache, name, key, file, options) => {
+  const entry = await cache.allocate(file, options);
+  if (entry) cache.put(name, key, entry);
+  return entry;
+};
+
+describe('FilesystemCache: allocate', () => {
+  it('places bytes without publishing them', async () => {
     const cache = make();
-    const index = await cache.load(
-      'p',
-      files({ '/a': 100, '/b': 2000, '/c': 500 }),
-    );
-    assert.deepEqual([...index.entries.keys()].sort(), ['/a', '/b', '/c']);
-    const b = index.entries.get('/b');
-    assert.equal(b.kind, 'shared');
-    assert.equal(b.offset, 0);
-    assert.equal(bytes(cache, b).toString(), 'a'.repeat(2000));
-    assert.equal(cache.entry('p', '/a').kind, 'shared');
-    assert.equal(cache.entry('p', '/zzz'), null);
+    const entry = await cache.allocate(input(100));
+    assert.equal(entry.kind, 'shared');
+    assert.equal(bytes(cache, entry).toString(), 'a'.repeat(100));
+    assert.equal(cache.entry('p', '/a'), null, 'not in the index yet');
+    assert.deepEqual(cache.snapshot().places, {});
+    assert.equal(cache.put('p', '/a', entry), null);
+    assert.equal(cache.entry('p', '/a'), entry);
   });
 
   it('turns oversize files into disk entries', async () => {
     const cache = make();
     const file = { path: '/tmp/big', stat: { size: 3 * KB, mtimeMs: 1 } };
-    await cache.load('p', new Map([['/big', file]]));
-    assert.deepEqual(cache.entry('p', '/big'), {
+    assert.deepEqual(await cache.allocate(file), {
       kind: 'disk',
       path: '/tmp/big',
       stat: file.stat,
@@ -57,45 +57,42 @@ describe('FilesystemCache: load', () => {
 
   it('honours per-call maxFileSize', async () => {
     const cache = make();
-    await cache.load('p', files({ '/x': 3 * KB }), { maxFileSize: 4 * KB });
-    assert.equal(cache.entry('p', '/x').kind, 'shared');
+    const entry = await cache.allocate(input(3 * KB), { maxFileSize: 4 * KB });
+    assert.equal(entry.kind, 'shared');
   });
 
   it('empty files are shared entries without bytes', async () => {
     const cache = make();
-    await cache.load('p', files({ '/e': 0 }));
-    const e = cache.entry('p', '/e');
+    const e = await cache.allocate(input(0));
     assert.equal(e.kind, 'shared');
     assert.equal(e.length, 0);
     assert.equal(cache.pool.segments.size, 0);
   });
 
-  it('store predicate keeps selected files on disk', async () => {
+  it('onDisk keeps a file on disk', async () => {
     const cache = make();
-    const b = { ...input(10), path: '/tmp/b' };
-    await cache.load(
-      'p',
-      new Map([
-        ['/a', input(10)],
-        ['/b', b],
-      ]),
-      {
-        store: (key) => key !== '/b',
-      },
+    const b = await cache.allocate(
+      { ...input(10), path: '/tmp/b' },
+      { onDisk: true },
     );
-    assert.equal(cache.entry('p', '/a').kind, 'shared');
-    assert.equal(cache.entry('p', '/b').kind, 'disk');
+    assert.equal(b.kind, 'disk');
+    assert.equal(b.path, '/tmp/b');
+    assert.equal(cache.pool.segments.size, 0);
   });
 
-  it('in-memory input without a disk copy must fit in SAB', async () => {
+  it('fallback: false yields null instead of a disk entry', async () => {
     const cache = make();
-    await assert.rejects(
-      cache.load('p', files({ '/big': 3 * KB })),
-      /"\/big" does not fit in SAB and has no disk copy/,
+    assert.equal(
+      await cache.allocate(input(3 * KB), { fallback: false }),
+      null,
+    );
+    assert.equal(
+      await cache.allocate(input(10), { fallback: false, onDisk: true }),
+      null,
     );
     const meta = Object.freeze({ kind: 'custom' });
-    await cache.load('p', new Map([['/m', { ...input(5), meta }]]));
-    assert.equal(cache.entry('p', '/m').meta, meta);
+    const m = await cache.allocate({ ...input(5), meta }, { fallback: false });
+    assert.equal(m.meta, meta, 'extras travel with the entry');
   });
 
   it('uses the injected reader and rolls the extent back when it throws', async () => {
@@ -108,47 +105,32 @@ describe('FilesystemCache: load', () => {
     const cache = make({ reader });
     const good = { path: '/good', stat: { size: 100, mtimeMs: 1 } };
     const bad = { path: '/bad', stat: { size: 100, mtimeMs: 1 } };
-    const entry = await cache.allocate('p', '/good', good);
+    const entry = await cache.allocate(good);
     assert.equal(bytes(cache, entry).toString(), 'B'.repeat(100));
-    await assert.rejects(cache.allocate('p', '/bad', bad), /changed/);
+    await assert.rejects(cache.allocate(bad), /changed/);
     assert.equal(calls, 2);
-    assert.equal(cache.entry('p', '/bad'), null);
     // The failed extent was released: the next allocation reuses its offset.
-    const next = await cache.allocate('p', '/next', good);
+    const next = await cache.allocate(good);
     assert.equal(next.offset, 100);
   });
 
   it('rejects buffers whose length disagrees with stat.size', async () => {
     const cache = make();
     await assert.rejects(
-      cache.allocate('p', '/x', { data: buf(10), stat: { size: 11 } }),
+      cache.allocate({ data: buf(10), stat: { size: 11 } }),
       /size mismatch/,
     );
   });
 
   it('without reader, path inputs fall back to disk entries', async () => {
     const cache = make();
-    const entry = await cache.allocate('p', '/x', {
-      path: '/tmp/x',
-      stat: { size: 5 },
-    });
+    const entry = await cache.allocate({ path: '/tmp/x', stat: { size: 5 } });
     assert.equal(entry.kind, 'disk');
-  });
-});
-
-describe('FilesystemCache: allocate / free', () => {
-  it('fallback: false returns null instead of a disk entry', async () => {
-    const cache = make();
-    const entry = await cache.allocate('p', '/big', input(3 * KB), {
-      fallback: false,
-    });
-    assert.equal(entry, null);
-    assert.equal(cache.entry('p', '/big'), null);
   });
 
   it('refuses sizes above one segment even with maxFileSize: Infinity', async () => {
     const cache = make();
-    const entry = await cache.allocate('p', '/x', input(5 * KB), {
+    const entry = await cache.allocate(input(5 * KB), {
       fallback: false,
       maxFileSize: Infinity,
     });
@@ -159,24 +141,38 @@ describe('FilesystemCache: allocate / free', () => {
 
   it('respects the pool limit', async () => {
     const cache = make({ limit: 4 * KB });
-    await cache.allocate('p', '/a', input(2 * KB));
-    await cache.allocate('p', '/b', input(2 * KB));
-    const c = await cache.allocate('p', '/c', input(1 * KB));
+    await cache.allocate(input(2 * KB));
+    await cache.allocate(input(2 * KB));
+    const c = await cache.allocate(input(1 * KB));
     assert.equal(c.kind, 'disk');
+  });
+});
+
+describe('FilesystemCache: put / remove / free', () => {
+  it('put and remove return the entry they replace', async () => {
+    const cache = make();
+    const a = await publish(cache, 'p', '/a', input(10));
+    const b = await cache.allocate(input(20));
+    assert.equal(cache.put('p', '/a', b), a);
+    assert.equal(cache.remove('p', '/a'), b);
+    assert.equal(cache.remove('p', '/a'), null);
+    assert.equal(cache.remove('nope', '/a'), null);
+    cache.free({ kind: 'disk' });
+    cache.free(null);
   });
 
   it('free() reuses extents best-fit and merges neighbours', async () => {
     const cache = make();
-    const a = await cache.allocate('p', '/a', input(500));
-    const b = await cache.allocate('p', '/b', input(300));
-    const c = await cache.allocate('p', '/c', input(200));
+    const a = await cache.allocate(input(500));
+    const b = await cache.allocate(input(300));
+    const c = await cache.allocate(input(200));
     cache.free(a);
     cache.free(c);
     assert.deepEqual(cache.registry.free.get(1), [
       { offset: 0, length: 500 },
       { offset: 800, length: 200 },
     ]);
-    const d = await cache.allocate('p', '/d', input(200));
+    const d = await cache.allocate(input(200));
     assert.equal(d.offset, 800);
     cache.free(b);
     assert.deepEqual(cache.registry.free.get(1), [{ offset: 0, length: 800 }]);
@@ -184,57 +180,43 @@ describe('FilesystemCache: allocate / free', () => {
 
   it('fully freed segments are kept for reuse, never released', async () => {
     const cache = make();
-    const a = await cache.allocate('p', '/a', input(100));
-    cache.remove('p', '/a');
+    const a = await cache.allocate(input(100));
     cache.free(a);
     assert.ok(cache.pool.emptySegmentIds.has(1));
     assert.equal(cache.pool.segments.size, 1);
-    const b = await cache.allocate('p', '/b', input(100));
+    const b = await cache.allocate(input(100));
     assert.equal(b.segmentId, 1);
     assert.equal(cache.pool.segments.size, 1);
-  });
-
-  it('remove() returns the entry and free() ignores non-shared ones', async () => {
-    const cache = make();
-    await cache.allocate('p', '/a', input(10));
-    const removed = cache.remove('p', '/a');
-    assert.equal(removed.kind, 'shared');
-    assert.equal(cache.remove('p', '/a'), null);
-    cache.free({ kind: 'disk' });
-    cache.free(null);
   });
 });
 
 describe('FilesystemCache: compact', () => {
   // seg 1: /a + /b fill it exactly; seg 2: /c alone.
   const fill = async (cache, sizes = [2 * KB, 2 * KB, 200]) => {
-    const a = await cache.allocate('p', '/a', input(sizes[0]));
-    const b = await cache.allocate('p', '/b', input(sizes[1]));
-    const c = await cache.allocate('q', '/c', input(sizes[2], 'c'));
+    const a = await publish(cache, 'p', '/a', input(sizes[0]));
+    const b = await publish(cache, 'p', '/b', input(sizes[1]));
+    const c = await publish(cache, 'q', '/c', input(sizes[2], 'c'));
     assert.equal(b.segmentId, 1);
     assert.equal(c.segmentId, 2);
     return { a, b, c };
   };
 
-  it('moves entries of the emptiest segment into others and reports them', async () => {
+  it('plans the move of the emptiest segment without touching the index', async () => {
     const cache = make({ maxFileSize: 4 * KB });
     const { a, c } = await fill(cache);
     cache.remove('p', '/a');
     cache.free(a);
-    const result = cache.compact(0.5);
-    assert.ok(result);
-    assert.equal(result.updates.length, 1);
-    const [{ name, key, entry }] = result.updates;
+    const moves = cache.compact(0.5);
+    assert.equal(moves.length, 1);
+    const [{ name, key, entry }] = moves;
     assert.equal(name, 'q');
     assert.equal(key, '/c');
     assert.equal(entry.segmentId, 1);
     assert.equal(entry.offset, 0);
     assert.equal(bytes(cache, entry).toString(), 'c'.repeat(200));
-    assert.deepEqual(result.oldEntries, [c]);
-    assert.equal(cache.entry('q', '/c'), entry);
-    assert.ok(cache.indexes.get('q').segmentIds.has(1));
-    assert.ok(!cache.indexes.get('q').segmentIds.has(2));
-    assert.equal(result.newSegments[0].id, 1);
+    assert.equal(cache.entry('q', '/c'), c, 'the caller publishes the move');
+    assert.ok(cache.registry.closed.has(2));
+    assert.equal(cache.put('q', '/c', entry), c);
   });
 
   it('threshold 0 disables; nothing to do returns null', async () => {
@@ -264,16 +246,18 @@ describe('FilesystemCache: compact', () => {
     assert.equal(cache.registry.closed.size, 0);
   });
 
-  it('the emptied segment stays closed until ACK-pending bytes are freed', async () => {
+  it('the emptied segment stays closed until retired bytes are freed', async () => {
     const cache = make({ maxFileSize: 4 * KB });
     const { a, c } = await fill(cache);
     // /d shares seg 2 with /c, then gets replaced: its bytes wait for an ACK.
-    const d = await cache.allocate('q', '/d', input(300, 'd'));
+    const d = await publish(cache, 'q', '/d', input(300, 'd'));
     cache.remove('q', '/d');
     cache.remove('p', '/a');
     cache.free(a);
-    const result = cache.compact(0.5);
-    assert.equal(result.updates[0].entry.segmentId, 1);
+    const moves = cache.compact(0.5);
+    assert.equal(moves.length, 1, 'only published entries move');
+    assert.equal(moves[0].entry.segmentId, 1);
+    cache.put('q', '/c', moves[0].entry);
     assert.ok(cache.registry.closed.has(2), 'seg 2 closed, not recycled');
     assert.equal(
       bytes(cache, d).toString(),
@@ -281,7 +265,7 @@ describe('FilesystemCache: compact', () => {
       'old bytes intact',
     );
     // New allocations must not land in the closed segment.
-    const e = await cache.allocate('p', '/e', input(100));
+    const e = await cache.allocate(input(100));
     assert.notEqual(e.segmentId, 2);
     cache.free(c);
     assert.ok(cache.registry.closed.has(2), 'still holds /d');
@@ -289,13 +273,28 @@ describe('FilesystemCache: compact', () => {
     assert.ok(!cache.registry.closed.has(2));
     assert.ok(cache.pool.emptySegmentIds.has(2), 'now reusable');
   });
+
+  it('publishing into a closed segment reopens it', async () => {
+    const cache = make({ maxFileSize: 4 * KB });
+    const { a } = await fill(cache);
+    // A publication in progress holds an extent in seg 2.
+    const pending = await cache.allocate(input(100, 'p'));
+    assert.equal(pending.segmentId, 2);
+    cache.remove('p', '/a');
+    cache.free(a);
+    const moves = cache.compact(0.5);
+    for (const move of moves) cache.put(move.name, move.key, move.entry);
+    assert.ok(cache.registry.closed.has(2));
+    cache.put('p', '/pending', pending);
+    assert.ok(!cache.registry.closed.has(2), 'a live entry keeps it open');
+  });
 });
 
 describe('FilesystemCache: snapshot / projection', () => {
   it('snapshot is keyed by place and projects zero-copy views', async () => {
     const cache = make();
-    await cache.load('p', files({ '/a': 10 }));
-    await cache.load('q', files({ '/b': 0 }));
+    await publish(cache, 'p', '/a', input(10));
+    await publish(cache, 'q', '/b', input(0));
     const snap = cache.snapshot();
     assert.deepEqual(Object.keys(snap.places), ['p', 'q']);
     assert.equal(snap.segments.length, 1);
@@ -321,7 +320,7 @@ describe('FilesystemCache: snapshot / projection', () => {
 
   it('stats() summarises segments', async () => {
     const cache = make();
-    await cache.load('p', files({ '/a': 1024 }));
+    await cache.allocate(input(1024));
     const s = cache.stats();
     assert.equal(s.segmentCount, 1);
     assert.equal(s.totalUsed, 4 * KB);

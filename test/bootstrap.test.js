@@ -54,9 +54,10 @@ describe('bootstrap: --import shared-memory-fs/register', () => {
     assert.equal(r.code, 0, r.stderr);
   });
 
-  // With strict: true appRoot is the sandbox boundary, so the entry point and
-  // its package metadata live outside it — here the sandbox root holds only
-  // place directories and the entry is one level up.
+  // With strict: true appRoot is the routing boundary, so the entry point and
+  // its package metadata live outside it — here the strict root
+  // (fixtures/sandbox) holds only place directories and the entry is one
+  // level up.
   it('strict: entry point outside appRoot runs; unmanaged paths are denied', () => {
     const r = runIn(
       path.join(FIXTURES, 'sandbox'),

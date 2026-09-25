@@ -118,6 +118,7 @@ describe('VfsConfig: domains', () => {
       zeroCopy: false,
       compress: null,
       script: null,
+      fallback: 'disk',
     });
     assert.equal(p.require, null);
     assert.equal(p.import, null);

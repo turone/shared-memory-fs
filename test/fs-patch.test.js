@@ -8,6 +8,9 @@ const path = require('node:path');
 const fsPatch = require('../lib/adapters/fs-patch.js');
 const { tmpDir, writeTree, rm, kernel, drain } = require('./helpers.js');
 
+// The disk as it is, behind the patch: captured before any install.
+const { existsSync: onDisk } = fs;
+
 // fs-patch executes router decisions; these tests exercise node:fs itself
 // while the patch is installed. Suites install/uninstall around themselves.
 
@@ -58,6 +61,35 @@ describe('fs-patch: reads over sab and memory places', () => {
       '<h1>x</h1>',
     );
     assert.equal(fs.readFileSync(Buffer.from(file), 'utf8'), '<h1>x</h1>');
+  });
+
+  it('an aborted signal stops an async read or write; *Sync forms take none', async () => {
+    const file = at('mem', 'signal.txt');
+    fs.writeFileSync(file, 'one');
+    const signal = AbortSignal.abort();
+    for (const run of [
+      () => fs.promises.writeFile(file, 'two', { signal }),
+      () => fs.promises.appendFile(file, '!', { signal }),
+      () => fs.promises.readFile(file, { signal }),
+      () => fs.promises.readFile(at('pub', 'index.html'), { signal }),
+      () =>
+        new Promise((resolve, reject) => {
+          fs.writeFile(file, 'two', { signal }, (err) =>
+            err ? reject(err) : resolve(),
+          );
+        }),
+    ]) {
+      await assert.rejects(run(), (err) => {
+        assert.equal(err.name, 'AbortError');
+        assert.equal(err.code, 'ABORT_ERR');
+        assert.equal(err.cause, signal.reason);
+        return true;
+      });
+    }
+    assert.equal(fs.readFileSync(file, 'utf8'), 'one', 'nothing written');
+    fs.writeFileSync(file, 'two', { signal });
+    assert.equal(fs.readFileSync(file, { encoding: 'utf8', signal }), 'two');
+    fs.unlinkSync(file);
   });
 
   it('passthrough: outside places, disk-backed entries, excluded ext (non-strict)', () => {
@@ -120,13 +152,17 @@ describe('fs-patch: reads over sab and memory places', () => {
   });
 
   it('readdir: sync, callback, promises, options, ENOTDIR', async () => {
+    // hidden.bin is outside fs.ext: listed as disk territory by the
+    // non-strict default `fs.fallback: 'disk'`.
     assert.deepEqual(fs.readdirSync(at('pub')), [
       'big.txt',
+      'hidden.bin',
       'index.html',
       'sub',
     ]);
     assert.deepEqual(fs.readdirSync(at('pub'), { recursive: true }), [
       'big.txt',
+      'hidden.bin',
       'index.html',
       'sub',
       'sub/a.txt',
@@ -136,6 +172,7 @@ describe('fs-patch: reads over sab and memory places', () => {
       dirents.map((d) => [d.name, d.isDirectory()]),
       [
         ['big.txt', false],
+        ['hidden.bin', false],
         ['index.html', false],
         ['sub', true],
       ],
@@ -153,17 +190,19 @@ describe('fs-patch: reads over sab and memory places', () => {
     assert.throws(() => fs.readFileSync(at('pub', 'sub')), { code: 'EISDIR' });
   });
 
-  it('createReadStream: zero-copy chunks honour place setting; errors are emitted', async () => {
+  it('createReadStream: owned chunks even in a zeroCopy place; errors are emitted', async () => {
     const stream = fs.createReadStream(at('pub', 'sub', 'a.txt'), { start: 1 });
     const data = await drain(stream);
     assert.equal(data.toString(), 'aa');
     const chunks = [];
     for await (const c of fs.createReadStream(at('pub', 'index.html')))
       chunks.push(c);
-    assert.ok(
-      chunks[0].buffer instanceof SharedArrayBuffer,
-      'pub has zeroCopy: true',
-    );
+    // node:fs callers never release a lease: they always get copies.
+    assert.ok(!(chunks[0].buffer instanceof SharedArrayBuffer));
+    const text = [];
+    for await (const s of fs.createReadStream(at('pub', 'index.html'), 'utf8'))
+      text.push(s);
+    assert.equal(text.join(''), '<h1>x</h1>', 'string options are encoding');
     const bad = fs.createReadStream(at('pub', 'sub'));
     await assert.rejects(drain(bad), { code: 'EISDIR' });
     const passthrough = await drain(fs.createReadStream(at('other', 'o.txt')));
@@ -255,7 +294,7 @@ describe('fs-patch: reads over sab and memory places', () => {
   });
 });
 
-describe('fs-patch: strict sandbox', () => {
+describe('fs-patch: strict routing', () => {
   let root;
   let k;
   const at = (...p) => path.join(root, ...p);
@@ -271,6 +310,10 @@ describe('fs-patch: strict sandbox', () => {
       'stray/sub/deep.txt': 'deep',
       'nd/n.txt': 'n',
       'root-level.txt': 'root level file',
+      '..private/secret.txt': 'secret',
+      '..cache/c.txt': 'c',
+      '...data/d.txt': 'd',
+      'pub/..private/p.txt': 'inside pub',
     });
     k = await kernel(
       root,
@@ -319,10 +362,11 @@ describe('fs-patch: strict sandbox', () => {
     assert.equal(fs.readFileSync(at('pub', 'big.txt')).length, 70 * 1024);
   });
 
-  // Regression: these APIs are not implemented by the patch, so before the
-  // guard they reached libuv directly and read, listed or modified denied
-  // paths behind the sandbox's back.
-  it('unimplemented path APIs cannot bypass the sandbox', async () => {
+  // Regression: before the guards these APIs reached libuv directly and
+  // read, listed or modified denied paths behind the routing's back. Each now
+  // refuses a denied path — opendir is implemented, the others are guarded
+  // or refuse managed sources.
+  it('path APIs the places do not serve cannot bypass strict routing', async () => {
     const secret = at('lib', 'util.js');
     const outside = path.join(os.tmpdir(), 'vfs-leak-probe.txt');
     assert.throws(() => fs.copyFileSync(secret, outside), { code: 'EACCES' });
@@ -402,7 +446,7 @@ describe('fs-patch: strict sandbox', () => {
     assert.equal(fs.existsSync(at('stray', 's.txt')), false);
   });
 
-  // appRoot is the sandbox boundary: an unmanaged entry under it is denied at
+  // appRoot is the routing boundary: an unmanaged entry under it is denied at
   // every depth, whether it is a file or a directory. Previously only depth
   // >= 2 was routed, so an unmanaged first-level directory stayed listable and
   // `cp -r` copied its whole subtree out.
@@ -466,7 +510,7 @@ describe('fs-patch: strict sandbox', () => {
       assert.throws(() => fs.rmSync(at('stray'), { recursive: true }), {
         code: 'EACCES',
       });
-      assert.ok(fs.existsSync(path.join(root, 'stray', 's.txt')) || true);
+      assert.ok(onDisk(path.join(root, 'stray', 's.txt')), 'nothing removed');
     });
 
     it('unmanaged root-level file', () => {
@@ -491,7 +535,7 @@ describe('fs-patch: strict sandbox', () => {
       });
     });
 
-    it('watch and watchFile cannot probe denied paths', () => {
+    it('watch and watchFile cannot probe denied paths', async () => {
       assert.throws(() => fs.watch(at('stray'), () => {}), { code: 'EACCES' });
       assert.throws(() => fs.watch(at('pub', 'missing.txt'), () => {}), {
         code: 'EACCES',
@@ -499,7 +543,47 @@ describe('fs-patch: strict sandbox', () => {
       assert.throws(() => fs.watchFile(at('stray', 's.txt'), () => {}), {
         code: 'EACCES',
       });
-      assert.throws(() => fs.promises.watch(at('stray')), { code: 'EACCES' });
+      // As in node:fs, fs.promises.watch reports errors when iterated.
+      await assert.rejects(fs.promises.watch(at('stray')).next(), {
+        code: 'EACCES',
+      });
+    });
+
+    // Regression: `..private` is a name, not a parent path. It used to be
+    // taken for a path outside appRoot and passed through to the disk.
+    it('dot-prefixed names under appRoot are unmanaged, not outside', async () => {
+      const secret = at('..private', 'secret.txt');
+      assert.throws(() => fs.readFileSync(secret), { code: 'EACCES' });
+      await assert.rejects(fs.promises.readFile(secret), { code: 'EACCES' });
+      assert.equal(fs.existsSync(secret), false);
+      assert.throws(() => fs.writeFileSync(at('..private', 'w.txt'), 'x'), {
+        code: 'EACCES',
+      });
+      assert.throws(() => fs.readdirSync(at('..private')), { code: 'EACCES' });
+      assert.throws(() => fs.opendirSync(at('..private')), { code: 'EACCES' });
+      const dest = outside();
+      assert.throws(() => fs.copyFileSync(secret, dest), { code: 'EACCES' });
+      assert.equal(fs.existsSync(dest), false);
+      assert.throws(() => fs.readFileSync(at('..cache', 'c.txt')), {
+        code: 'EACCES',
+      });
+      assert.throws(() => fs.readFileSync(at('...data', 'd.txt')), {
+        code: 'EACCES',
+      });
+    });
+
+    it('a dot-prefixed directory inside a place belongs to that place', () => {
+      assert.equal(
+        fs.readFileSync(at('pub', '..private', 'p.txt'), 'utf8'),
+        'inside pub',
+      );
+      assert.deepEqual(fs.readdirSync(at('pub', '..private')), ['p.txt']);
+      assert.throws(
+        () => fs.writeFileSync(at('pub', '..private', 'w.txt'), ''),
+        {
+          code: 'EROFS',
+        },
+      );
     });
 
     it('paths outside appRoot keep ordinary Node semantics', async () => {

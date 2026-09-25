@@ -5,9 +5,9 @@
 // Demonstrates:
 //   1. Each tenant has its own writable in-memory namespace.
 //   2. strict mode rejects any path under appRoot that no place owns.
-//   3. Real cross-tenant isolation requires worker_threads (one place per
-//      worker) — same-process places are accessible to anyone holding the
-//      kernel; this example keeps everything on the main thread to stay short.
+//   3. Strict is a routing policy, not isolation: same-process places are
+//      accessible to anyone holding the kernel, and worker threads share
+//      the process. Untrusted tenants need OS-level boundaries.
 //
 // Run:
 //   node examples/multi-tenant/run.js
@@ -70,7 +70,7 @@ module.exports = function probe() {
   require(path.join(APP_ROOT, 'tenant-a', 'index.js'))();
   require(path.join(APP_ROOT, 'tenant-b', 'index.js'))();
 
-  console.log('-- 2. strict: appRoot is the sandbox boundary --');
+  console.log('-- 2. strict: appRoot is the routing boundary --');
   for (const stray of [
     path.join(APP_ROOT, 'private', 'config.local.json'),
     path.join(APP_ROOT, 'README.md'),
@@ -92,8 +92,8 @@ module.exports = function probe() {
   }
 
   console.log(
-    '\nNote: real cross-tenant isolation needs worker_threads. ' +
-      'Each worker should construct a kernel with only its own place attached.',
+    '\nNote: strict is a routing policy, not isolation of untrusted code; ' +
+      'untrusted tenants need OS-level boundaries.',
   );
 
   fsPatch.uninstall();

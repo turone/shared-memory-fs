@@ -16,7 +16,9 @@ if (!kernel || kernel.state !== 'ready') {
   process.exit(1);
 }
 
-const text = fs.readFileSync(path.join(process.cwd(), 'static', 'hello.txt'), 'utf8').trim();
+const text = fs
+  .readFileSync(path.join(process.cwd(), 'static', 'hello.txt'), 'utf8')
+  .trim();
 const viaFacade = kernel.fs('static').readFile('/hello.txt', 'utf8').trim();
 
 // A worker attaches to the shared segments and reads the same bytes.
@@ -30,4 +32,6 @@ const fromWorker = await new Promise((resolve, reject) => {
   worker.once('error', reject);
 });
 
-console.log(`OK esm read=${text} facade=${viaFacade} greet=${greet('vfs')} cjs=${cjs.answer} worker=${fromWorker}`);
+console.log(
+  `OK esm read=${text} facade=${viaFacade} greet=${greet('vfs')} cjs=${cjs.answer} worker=${fromWorker}`,
+);

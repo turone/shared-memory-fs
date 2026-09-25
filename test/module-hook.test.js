@@ -251,6 +251,18 @@ describe('module-hook: strict', () => {
     assert.throws(() => require(path.join(root, 'stray', 'x.js')), {
       code: 'MODULE_NOT_FOUND',
     });
+    // `..private` is a name under appRoot, not a parent path: unmanaged.
+    writeTree(root, {
+      '..private/leak.js': 'module.exports = "leak";',
+      '..private/leak.mjs': 'export default "leak";',
+    });
+    assert.throws(() => require(path.join(root, '..private', 'leak.js')), {
+      code: 'MODULE_NOT_FOUND',
+    });
+    await assert.rejects(
+      import(pathToFileURL(path.join(root, '..private', 'leak.mjs')).href),
+      { code: 'ERR_MODULE_NOT_FOUND' },
+    );
     moduleHook.uninstall();
     // Without strict the same late file loads from disk through Node.
     const k2 = await kernel(root, { lib: { require: true } });
@@ -261,6 +273,144 @@ describe('module-hook: strict', () => {
     k.close();
     k2.close();
     rm(root);
+  });
+});
+
+describe('module-hook: dot-prefixed directories inside a place', () => {
+  it('belong to the place for require and import', async () => {
+    const root = writeTree(tmpDir('modhook-dots'), {
+      'lib/..private/cjs.js': 'module.exports = "inside";',
+      'lib/..private/esm.mjs': 'export default "inside-esm";',
+    });
+    const k = await kernel(
+      root,
+      { lib: { require: { ext: ['js'] }, import: { ext: ['mjs'] } } },
+      { strict: true },
+    );
+    moduleHook.install(k);
+    try {
+      assert.equal(
+        require(path.join(root, 'lib', '..private', 'cjs.js')),
+        'inside',
+      );
+      const mod = await import(
+        pathToFileURL(path.join(root, 'lib', '..private', 'esm.mjs')).href
+      );
+      assert.equal(mod.default, 'inside-esm');
+    } finally {
+      moduleHook.uninstall();
+      k.close();
+      rm(root);
+    }
+  });
+});
+
+describe('module-hook: a specifier that names a directory', () => {
+  // Memory modules: Node's own resolver finds none of them on disk, so
+  // every answer below is the hook's.
+  it('resolves as a directory only, as Node does, on every platform', async () => {
+    const root = tmpDir('modhook-dirs');
+    const k = await kernel(root, {
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true },
+        require: true,
+        import: { ext: ['mjs'] },
+      },
+    });
+    const mem = k.fs('mem');
+    mem.writeFile('/pick.js', "module.exports = 'pick.js';");
+    mem.writeFile('/pick/index.js', "module.exports = 'pick/index.js';");
+    mem.writeFile(
+      '/pick/probe.js',
+      "module.exports = [require('.'), require('./'), require('../pick/')," +
+        " require('../pick')];",
+    );
+    mem.writeFile('/x.js', "module.exports = 'x.js';");
+    mem.writeFile('/x.mjs', "export default 'x.mjs';");
+    mem.writeFile(
+      '/probe.mjs',
+      "export default await import('./x.mjs/').then(() => 'x.mjs', " +
+        '(err) => err.code);',
+    );
+    const at = (...p) => path.join(root, 'mem', ...p);
+    moduleHook.install(k);
+    try {
+      assert.equal(require(at('pick') + '/'), 'pick/index.js');
+      assert.equal(require(at('pick')), 'pick.js');
+      assert.deepEqual(require(at('pick', 'probe.js')), [
+        'pick/index.js',
+        'pick/index.js',
+        'pick/index.js',
+        'pick.js',
+      ]);
+      assert.throws(() => require(at('x.js') + '/'), {
+        code: 'MODULE_NOT_FOUND',
+      });
+      const url = pathToFileURL(at('x.mjs')).href;
+      await assert.rejects(import(url + '/'), { code: 'ERR_MODULE_NOT_FOUND' });
+      const probe = await import(pathToFileURL(at('probe.mjs')).href);
+      assert.equal(probe.default, 'ERR_MODULE_NOT_FOUND');
+      assert.equal((await import(url)).default, 'x.mjs');
+    } finally {
+      moduleHook.uninstall();
+      k.close();
+      rm(root);
+    }
+  });
+});
+
+describe('module-hook: relative specifiers, as Node reads them', () => {
+  // Memory modules again: only the hook can find them.
+  it('require takes ..name and, on Windows, .\\name; import neither', async () => {
+    const root = tmpDir('modhook-relative');
+    const k = await kernel(root, {
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true },
+        require: true,
+        import: { ext: ['mjs'] },
+      },
+    });
+    const mem = k.fs('mem');
+    mem.writeFile('/lib/x.js', "module.exports = 'x.js';");
+    mem.writeFile('/lib/..private.js', "module.exports = '..private.js';");
+    mem.writeFile('/lib/.hidden.js', "module.exports = '.hidden.js';");
+    mem.writeFile('/lib/x.mjs', "export default 'x.mjs';");
+    mem.writeFile('/lib/..private.mjs', "export default '..private.mjs';");
+    mem.writeFile(
+      '/lib/probe.js',
+      'const t = (s) => { try { return require(s); } catch (err) ' +
+        '{ return err.code; } };' +
+        "module.exports = [t('.\\\\x.js'), t('..private'), t('.hidden')];",
+    );
+    mem.writeFile(
+      '/lib/probe.mjs',
+      'const t = async (s) => { try { return (await import(s)).default; } ' +
+        'catch (err) { return err.code; } };' +
+        "export default [await t('.\\\\x.mjs'), await t('..private.mjs')];",
+    );
+    const at = (...p) => path.join(root, 'mem', 'lib', ...p);
+    moduleHook.install(k);
+    try {
+      const win = process.platform === 'win32';
+      assert.deepEqual(require(at('probe.js')), [
+        win ? 'x.js' : 'MODULE_NOT_FOUND',
+        '..private.js',
+        'MODULE_NOT_FOUND',
+      ]);
+      const esm = await import(pathToFileURL(at('probe.mjs')).href);
+      assert.deepEqual(esm.default, [
+        'ERR_INVALID_MODULE_SPECIFIER',
+        'ERR_INVALID_MODULE_SPECIFIER',
+      ]);
+    } finally {
+      moduleHook.uninstall();
+      k.close();
+      rm(root);
+    }
   });
 });
 

@@ -63,15 +63,66 @@ const until = async (predicate, ms = 3000, step = 25) => {
   return predicate();
 };
 
+// A worker stand-in on a real link(), in this thread: records every message
+// the main kernel posts and, unless `ack: false`, ACKs each vfs-update like
+// an attached worker that reads nothing. `id` is its link id on main.
+const tap = (k, { ack = true } = {}) => {
+  const { vfs } = k.link();
+  const id = [...k.links.keys()].at(-1);
+  const messages = [];
+  vfs.port.on('message', (msg) => {
+    messages.push(msg);
+    if (ack && msg.name === 'vfs-update') {
+      vfs.port.postMessage({ name: 'vfs-ack', updateId: msg.updateId });
+    }
+  });
+  vfs.port.unref();
+  const updates = () => messages.filter((m) => m.name === 'vfs-update');
+  return { id, port: vfs.port, messages, updates };
+};
+
+// A worker kernel attached to a real link(), in this thread: it projects the
+// snapshot, applies deltas and ACKs them through the port exactly like
+// attach(), without spawning a thread.
+const worker = (k, options = {}) => {
+  const { vfs } = k.link();
+  const id = [...k.links.keys()].at(-1);
+  const w = VfsKernel.fromSnapshot(vfs.snapshot, new VfsConfig(vfs.config), {
+    appRoot: vfs.appRoot,
+    console: quiet,
+    port: vfs.port,
+    ...options,
+  });
+  return { id, kernel: w, port: vfs.port, main: k.links.get(id) };
+};
+
+// Resolves with the next `event` of `emitter`, after every listener
+// registered before this call (the kernel's own come first). The kernel
+// unrefs its link ports, and Node 22 ends an event loop that has nothing
+// else to run before a port event arrives: a timer holds it meanwhile.
+const nextEvent = (emitter, event) =>
+  new Promise((resolve) => {
+    const hold = setInterval(() => {}, 2 ** 30);
+    emitter.once(event, (value) => {
+      clearInterval(hold);
+      resolve(value);
+    });
+  });
+
+const nextMessage = (port) => nextEvent(port, 'message');
+
 module.exports = {
   quiet,
   tmpDir,
   writeTree,
   rm,
-  sleep,
   config,
   kernel,
   drain,
   until,
+  tap,
+  worker,
+  nextEvent,
+  nextMessage,
   SMALL_MEMORY,
 };

@@ -10,6 +10,14 @@
   },
   "rules": {
     "eqeqeq": ["error", "always", { "null": "ignore" }],
-    "class-methods-use-this": "off"
-  }
+    "class-methods-use-this": "off",
+    "import/no-unresolved": [
+      "error",
+      { "commonjs": true, "ignore": ["^shared-memory-fs(/|$)"] }
+    ]
+  },
+  "overrides": [
+    { "files": ["*.cjs"], "parserOptions": { "sourceType": "script" } },
+    { "files": ["*.mjs"], "parserOptions": { "sourceType": "module" } }
+  ]
 }

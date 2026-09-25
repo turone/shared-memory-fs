@@ -9,8 +9,8 @@ const { tmpDir, rm, kernel } = require('./helpers.js');
 
 // Bytecode flavors: fs.script.compile (bare vm.Script, PlaceFs.script()) and
 // require.compile (Module.wrap flavor, consumed by the _compile hook) are
-// two independent companions of the same canonical source. See
-// /memories/repo/script-domain-handoff.md §"Bytecode flavors".
+// two independent companions of the same canonical source
+// (doc/architecture.md, "Preparation").
 
 const wrap = {
   id: (raw, file) => ({
@@ -34,7 +34,12 @@ describe('bytecode flavors: coexistence', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
         },
       },
       {},
@@ -74,7 +79,12 @@ describe('bytecode flavors: coexistence', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
           require: { compile: true },
         },
       },
@@ -159,7 +169,12 @@ describe('bytecode flavors: failure and rollback', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
           require: { compile: true },
         },
       },
@@ -191,7 +206,12 @@ describe('bytecode flavors: failure and rollback', () => {
       {
         v: {
           origin: 'virtual',
-          fs: { writable: true, script: { prepare: 'id', compile: true } },
+          fs: {
+            writable: true,
+            ext: ['js', 'cjs'],
+            prepare: 'id',
+            script: { compile: true },
+          },
         },
       },
       {},
@@ -220,5 +240,47 @@ describe('bytecode flavors: failure and rollback', () => {
     assert.equal(v.readFile('/h.js', 'utf8'), '(x => x * 2)');
     k.close();
     rm(root);
+  });
+
+  it('map: a fs.script.compile failure keeps the previous version too', async () => {
+    const root = tmpDir('bc-script-fail-map');
+    let broken = false;
+    const k = await kernel(
+      root,
+      {
+        m: {
+          provider: 'map',
+          origin: 'virtual',
+          fs: {
+            writable: true,
+            ext: ['js'],
+            prepare: 'id',
+            script: { compile: true },
+          },
+        },
+      },
+      {},
+      {
+        preparers: {
+          id: (raw) =>
+            broken ? '{ not valid js (((' : `(${raw.toString().trim()})`,
+        },
+      },
+    );
+    try {
+      const m = k.fs('m');
+      m.writeFile('/h.js', 'x => x');
+      const before = m.script('/h.js');
+      broken = true;
+      assert.throws(() => m.writeFile('/h.js', 'y => y'));
+      assert.equal(m.readFile('/h.js', 'utf8'), '(x => x)', 'previous version');
+      assert.deepEqual(m.script('/h.js').cachedData, before.cachedData);
+      broken = false;
+      m.writeFile('/h.js', 'x => x * 2');
+      assert.equal(m.readFile('/h.js', 'utf8'), '(x => x * 2)');
+    } finally {
+      k.close();
+      rm(root);
+    }
   });
 });
