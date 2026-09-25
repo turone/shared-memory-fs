@@ -3,6 +3,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const fsPatch = require('../lib/adapters/fs-patch.js');
 const { tmpDir, writeTree, rm, kernel, worker } = require('./helpers.js');
@@ -33,6 +34,19 @@ const outcome = async (fn) => {
     return 'ok';
   } catch (err) {
     return err;
+  }
+};
+
+// The error node:fs gives `rm` of a directory without `recursive`.
+const nativeRmError = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vfs-rm-'));
+  try {
+    fs.rmSync(dir);
+    return null;
+  } catch (err) {
+    return err;
+  } finally {
+    fs.rmSync(dir, { recursive: true });
   }
 };
 
@@ -240,6 +254,22 @@ describe('virtual hierarchy', () => {
           assert.equal(place.exists(`${dir}/new`), false, label);
           const err = await outcome(() => place.unlink(`${dir}/d`));
           refused(err, 'EISDIR', 'unlink', at(name, `${dir}/d`), undefined);
+          // rm of a directory without recursive: node:fs's own SystemError.
+          const native = nativeRmError();
+          const rmErr = await outcome(() =>
+            place.rm(`${dir}/d`, { force: true }),
+          );
+          const where = at(name, `${dir}/d`);
+          for (const field of ['name', 'code', 'errno', 'syscall']) {
+            assert.equal(rmErr[field], native[field], `${label}: ${field}`);
+          }
+          assert.equal(rmErr.path, where);
+          assert.deepEqual(rmErr.info, { ...native.info, path: where });
+          assert.equal(
+            rmErr.message,
+            native.message.replace(native.path, where),
+            label,
+          );
           assert.deepEqual(keysOf(k, name), keys, `${label}: nothing changed`);
         }
         // A file on its way already refuses a directory under it.

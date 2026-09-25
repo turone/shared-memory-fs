@@ -406,10 +406,10 @@ describe('PlaceFs: memory mutations', () => {
     assert.throws(() => mem.unlink('/u.js'), { code: 'ENOENT' });
   });
 
-  it('rm: file, recursive tree, force, non-empty', () => {
+  it('rm: file, recursive tree, force, a directory without recursive', () => {
     mem.writeFile('/t/a.txt', 'a');
     mem.writeFile('/t/b/c.txt', 'c');
-    assert.throws(() => mem.rm('/t'), { code: 'ENOTEMPTY' });
+    assert.throws(() => mem.rm('/t'), { code: 'ERR_FS_EISDIR' });
     assert.throws(() => mem.rm('/nope'), { code: 'ENOENT' });
     mem.rm('/nope', { force: true });
     mem.rm('/t/a.txt');
@@ -422,7 +422,7 @@ describe('PlaceFs: memory mutations', () => {
     mem.writeFile('/combo/a.txt', 'a');
     mem.writeFile('/combo/b/c.txt', 'c');
     assert.throws(() => mem.rm('/combo', { force: true }), {
-      code: 'ENOTEMPTY',
+      code: 'ERR_FS_EISDIR',
     });
     assert.throws(() => mem.rm('/combo-missing', { recursive: true }), {
       code: 'ENOENT',
