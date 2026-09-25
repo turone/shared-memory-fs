@@ -42,8 +42,10 @@ non-strict routing, and both fallbacks.
   `appRoot` without strict: native levels outside, place listings inside.
 - Recursive `rm` / `rmdir` of a tree that holds places: every descendant
   through its own place's mutation policy.
-- A directory renamed into or out of a place: every descendant through the
-  routing of both ends.
+- A directory renamed across a place's boundary: every descendant through
+  the routing of both ends. A directory renamed in a virtual place: its
+  entries moved in one publication. (A place's root stays where the config
+  puts it.)
 - `rename` of a tree that holds places: likely refused for good — moving
   `appRoot` under a running kernel has no consistent meaning; decide first.
 

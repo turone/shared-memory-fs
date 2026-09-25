@@ -392,8 +392,9 @@ raw bytes and miss virtual entries.
   of a place directory; a recursive `cp` of or into managed territory; a
   hard link into or out of a place; `watch` of managed territory; recursive
   walks (`readdir`, `opendir`, `watch`, `rm`, `rmdir`) and `rename` of a
-  tree that holds places; a directory renamed into or out of a place;
-  guarded mutations in a virtual place. A hidden source is `EACCES`.
+  tree that holds places; a directory renamed across a place's boundary (a
+  place's root included) or in a virtual place; guarded mutations in a
+  virtual place. A hidden source is `EACCES`.
 - _Native passthrough outside managed territory_: unrelated paths outside
   `appRoot`, `disk` / `node-default` places, disk-territory files,
   unmanaged paths without strict; and the guarded APIs (`chmod`, `chown`,
@@ -461,10 +462,12 @@ place's watcher. A copy gives the same bytes without sharing the file.
 routing and the source the read routing: a hidden source is `EACCES`. A
 published disk-origin file may leave `appRoot` or change its extension; the
 watchers then drop the old canonical entry and publish the new key by the
-policy of its place and extension. A directory never enters or leaves a
-place (`FsRouter.rename`: `crossing`).** In a virtual place the store moves
-an ordinary entry atomically and keeps its mtime — the preparer of a new
-extension runs once — and refuses a prepared one (`ENOTSUP`); across a
+policy of its place and extension. A directory moves natively only within
+one disk-origin place; across a place's boundary, as a place's root, or as
+a tree that holds places it is `ENOTSUP` (`FsRouter.rename`: `crossing`,
+`unsupported`).** In a virtual place the store moves an ordinary entry
+atomically and keeps its mtime — the preparer of a new extension runs
+once — and refuses a prepared one and a directory (`ENOTSUP`); across a
 virtual boundary a rename is `EXDEV`. _Why:_ the raw file is a disk-origin
 place's source of truth: moving it hands on exactly what its publication
 consumes, and each end republishes it by its own rules — the extension
@@ -473,9 +476,12 @@ a rename a bypass was a hidden source: with write access to a disk-origin
 place, a rename carried a file strict routing hides out of `appRoot`, or
 gave it an extension its place serves from disk. A published source was
 readable before it moved; strict routing decides which paths are served, and
-a preparer is a publication step, not an access boundary. A directory
-would change the policy of all its descendants at once, hidden files
-included, with nothing routed. A prepared virtual entry has no raw input,
+a preparer is a publication step, not an access boundary. Within one
+disk-origin place a directory keeps its policy, and the watcher republishes
+its tree; across a boundary it would change the policy of all its
+descendants at once, hidden files included, with nothing routed. A virtual
+place's directories are implicit: its store moves entries, one publication
+each, not trees. A prepared virtual entry has no raw input,
 and its bundle may embed the old key (`scriptOptions.filename`, `meta`,
 bytecode). A copy and a delete across places would not be atomic, and a
 virtual place is a filesystem of its own.
