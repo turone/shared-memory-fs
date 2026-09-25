@@ -15,6 +15,7 @@ const {
   quiet,
   until,
   tap,
+  nextEvent,
 } = require('./helpers.js');
 
 describe('VfsKernel: lifecycle', () => {
@@ -336,7 +337,7 @@ describe('VfsKernel: snapshot, workers, ACK', () => {
     await v.unlink('/a');
     assert.equal(k.retired.size, 1, '/a waits for the ACK');
     const port = k.links.get(w.id);
-    const closed = new Promise((resolve) => port.once('close', resolve));
+    const closed = nextEvent(port, 'close');
     w.port.close();
     await closed;
     assert.equal(k.cache.entry('v', '/c').segmentId, 1, '/c was relocated');

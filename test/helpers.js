@@ -96,10 +96,20 @@ const worker = (k, options = {}) => {
   return { id, kernel: w, port: vfs.port, main: k.links.get(id) };
 };
 
-// Resolves once `port` has delivered its next message to every listener
-// registered before this call (the kernel's own come first).
-const nextMessage = (port) =>
-  new Promise((resolve) => port.once('message', resolve));
+// Resolves with the next `event` of `emitter`, after every listener
+// registered before this call (the kernel's own come first). The kernel
+// unrefs its link ports, and Node 22 ends an event loop that has nothing
+// else to run before a port event arrives: a timer holds it meanwhile.
+const nextEvent = (emitter, event) =>
+  new Promise((resolve) => {
+    const hold = setInterval(() => {}, 2 ** 30);
+    emitter.once(event, (value) => {
+      clearInterval(hold);
+      resolve(value);
+    });
+  });
+
+const nextMessage = (port) => nextEvent(port, 'message');
 
 module.exports = {
   quiet,
@@ -112,6 +122,7 @@ module.exports = {
   until,
   tap,
   worker,
+  nextEvent,
   nextMessage,
   SMALL_MEMORY,
 };

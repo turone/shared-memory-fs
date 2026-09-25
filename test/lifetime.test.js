@@ -13,6 +13,7 @@ const {
   drain,
   tap,
   worker,
+  nextEvent,
   nextMessage,
 } = require('./helpers.js');
 
@@ -335,7 +336,7 @@ describe('lifetime: worker exit', () => {
     await v.writeFile('/a.txt', 'B'.repeat(64));
     await acked;
     assert.deepEqual(k.retirements()[0].holders, [w.id]);
-    const closed = once(w.main, 'close');
+    const closed = nextEvent(w.main, 'close');
     w.port.close();
     await closed;
     assert.equal(k.retired.size, 0, 'no leak');
@@ -374,7 +375,7 @@ describe('lifetime: worker exit', () => {
     const [record] = k.retirements();
     assert.deepEqual(record.holders, [id]);
     assert.equal(record.waiting, 'release');
-    const closed = once(port, 'close');
+    const closed = nextEvent(port, 'close');
     await thread.terminate();
     await closed;
     assert.equal(k.retired.size, 0);
