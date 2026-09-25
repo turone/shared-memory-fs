@@ -15,7 +15,7 @@ Expected output:
 -- 1. each tenant runs and reads its own file --
   [A] own data.txt: tenant-a secret
   [B] own data.txt: tenant-b secret
--- 2. strict: appRoot is the sandbox boundary --
+-- 2. strict: appRoot is the routing boundary --
   read config.local.json -> EACCES
   read README.md -> EACCES
 -- 3. paths OUTSIDE appRoot are unaffected by strict --
@@ -33,8 +33,9 @@ Expected output:
   `node-default` / `disk` place.
 - **Strict does NOT firewall same-process places from each other.** In one
   process, tenant-A's code calling `fs.readFileSync('/.../tenant-b/x')` will
-  succeed — both mounts belong to the kernel. For real cross-tenant isolation
-  spawn each tenant in its own worker_thread and pass only that tenant's
-  place via `kernel.link()`.
+  succeed — both mounts belong to the kernel. Strict is a routing policy,
+  not isolation of untrusted code: worker threads share the process, and a
+  linked worker receives the whole config and snapshot. Isolating untrusted
+  tenants needs OS-level boundaries (separate processes, containers).
 - **Paths outside `appRoot` pass through unchanged**, so workers can still
   hit `/tmp`, system libraries, etc.

@@ -13,8 +13,10 @@ curl http://localhost:3000/
 
 The place reads `pub/index.html`, `pub/style.css`, `pub/app.js` from disk into
 SAB segments at startup. After that, every HTTP request is served zero-copy
-from the SAB: the place has `fs: { zeroCopy: true }` and the handler passes
-`readFileView()` straight to `res.end()`.
+from the SAB: the place has `fs: { zeroCopy: true }`, the handler takes a
+lease with `readFileView()`, passes `lease.view` to `res.end()` and
+releases the lease once the response has finished or the client is gone —
+the socket may still be writing the view after `res.end()` returns.
 
 ## Build a single-executable application (sea provider)
 
@@ -46,4 +48,4 @@ at init. The HTTP handler is unchanged.
 - `fs.ext` (`html, css, js, svg, json`) keeps the `pub/` mount to those
   files; unpublished paths stay off the place.
 - SEA assets are copied into SAB once at boot, then served zero-copy via
-  `place.readFileView()` (`fs.zeroCopy: true`).
+  `place.readFileView()` leases (`fs.zeroCopy: true`).

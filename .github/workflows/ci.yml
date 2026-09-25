@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, VFS, virtual-and-prepared]
+    branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
   test:
