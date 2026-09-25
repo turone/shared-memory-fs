@@ -361,6 +361,59 @@ describe('module-hook: a specifier that names a directory', () => {
   });
 });
 
+describe('module-hook: relative specifiers, as Node reads them', () => {
+  // Memory modules again: only the hook can find them.
+  it('require takes ..name and, on Windows, .\\name; import neither', async () => {
+    const root = tmpDir('modhook-relative');
+    const k = await kernel(root, {
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true },
+        require: true,
+        import: { ext: ['mjs'] },
+      },
+    });
+    const mem = k.fs('mem');
+    mem.writeFile('/lib/x.js', "module.exports = 'x.js';");
+    mem.writeFile('/lib/..private.js', "module.exports = '..private.js';");
+    mem.writeFile('/lib/.hidden.js', "module.exports = '.hidden.js';");
+    mem.writeFile('/lib/x.mjs', "export default 'x.mjs';");
+    mem.writeFile('/lib/..private.mjs', "export default '..private.mjs';");
+    mem.writeFile(
+      '/lib/probe.js',
+      'const t = (s) => { try { return require(s); } catch (err) ' +
+        '{ return err.code; } };' +
+        "module.exports = [t('.\\\\x.js'), t('..private'), t('.hidden')];",
+    );
+    mem.writeFile(
+      '/lib/probe.mjs',
+      'const t = async (s) => { try { return (await import(s)).default; } ' +
+        'catch (err) { return err.code; } };' +
+        "export default [await t('.\\\\x.mjs'), await t('..private.mjs')];",
+    );
+    const at = (...p) => path.join(root, 'mem', 'lib', ...p);
+    moduleHook.install(k);
+    try {
+      const win = process.platform === 'win32';
+      assert.deepEqual(require(at('probe.js')), [
+        win ? 'x.js' : 'MODULE_NOT_FOUND',
+        '..private.js',
+        'MODULE_NOT_FOUND',
+      ]);
+      const esm = await import(pathToFileURL(at('probe.mjs')).href);
+      assert.deepEqual(esm.default, [
+        'ERR_INVALID_MODULE_SPECIFIER',
+        'ERR_INVALID_MODULE_SPECIFIER',
+      ]);
+    } finally {
+      moduleHook.uninstall();
+      k.close();
+      rm(root);
+    }
+  });
+});
+
 describe('module-hook: ESM', () => {
   let root;
   let k;
