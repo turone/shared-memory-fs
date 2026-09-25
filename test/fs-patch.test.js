@@ -63,6 +63,35 @@ describe('fs-patch: reads over sab and memory places', () => {
     assert.equal(fs.readFileSync(Buffer.from(file), 'utf8'), '<h1>x</h1>');
   });
 
+  it('an aborted signal stops an async read or write; *Sync forms take none', async () => {
+    const file = at('mem', 'signal.txt');
+    fs.writeFileSync(file, 'one');
+    const signal = AbortSignal.abort();
+    for (const run of [
+      () => fs.promises.writeFile(file, 'two', { signal }),
+      () => fs.promises.appendFile(file, '!', { signal }),
+      () => fs.promises.readFile(file, { signal }),
+      () => fs.promises.readFile(at('pub', 'index.html'), { signal }),
+      () =>
+        new Promise((resolve, reject) => {
+          fs.writeFile(file, 'two', { signal }, (err) =>
+            err ? reject(err) : resolve(),
+          );
+        }),
+    ]) {
+      await assert.rejects(run(), (err) => {
+        assert.equal(err.name, 'AbortError');
+        assert.equal(err.code, 'ABORT_ERR');
+        assert.equal(err.cause, signal.reason);
+        return true;
+      });
+    }
+    assert.equal(fs.readFileSync(file, 'utf8'), 'one', 'nothing written');
+    fs.writeFileSync(file, 'two', { signal });
+    assert.equal(fs.readFileSync(file, { encoding: 'utf8', signal }), 'two');
+    fs.unlinkSync(file);
+  });
+
   it('passthrough: outside places, disk-backed entries, excluded ext (non-strict)', () => {
     assert.equal(
       fs.readFileSync(at('other', 'o.txt'), 'utf8'),
