@@ -305,6 +305,62 @@ describe('module-hook: dot-prefixed directories inside a place', () => {
   });
 });
 
+describe('module-hook: a specifier that names a directory', () => {
+  // Memory modules: Node's own resolver finds none of them on disk, so
+  // every answer below is the hook's.
+  it('resolves as a directory only, as Node does, on every platform', async () => {
+    const root = tmpDir('modhook-dirs');
+    const k = await kernel(root, {
+      mem: {
+        provider: 'map',
+        origin: 'virtual',
+        fs: { writable: true },
+        require: true,
+        import: { ext: ['mjs'] },
+      },
+    });
+    const mem = k.fs('mem');
+    mem.writeFile('/pick.js', "module.exports = 'pick.js';");
+    mem.writeFile('/pick/index.js', "module.exports = 'pick/index.js';");
+    mem.writeFile(
+      '/pick/probe.js',
+      "module.exports = [require('.'), require('./'), require('../pick/')," +
+        " require('../pick')];",
+    );
+    mem.writeFile('/x.js', "module.exports = 'x.js';");
+    mem.writeFile('/x.mjs', "export default 'x.mjs';");
+    mem.writeFile(
+      '/probe.mjs',
+      "export default await import('./x.mjs/').then(() => 'x.mjs', " +
+        '(err) => err.code);',
+    );
+    const at = (...p) => path.join(root, 'mem', ...p);
+    moduleHook.install(k);
+    try {
+      assert.equal(require(at('pick') + '/'), 'pick/index.js');
+      assert.equal(require(at('pick')), 'pick.js');
+      assert.deepEqual(require(at('pick', 'probe.js')), [
+        'pick/index.js',
+        'pick/index.js',
+        'pick/index.js',
+        'pick.js',
+      ]);
+      assert.throws(() => require(at('x.js') + '/'), {
+        code: 'MODULE_NOT_FOUND',
+      });
+      const url = pathToFileURL(at('x.mjs')).href;
+      await assert.rejects(import(url + '/'), { code: 'ERR_MODULE_NOT_FOUND' });
+      const probe = await import(pathToFileURL(at('probe.mjs')).href);
+      assert.equal(probe.default, 'ERR_MODULE_NOT_FOUND');
+      assert.equal((await import(url)).default, 'x.mjs');
+    } finally {
+      moduleHook.uninstall();
+      k.close();
+      rm(root);
+    }
+  });
+});
+
 describe('module-hook: ESM', () => {
   let root;
   let k;

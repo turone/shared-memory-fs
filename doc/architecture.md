@@ -367,6 +367,14 @@ ignored.** _Why:_ the VFS answers the same on every platform, and a path
 that names a directory never reaches a file. Checked in the mutation's
 own turn, a directory-form `rm` never takes a file written meanwhile.
 
+**A module specifier that names a directory — a trailing `/`, `.`, `..` —
+resolves as one only, as Node's resolver does: `require` skips
+LOAD_AS_FILE, `import` finds no module; `resolveModule` never takes a path
+ending in a separator for a published file.** _Why:_ `require('./lib/')`
+must load `lib/index.js`, never a sibling `lib.js`; Node's ESM resolver on
+Windows would hand the hooks `x.mjs/` as a file, which the VFS refuses as
+on POSIX.
+
 **Strict mode is a routing policy, not isolation.** _Why:_ code can reach
 the OS by other means (native addons, child processes, its own hooks) and
 worker threads share one process; isolating untrusted code needs OS-level
