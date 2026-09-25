@@ -416,6 +416,64 @@ describe('PlaceFs: memory mutations', () => {
   });
 });
 
+// A rename is not a write: like a rename on disk it keeps the mtime, and the
+// moved entry keeps its companions.
+describe('PlaceFs: a virtual rename keeps the metadata', () => {
+  const PLACES = {
+    'sab + virtual': {
+      provider: 'sab',
+      origin: 'virtual',
+      fs: { writable: true, compress: { encodings: ['gzip'], ext: ['js'] } },
+      require: true,
+    },
+    'map + virtual': {
+      provider: 'map',
+      origin: 'virtual',
+      fs: { writable: true },
+      require: true,
+    },
+  };
+
+  for (const [name, config] of Object.entries(PLACES)) {
+    it(name, async () => {
+      const root = tmpDir('placefs-rename');
+      const k = await kernel(root, { v: config });
+      const v = k.fs('v');
+      const at = (key) => path.join(root, 'v', key);
+      const realNow = Date.now;
+      try {
+        const start = realNow();
+        await v.writeFile('/a.js', 'module.exports = 1;');
+        const written = v.stat('/a.js');
+        assert.ok(written.mtimeMs >= start && written.mtimeMs <= realNow());
+        // However late the rename, the entry keeps the time of its write.
+        Date.now = () => realNow() + 60_000;
+        try {
+          await v.rename('/a.js', '/b.js');
+        } finally {
+          Date.now = realNow;
+        }
+        const moved = v.stat('/b.js');
+        assert.equal(moved.mtimeMs, written.mtimeMs);
+        assert.equal(moved.size, written.size);
+        assert.ok(moved.isFile());
+        assert.equal(v.readFile('/b.js', 'utf8'), 'module.exports = 1;');
+        assert.equal(v.stat('/a.js'), null);
+        assert.deepEqual(v.readdir('/'), ['b.js']);
+        assert.ok(k.bytecode(at('b.js')), 'the bytecode moved with it');
+        assert.equal(k.bytecode(at('a.js')), null);
+        if (config.fs.compress) {
+          assert.deepEqual(v.storedEncodings('/b.js'), ['raw', 'gzip']);
+          assert.deepEqual(v.storedEncodings('/a.js'), []);
+        }
+      } finally {
+        k.close();
+        rm(root);
+      }
+    });
+  }
+});
+
 describe('PlaceFs: writable sab place writes to disk', () => {
   it('writes through node:fs and reads back after the watcher epoch', async () => {
     const root = writeTree(tmpDir('placefs-sab-w'), { 'data/a.txt': 'a' });
