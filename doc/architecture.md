@@ -649,6 +649,8 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
   reused, never returned to the OS.
 - Source and companions of a file are published in one `vfs-update`.
 - Watcher epochs never overlap.
+- A closed kernel publishes nothing and arms no timer: a watcher event
+  whose `stat` lands after `close()` is dropped.
 - Companions never appear in `readdir`, `exists`, routing or the patched fs;
   `Place.companions(key)` enumerates them — never hand-roll key lists.
 - Kernel-internal disk I/O (kernel, scanner, watcher, disk territory in

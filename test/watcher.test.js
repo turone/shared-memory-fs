@@ -598,6 +598,24 @@ describe('DirWatcher.close', () => {
     assert.equal(watcher.queue.size, 0);
     rm(root);
   });
+
+  // An event's stat may land after close(): it must arm no debounce timer,
+  // which would publish a stale epoch and hold the process open.
+  it('an event whose stat lands after close queues nothing', async () => {
+    const { DirWatcher } = require('../lib/watcher.js');
+    const root = writeTree(tmpDir('watch-late'), { 'a.txt': 'a' });
+    const watcher = new DirWatcher({ timeout: 60000 });
+    const epochs = [];
+    watcher.on('epoch', (epoch) => epochs.push(epoch));
+    watcher.watch(root);
+    const late = watcher.post(path.join(root, 'a.txt'));
+    watcher.close();
+    await late;
+    assert.equal(watcher.timer, null);
+    assert.equal(watcher.queue.size, 0);
+    assert.deepEqual(epochs, []);
+    rm(root);
+  });
 });
 
 describe('readInto: stable source reads', () => {
