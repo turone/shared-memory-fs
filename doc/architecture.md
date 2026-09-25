@@ -61,7 +61,7 @@ SAB segments ──────────── one physical copy ────
 | `lib/compressor.js`             | `Compressor`: codec work only                                                                                                                             |
 | `lib/pins.js`                   | `Pins`: per-thread direct consumers of shared versions                                                                                                    |
 | `lib/serial-queue.js`           | `SerialQueue`: one task at a time, arrival order                                                                                                          |
-| `lib/place.js`                  | `Place`: projection, `visible()`, `cached()`, `scripted()`, `prepared()`, `preparerOf()`, `companions()`                                                  |
+| `lib/place.js`                  | `Place`: projection (`PlaceFiles`, with its directory index), `visible()`, `cached()`, `scripted()`, `prepared()`, `preparerOf()`, `companions()`         |
 | `lib/place-fs.js`               | `PlaceFs` facade, `VfsReadStream`, view leases, disk territory of `fs.fallback: 'disk'`                                                                   |
 | `lib/registry.js`               | `PlaceRegistry` (path → place, key) + `FsRouter` (read / mutate / copy / rename / link decisions)                                                         |
 | `lib/map-store.js`              | `MapStore`: the per-thread Map sink, atomic publish                                                                                                       |
@@ -105,6 +105,17 @@ before anything is read — e.g. `compress.retainRaw: false` on a virtual
 place (no raw file to serve) or `prepare` on a passthrough provider. Every
 resolved value is explicit (origin, `fs.fallback`), so a resolved config
 describes itself.
+
+**A place's projection indexes the directories its source keys imply
+(`PlaceFiles`: `Map<dir, Set<name>>`), kept by the projection's own `set`
+and `delete`.** A directory lookup costs the depth of its key, a listing
+the size of what it lists. _Why:_ directory lookups sit on hot paths —
+routing a directory or a miss, `stat`, `exists`, listings, the hierarchy
+check before every new key — and scanning every key made each linear in
+the size of the place (a third of a millisecond at 50 000 keys, against a
+tens of nanoseconds indexed). Kept inside the Map, the index follows every
+writer — kernel deltas, Map stores, worker snapshots — without one call
+site to forget; filling it costs about 0.3 µs per key.
 
 ## Storage
 
@@ -608,6 +619,8 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
 | Recompressing, re-preparing or moving part of a subtree                                                         | wasted work; no raw input; a tree split between two names         |
 | A hierarchy check against the published index only                                                              | two overlapping mutations would both pass                         |
 | Locking every ancestor of a created key                                                                         | serializes all writes of one directory                            |
+| Scanning every key for implicit directories                                                                     | linear in the size of the place, on hot paths                     |
+| Updating the directory index at each mutation site                                                              | one new call site could forget it                                 |
 | A native watcher for a published file                                                                           | raw disk events are not publications                              |
 | A full copy per stream, or of its unread rest                                                                   | the cost grows with the file; a pin gives the same stability      |
 | Atomics or a global lock per read; pinning a segment or every companion                                         | cross-thread cost on the hot path; holds unrelated bytes          |
@@ -658,6 +671,7 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
 - A virtual subtree moves in one publication or not at all.
 - A virtual path is a file or a directory, never both — also while
   mutations overlap.
+- A projection's directory index says what a scan of its keys would say.
 - Disk territory never leaves its place (`PlaceFs.#within`) and, under
   strict, never serves or lists a cached extension.
 

@@ -155,6 +155,8 @@ describe('PlaceFs: reads', () => {
     assert.equal(s.size, 200);
     assert.ok(s.isFile());
     assert.ok(pub.stat('/img').isDirectory());
+    // A directory takes the same key forms a file does.
+    assert.ok(pub.exists('img') && pub.stat('img/').isDirectory());
     assert.ok(pub.stat('/').isDirectory());
     assert.equal(pub.stat('/nope'), null);
     assert.equal(pub.stat('/app.js', { bigint: true }).size, 200n);

@@ -193,6 +193,44 @@ describe('watcher: stale delete event', () => {
   });
 });
 
+// A directory deleted on disk takes its whole subtree along — companions
+// included — and nothing that merely shares its prefix.
+describe('watcher: a deleted directory', () => {
+  it('unpublishes its subtree and nothing else', async () => {
+    const root = writeTree(tmpDir('watch-dir'), {
+      'site/d/a.css': 'a{}',
+      'site/d/sub/b.css': 'b{}',
+      'site/dx.css': 'x{}',
+      'site/other.css': 'o{}',
+    });
+    const gzip = { encodings: ['gzip'], ext: ['css'] };
+    const k = await kernel(
+      root,
+      { site: { fs: { ext: ['css'], compress: gzip } } },
+      { watch: true, watchTimeout: 60000 },
+    );
+    try {
+      const site = k.fs('site');
+      const dir = path.join(root, 'site', 'd');
+      rm(dir);
+      k.watcher.emit('epoch', new Map([[dir, 'delete']]));
+      await k.watchQueue.idle;
+      assert.equal(site.exists('/d'), false);
+      assert.deepEqual(site.readdir('/'), ['dx.css', 'other.css']);
+      const keys = [...k.cache.index('site').entries.keys()];
+      assert.deepEqual(
+        keys.filter((key) => key.startsWith('/d/')),
+        [],
+        'no source or companion left under /d',
+      );
+      assert.deepEqual(site.storedEncodings('/dx.css'), ['raw', 'gzip']);
+    } finally {
+      k.close();
+      rm(root);
+    }
+  });
+});
+
 // Epochs run strictly one at a time, in arrival order: a slow older epoch
 // never publishes over a newer one. Epochs are emitted by hand; a long
 // debounce keeps real fs.watch events out. The reader is gated after a
