@@ -78,6 +78,23 @@ const refusal = (err, code, syscall, from, to) => {
   assert.equal(err.dest, to);
 };
 
+// The SystemError node:fs threw (`native`), raised for other paths: `paths`
+// maps each path it names to the one `err` names instead.
+const sameSystemError = (err, native, paths) => {
+  const swap = (text) =>
+    Object.entries(paths).reduce((s, [a, b]) => s.split(a).join(b), text);
+  for (const field of ['name', 'code', 'errno', 'syscall', 'dest']) {
+    assert.equal(err[field], native[field], `${field}: ${err.message}`);
+  }
+  assert.equal(err.path, swap(native.path));
+  assert.deepEqual(err.info, {
+    ...native.info,
+    path: swap(native.info.path),
+    message: swap(native.info.message),
+  });
+  assert.equal(err.message, swap(native.message));
+};
+
 // Each form of each copy: resolves 'ok' or the error it failed with.
 const COPIES = {
   copyFileSync: (from, to) => fs.copyFileSync(from, to),
@@ -360,10 +377,14 @@ describe('single-file copies hand the raw input to the destination', () => {
     fs.cpSync(from, native, { force: false });
     assert.equal(k.fs('vmp').readFile('/o.txt', 'utf8'), 'virtual');
     assert.equal(readDisk(native, 'utf8'), 'virtual');
-    const exists = await outcome(() =>
-      fs.promises.cp(from, store, { force: false, errorOnExist: true }),
+    // errorOnExist: node:fs's own SystemError, named by the destination.
+    const onExist = { force: false, errorOnExist: true };
+    const exists = await outcome(() => fs.promises.cp(from, store, onExist));
+    const nativeExists = await outcome(() =>
+      fs.promises.cp(from, native, onExist),
     );
-    refusal(exists, 'ERR_FS_CP_EEXIST', 'cp', from, store);
+    assert.equal(nativeExists.code, 'ERR_FS_CP_EEXIST');
+    sameSystemError(exists, nativeExists, { [native]: store });
     // A clone that may fall back to a copy is a copy.
     fs.copyFileSync(from, store, COPYFILE_FICLONE);
     assert.equal(k.fs('vmp').readFile('/o.txt', 'utf8'), 'new');
@@ -376,6 +397,72 @@ describe('single-file copies hand the raw input to the destination', () => {
       assert.equal(err.code, 'ENOTSUP', detail);
       assert.match(err.message, new RegExp(detail));
     }
+  });
+
+  it('cp never puts a file on a directory, as node:fs', async () => {
+    const from = external('f');
+    const dir = fresh('dir');
+    fs.mkdirSync(dir);
+    const native = await outcome(() => fs.promises.cp(from, dir));
+    assert.equal(native.code, 'ERR_FS_CP_NON_DIR_TO_DIR');
+    await k.fs('vs').writeFile('/src.txt', 'src');
+    k.fs('vmp').writeFile('/dir/in.txt', 'in');
+    const store = at('vmp', 'dir');
+    // Onto a virtual directory, and from a virtual source onto a disk one,
+    // whatever `force` says. cpSync, native or not, has the same code.
+    for (const [src, dest] of [
+      [from, store],
+      [at('vs', 'src.txt'), dir],
+    ]) {
+      for (const options of [
+        {},
+        { force: false },
+        { force: false, errorOnExist: true },
+      ]) {
+        const viaCallback = await outcome(
+          () =>
+            new Promise((resolve, reject) => {
+              fs.cp(src, dest, options, (err) =>
+                err ? reject(err) : resolve(),
+              );
+            }),
+        );
+        const viaPromise = await outcome(() =>
+          fs.promises.cp(src, dest, options),
+        );
+        for (const err of [viaCallback, viaPromise]) {
+          sameSystemError(err, native, { [from]: src, [dir]: dest });
+        }
+        const viaSync = await outcome(() => fs.cpSync(src, dest, options));
+        assert.equal(viaSync.code, 'ERR_FS_CP_NON_DIR_TO_DIR');
+      }
+    }
+    assert.deepEqual(fs.readdirSync(dir), [], 'nothing written on disk');
+    assert.deepEqual(k.fs('vmp').readdir('/dir'), ['in.txt']);
+    // copyFile onto a directory is EISDIR, EEXIST with COPYFILE_EXCL —
+    // unless the destination is named as one, which takes no file.
+    refusal(
+      await outcome(() => fs.copyFileSync(from, store)),
+      'EISDIR',
+      'copyfile',
+      from,
+      store,
+    );
+    refusal(
+      await outcome(() => fs.copyFileSync(from, store, COPYFILE_EXCL)),
+      'EEXIST',
+      'copyfile',
+      from,
+      store,
+    );
+    const named = store + path.sep;
+    refusal(
+      await outcome(() => fs.copyFileSync(from, named, COPYFILE_EXCL)),
+      'EISDIR',
+      'copyfile',
+      from,
+      named,
+    );
   });
 
   it('compression: a companion is never copied as content', async () => {
