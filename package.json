@@ -34,8 +34,8 @@
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
     "test:examples": "node --test \"test-examples/examples-smoke.test.js\"",
-    "lint": "eslint . && prettier -c \"**/*.js\" \"**/*.json\" \"**/*.md\"",
-    "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\""
+    "lint": "eslint . && prettier -c .",
+    "fix": "eslint . --fix && prettier --write ."
   },
   "engines": {
     "node": ">=22.22.3 <23 || >=24.12.0 <25 || >=26"
