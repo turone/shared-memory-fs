@@ -20,8 +20,10 @@ const {
 // policy of its own place and extension. A hidden source stays EACCES: no
 // new name makes it readable. In a virtual place a rename moves an ordinary
 // entry, whose canonical bytes are its raw input, and refuses a prepared one
-// (ENOTSUP); across a virtual boundary it is EXDEV. A directory that would
-// enter or leave a place is ENOTSUP.
+// (ENOTSUP); across a virtual boundary it is EXDEV. A directory moves only
+// within one disk-origin place: across a place's boundary, as a place's
+// root, or in a virtual place, whose directories are implicit, it is
+// ENOTSUP.
 
 const calls = { upper: 0, wrap: 0, mark: 0 };
 const PREPARERS = {
@@ -300,7 +302,7 @@ describe('rename routes its source and its destination', () => {
     }
   });
 
-  it('a directory never enters or leaves a place', async () => {
+  it('a directory moves only within one disk-origin place', async () => {
     const unrelated = path.join(base, 'outside', 'dir');
     for (const [from, to] of [
       [at('wd', 'pages'), fresh('pages')],
@@ -311,6 +313,22 @@ describe('rename routes its source and its destination', () => {
     ]) {
       await refusedEverywhere(from, to, 'ENOTSUP');
       assert.ok(onDisk(from), 'the source stays');
+    }
+    // A virtual place has implicit directories: its entries move, not trees.
+    await k.fs('vs').writeFile('/tree/t.txt', 't');
+    k.fs('vm').writeFile('/tree/t.txt', 't');
+    for (const [name, forms] of [
+      ['vs', ASYNC],
+      ['vm', RENAMES],
+    ]) {
+      await refusedEverywhere(
+        at(name, 'tree'),
+        at(name, 'moved'),
+        'ENOTSUP',
+        forms,
+      );
+      assert.equal(k.fs(name).readFile('/tree/t.txt', 'utf8'), 't', name);
+      assert.equal(k.fs(name).exists('/moved'), false, name);
     }
     // Within its place, or outside any, a directory stays node:fs.
     fs.renameSync(at('wd', 'pages'), at('wd', 'docs'));
