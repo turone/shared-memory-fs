@@ -38,4 +38,6 @@ Expected output:
   linked worker receives the whole config and snapshot. Isolating untrusted
   tenants needs OS-level boundaries (separate processes, containers).
 - **Paths outside `appRoot` pass through unchanged**, so workers can still
-  hit `/tmp`, system libraries, etc.
+  hit `/tmp`, system libraries, etc. — except a recursive walk, copy or
+  removal, or a rename, of a directory above `appRoot`: it would enter the
+  places, so it is refused with `ENOTSUP`.

@@ -6,9 +6,10 @@ Future project work. Priority: **P1** — strict boundary or correctness,
 ## P2 — VFS-aware versions of the operations refused today
 
 **Problem.** For managed territory, native operations that walk a tree or
-reuse the raw disk file are recognized but unsupported (`ENOTSUP`), so an
-application cannot copy, link, watch, walk from above, remove or move
-managed content through `node:fs`.
+report raw disk events are recognized but unsupported (`ENOTSUP`), so an
+application cannot copy a tree, watch, walk from above, or remove or move a
+tree of managed content through `node:fs`. Single-file copies and renames
+are implemented: they hand on the raw input.
 
 **Cause.** A native operation checks only its top path. The rule in
 `doc/architecture.md` (Patched `node:fs`) refuses whatever the kernel cannot
@@ -18,28 +19,37 @@ route path by path.
 `ENOTSUP` only if it:
 
 - walks only through the filtered listing;
-- reads canonical VFS bytes, never the raw disk file;
-- writes through the destination's mutation policy;
-- supports virtual entries;
+- hands on each source's raw input (`FsRouter.copy`), never a prepared
+  result or a companion, and refuses a source without one;
+- writes through each destination's mutation policy, its preparer running
+  once;
+- supports virtual entries and directories;
 - leaves no raw disk bypass;
 - holds the strict boundary for every descendant;
+- follows a defined symlink policy;
 - cleans up atomically after a partial failure;
 
 and regression tests cover the sync, callback and promises forms, strict and
 non-strict routing, and both fallbacks.
 
-- `cp` / `copyFile` from a managed source, and a recursive `cp` into a tree
-  that holds places.
-- `link` from a managed source — or a decision that it stays refused, since
-  a hard link cannot carry canonical content.
-- `watch` of a managed directory and a recursive `watch`: report
-  publications or route-filtered events, never hidden names.
+- Recursive `cp` of or into managed territory, with `force`,
+  `errorOnExist` and `filter` per descendant.
+- `watch` of managed territory: publication-level events for disk and
+  virtual updates, never a hidden raw name; a defined outcome for a
+  preparation that fails; a recursive watch bounded by the filtered
+  listing; `AbortSignal`, `close()` and backpressure as in `node:fs`.
 - Recursive `readdir` / `opendir` / `watch` from above `appRoot`, or from
   `appRoot` without strict: native levels outside, place listings inside.
 - Recursive `rm` / `rmdir` of a tree that holds places: every descendant
   through its own place's mutation policy.
+- A directory renamed into or out of a place: every descendant through the
+  routing of both ends.
 - `rename` of a tree that holds places: likely refused for good — moving
   `appRoot` under a running kernel has no consistent meaning; decide first.
+
+Hard links into or out of a place stay refused by decision
+(`doc/architecture.md`): one physical file cannot carry two canonical
+contents.
 
 ## P2 — Symbolic links
 
@@ -74,9 +84,78 @@ document `/` as the contract, with a test pinning the choice on Windows.
 **Problem.** Memory savings and startup / per-request costs are stated as
 copy counts, not measured (`doc/alternatives.md`).
 
-**Done when.** A reproducible benchmark compares worker pools of several sizes
-against plain `node:fs` (memory, startup, request latency) and the docs cite
-its results.
+**Done when.** A reproducible benchmark compares worker pools of several
+sizes against plain `node:fs` and against a Buffer cache in every worker:
+memory, startup, throughput, p95 / p99 request latency, and the cost of an
+update and of compression. The docs cite its results.
+
+## P3 — One copy fewer for `Uint8Array` preparer results
+
+**Problem.** A `Uint8Array` a preparer returns is copied twice: into an
+owned canonical Buffer, then into its provisional SAB allocation.
+
+**Cause.** The first copy takes ownership — the caller may still change the
+array, and a view may cover part of an `ArrayBuffer` with a lifetime of
+its own; the second is the one publication path of strings, Buffers and
+arrays, which rollback, index-at-flush, `fs.script` compilation,
+companions and atomic publication rely on.
+
+**Done when.** A benchmark measures the publication of large `Uint8Array`
+results; only if it justifies it, they are written straight into the
+provisional allocation, with rollback and ownership guarantees kept and no
+regression for Buffer and string results.
+
+## P3 — Public diagnostics
+
+**Problem.** Only the internal `retirements()` shows what the kernel holds.
+Pool usage and fragmentation, bytes waiting to be freed, ACK age (a stuck
+worker), disk-fallback counts and preparation failures are not observable.
+
+**Cause.** A public `stats()` was deliberately left out of the lifetime
+work.
+
+**Done when.** A documented, read-only API reports these metrics, a test
+shows a stuck worker through it, and the API never frees or changes
+anything.
+
+## P3 — Preparation regression tests
+
+**Problem.** Two guarantees hold by construction but have no test: a new
+file in a new directory gets its prepared source and its bytecode in one
+`vfs-update`, and compaction keeps a prepared source and its companions
+together.
+
+**Done when.** Both are pinned in `test/prepare.test.js`, driven by manual
+watcher epochs and a forced compaction.
+
+## P3 — Diagnostics of `prepare` conflicts inside one domain
+
+**Problem.** When one domain's object form assigns an extension to several
+preparers, the config error names only the first two; across domains it
+names every declaration.
+
+**Done when.** The error lists every declaration of the extension, with a
+test for three or more.
+
+## P3 — `fs.fallback: 'disk'` on a place without `fs.ext`
+
+**Problem.** Without strict, a disk-origin place with no `fs.ext` resolves
+`fs.fallback` to `'disk'` (its permissive reads), yet the same value set
+explicitly is a config error ("needs a finite ext list"). A resolved config
+should be valid input.
+
+**Done when.** Either the explicit value is accepted with that meaning, or
+the default resolves to another value — decided, documented and tested.
+
+## P3 — glob and virtual entries
+
+**Problem.** glob captures the `node:fs` functions it walks with when it is
+loaded: loaded after the patch it walks the places (virtual entries show,
+filtered by route); loaded before, it walks the disk natively (they never
+show). Which one an application gets depends on load order.
+
+**Done when.** One behavior is chosen and documented — e.g. glob always
+lists through the places — with a test for both load orders.
 
 ## P3 — TypeScript declarations
 

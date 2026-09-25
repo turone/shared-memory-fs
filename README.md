@@ -313,6 +313,13 @@ Here `.js` goes through `api` once; that one prepared source is what
   extension in two domains — even with the same preparer — is a config
   error naming the place, the extension and every declaration. No domain
   priority, no merging.
+- **Providers.** `prepare` applies to `sab`, `map` and `sea` places;
+  `disk` and `node-default` places pass files through untouched, so
+  declaring it there is a config error, and so is combining it with
+  `compress.retainRaw: false` (reads would come from the raw disk file,
+  not the prepared content).
+  `fs.script.prepare` of earlier versions is gone: declare `prepare` in a
+  domain.
 - **Contract.** `prepare(raw: Buffer, file)` → `null` / `undefined`
   (publish raw) | `string` | `Uint8Array` |
   `{ source, scriptOptions?, meta? }`. `file` is frozen
@@ -331,12 +338,16 @@ Here `.js` goes through `api` once; that one prepared source is what
 - **All or nothing.** A preparer that throws, or a required
   `fs.script.compile` that fails, publishes nothing: the previous version
   and its companions stay.
-- **Mutations.** In a virtual place `appendFile` of a prepared key is
-  `ENOTSUP` (no raw input to append to), and so is moving one away
-  (`rename`: its bundle may embed the old key). Renaming an unprepared
-  file onto an extension with a preparer publishes it through that
-  preparer. In a disk-origin place mutations edit the raw file and the
-  watcher re-prepares it.
+- **Mutations and copies.** In a virtual place `appendFile`, `rename` and
+  copies of a prepared key are `ENOTSUP`: its raw input is not kept, and
+  its bundle may embed the old key. Renaming or copying an unprepared entry
+  onto an extension with a preparer publishes it through that preparer,
+  once. In a disk-origin place mutations edit the raw file and the watcher
+  re-prepares it; a copy or a rename hands on that raw file, never the
+  prepared content (see [Copies and renames](#copies-and-renames)).
+  `readFile` gives the prepared content: writing it elsewhere with
+  `writeFile` is a new publication the destination may prepare again, not
+  a raw-preserving copy.
 - **Threads.** The main kernel prepares everything shared (`sab`, `sea`).
   A worker's own `map` places prepare locally with
   `attach({ preparers })`; without the preparer such a write fails with
@@ -383,6 +394,10 @@ virtual place has no raw file to serve), and no `require.compile`,
 `fs.script` or `prepare`. `place.readFile()` and the patched `fs` then
 read the source from disk; `readFileView()` has no view of it.
 
+A compressed representation is never content of its own: a copy or a
+rename hands on the raw input — from disk with `retainRaw: false` — and
+the destination builds its own representations.
+
 Failures are per representation: a codec that does not fit is skipped
 with a warning; `storedEncodings()` reports what actually exists.
 
@@ -410,7 +425,7 @@ the patched `node:fs` replace the operating system's isolation.
 - `appRoot` itself is a **managed root**: `readdir(appRoot)` and
   `opendir(appRoot)` list the enabled places and nothing else, and
   `stat(appRoot)` is a directory. `watch` of it — as of any managed
-  directory — is `ENOTSUP` (recognized but unsupported); writes to it and
+  territory — is `ENOTSUP` (recognized but unsupported); writes to it and
   the other guarded calls on it (`rmdir`, `statfs`, `watchFile`, …) are
   `EACCES`.
 - A trusted entry point and `package.json` must live **outside
@@ -425,11 +440,12 @@ the patched `node:fs` replace the operating system's isolation.
   would enter `appRoot` from above: recursive listings, watches, copies and
   removals, and `rename`, of a directory above it. Scanner does not follow
   symlinks.
-- Listings (`readdir`, `opendir`) always come from the places; copies,
-  links and directory watches of what they serve are refused (see
-  [Patched `node:fs`](#patched-nodefs)). Guarded APIs still enforce the
-  routing decision, so a denied path cannot be probed via `glob`,
-  `readlink`, `statfs`, …
+- Listings (`readdir`, `opendir`) always come from the places. A copy or a
+  rename routes both of its paths and hands on the raw input, so a hidden
+  source stays `EACCES`; recursive copies, hard links and watches of
+  managed territory are refused (see [Patched `node:fs`](#patched-nodefs)).
+  Guarded APIs still enforce the routing decision, so a denied path cannot
+  be probed via `glob`, `readlink`, `statfs`, …
 - Same-process places are not firewalled from each other, and a linked
   worker receives the whole config and snapshot.
 
@@ -485,8 +501,12 @@ no stream or view in any thread still reads them — never on a timeout.
   chunks (`zeroCopy: true`) can still sit in a socket's write queue after
   the stream ends, so the stream itself holds the version until
   `release()` (idempotent, also `[Symbol.dispose]`; on a still-active
-  stream it stops it first). Per call, `{ zeroCopy: false }` asks for owned
-  chunks even in a `zeroCopy` place.
+  stream it stops it first). Borrowed chunks are views of shared memory,
+  like a lease view: never mutate them, never use them after `release()`;
+  `Buffer.from(chunk)` keeps the bytes. Without an option a stream follows
+  the place's `fs.zeroCopy`; per call, `{ zeroCopy: false }` asks for owned
+  chunks even in a `zeroCopy` place, and `{ zeroCopy: true }` in a place
+  without it is `ENOTSUP`.
 - Use `pipeline()`. It destroys the source when the destination fails;
   a manual `pipe()` does not — destroy the source yourself when the
   destination closes or aborts.
@@ -521,7 +541,7 @@ cloneable so workers rebuild from it.
 | ---------------------- | ------ | ---------- | ----------------------------------- |
 | `memory.limit`         | size   | `'1 gib'`  | Total SAB pool budget               |
 | `memory.segmentSize`   | size   | `'64 mib'` | SAB segment size                    |
-| `memory.maxFileSize`   | size   | `'10 mb'`  | Larger files become disk entries    |
+| `memory.maxFileSize`   | size   | `'10 mb'`  | Larger disk files stay on disk      |
 | `compaction.threshold` | number | `0.3`      | 0 = off; else compact below this    |
 | `hooks.fs`             | bool   | `true`     | Patch `node:fs`                     |
 | `hooks.module`         | bool   | `true`     | `module.registerHooks` + `_compile` |
@@ -531,6 +551,11 @@ cloneable so workers rebuild from it.
 
 Sizes accept `metautil.sizeToBytes` strings or numbers. Booleans must be
 booleans.
+
+`memory.maxFileSize` keeps large disk files out of the pool: they stay
+disk entries, read from disk. Content without a disk file of its own —
+prepared, virtual or SEA — cannot fall back to disk: if it does not fit,
+its publication is refused, and at startup `initialize()` fails.
 
 `watch` starts the kernel's own watcher: it republishes disk changes of
 the disk-origin cached places — `sab` + `disk` and `map` + `disk` alike;
@@ -599,15 +624,15 @@ States: `new → initializing → ready → closed` (final). `fs()`,
 `snapshot()`, `watch()`, `link()` require `ready`. `initialize()`
 failure closes the kernel.
 
-| Method               | Description                                                                            |
-| -------------------- | -------------------------------------------------------------------------------------- |
-| `await initialize()` | Scan / SEA / map through the publication pipeline: preparers, bytecode, compression    |
-| `fs(name)`           | `PlaceFs` for an indexed fs place                                                      |
-| `snapshot()`         | `{ segments, places }` — published entries only                                        |
-| `link()`             | `{ vfs, transferList }` for a worker — the only worker transport                       |
-| `watch()`            | Start `DirWatcher` (also auto if writable disk-origin)                                 |
-| `retirements()`      | Diagnostics: retired versions still held — representation, bytes, age, ACKs or holders |
-| `close()`            | Stop watcher and streams, reject queued mutations, drop projections, collectable SAB   |
+| Method               | Description                                                                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `await initialize()` | Scan / SEA / map through the publication pipeline: preparers, bytecode, compression                                                  |
+| `fs(name)`           | `PlaceFs` for an indexed fs place                                                                                                    |
+| `snapshot()`         | `{ segments, places }` — published entries only                                                                                      |
+| `link()`             | `{ vfs, transferList }` for a worker — the only worker transport                                                                     |
+| `watch()`            | Start `DirWatcher` (also auto if writable disk-origin)                                                                               |
+| `retirements()`      | Internal diagnostics (debugging, tests; not a stable API): retired versions still held — representation, bytes, age, ACKs or holders |
+| `close()`            | Stop watcher and streams, reject queued mutations, drop projections, collectable SAB                                                 |
 
 `link()` returns `{ vfs: { snapshot, config: raw, appRoot, port },
 transferList }`. The kernel posts every `vfs-update` to the port, reads
@@ -662,7 +687,8 @@ rejected).
 | `writeFile` / `appendFile` / `unlink`        | void \| Promise                                       | Sync for map/disk; Promise for `sab + virtual`                                        |
 | `mkdir` / `rm` / `rename`                    | void \| Promise                                       | `mkdir` is a no-op; prepared keys reject `appendFile` / moving away with `ENOTSUP`    |
 
-Cross-place `rename` through patched `fs` is `EXDEV`.
+Through patched `fs`, a `rename` across a virtual place's boundary is
+`EXDEV` (see [Copies and renames](#copies-and-renames)).
 
 ## Patched `node:fs`
 
@@ -675,22 +701,27 @@ touches has been routed:
 
 - a single-path operation runs after the routing of its source and
   destination allows it;
+- a copy or a rename hands on the source's raw input — the raw disk file
+  of a disk-origin place, prepared or not, or the canonical bytes of an
+  unprepared virtual entry — never a prepared result or a companion, and
+  the destination publishes it through its own pipeline;
 - a recursive or compound operation whose routing could check only its top
   path is refused;
-- the raw disk file of an entry the places serve (published, prepared,
-  virtual) is never copied or linked in place of its content;
 - a virtual destination is never changed by a native disk operation;
 - a recursive operation from outside `appRoot` is refused when its walk
   would enter `appRoot`;
 - unrelated paths outside `appRoot` stay native.
 
 Where the kernel cannot guarantee that, the operation fails with `ENOTSUP`
-before anything is read or written; it is not approximated.
+before anything is read or written; it is not approximated. Under strict
+routing every compound native operation stays within these limits; strict
+is a routing and access boundary, not an OS sandbox.
 
 **1. Implemented** — served by the places; sync, callback and promises
 forms: `readFile`, `stat`, `lstat`, `access`, `realpath`, `readdir`,
 `opendir`, `existsSync`, `createReadStream`, `writeFile`, `appendFile`,
-`unlink`, `mkdir`, `rm`, `rename`.
+`unlink`, `mkdir`, `rm`, `rename`, `copyFile` and a non-recursive `cp`
+(see [Copies and renames](#copies-and-renames)).
 
 `opendir` returns a `Dir` over exactly what `readdir` lists there (the
 strict `appRoot`, a place directory, the disk territory of
@@ -722,20 +753,26 @@ read or written:
 - `open` of a virtual entry: SAB and map entries have no file descriptor,
   so descriptor-based calls (`read`, `write`, `fstat`, …) never reach
   them.
-- `cp` / `copyFile` / `link` from a source the places serve — a published,
-  prepared or virtual entry, a place directory, the strict `appRoot` —
-  and, with `recursive`, from any disk territory: a native copy would take
-  raw disk bytes in place of the content and walk past the filtered
-  listings.
-- `watch` of a managed directory, recursive or not, and any recursive
-  `watch` of managed territory: a directory watcher reports every entry,
-  the ones a place hides included. A single managed file keeps a native
-  watcher. `fs.promises.watch` reports the refusal when iterated, as
-  `node:fs` reports its errors.
-- Recursive `readdir`, `opendir`, `watch`, `rm`, `rmdir` and `cp` (source
-  or destination), and `rename`, of a tree that holds places — `appRoot`
-  passed through without strict, or a directory above it: the walk would
-  enter the places natively. One level (`readdir(parent)`) stays native.
+- `cp` / `copyFile` / `rename` of a prepared virtual (or SEA) entry: there
+  is no raw input to hand on. A copy of a place directory, too.
+- A recursive `cp` whose source or destination is in a place, or that
+  encloses `appRoot`: a native walk reads and writes raw files past the
+  routing and misses virtual entries.
+- A hard link into or out of a place: one physical file under two names,
+  while a place gives each name its own canonical content, preparation and
+  companions — and a second name would escape the place's mutation policy.
+- `watch` of managed territory — a place directory, a published file, the
+  strict `appRoot`, any recursive watch of a place: a native watcher
+  reports raw disk events, hidden names included, not publications. A file
+  of the disk territory keeps a native watcher: it is its own content.
+  `fs.promises.watch` reports the refusal when iterated, as `node:fs`
+  reports its errors.
+- Recursive `readdir`, `opendir`, `watch`, `rm` and `rmdir`, and `rename`,
+  of a tree that holds places — `appRoot` passed through without strict,
+  or a directory above it: the walk would enter the places natively. One
+  level (`readdir(parent)`) stays native.
+- A directory renamed into or out of a place: every descendant would
+  change policy at once.
 - A guarded mutation (below) in a virtual place: only its store changes its
   entries.
 
@@ -753,31 +790,88 @@ read or written:
   its results are filtered instead — relative results against its `cwd`
   option.
 
+### Copies and renames
+
+`copyFile` and a non-recursive `cp` route the source as a read and the
+destination as a mutation, then hand the destination the source's **raw
+input** — what a publication consumes:
+
+| Source                                                   | Raw input                                       |
+| -------------------------------------------------------- | ----------------------------------------------- |
+| Disk-origin place: a published entry, prepared or not    | its raw disk file, never the prepared content   |
+| Disk territory, `disk` / `node-default` place, elsewhere | the file on disk                                |
+| Unprepared virtual (or SEA) entry                        | its canonical bytes — they are its raw input    |
+| Prepared virtual (or SEA) entry                          | none, it is not kept: `ENOTSUP`                 |
+| Hidden source (unpublished, unmanaged, `fallback: deny`) | `EACCES`, before anything is read               |
+| Compression or bytecode companion                        | never: derived from the content, rebuilt anyway |
+
+The destination publishes the bytes through its own pipeline — its
+preparer runs once, the source's never runs again:
+
+| Destination                | Result                                                         |
+| -------------------------- | -------------------------------------------------------------- |
+| Outside `appRoot`          | the raw bytes, as `node:fs` copies them                        |
+| Writable disk-origin place | the raw bytes on disk; its watcher prepares and publishes them |
+| Writable virtual place     | written through its store; no file appears on disk             |
+| Read-only place, denied    | `EROFS` / `EACCES`, nothing written                            |
+
+A `sab + virtual` place mutates asynchronously, so `copyFileSync` /
+`cpSync` into it are `ENOTSUP`. Options keep their `node:fs` meaning for
+one file (`COPYFILE_EXCL`, `COPYFILE_FICLONE`, `force`, `errorOnExist`,
+`dereference`); one the VFS cannot honor (`COPYFILE_FICLONE_FORCE`,
+`filter`, `preserveTimestamps`) is `ENOTSUP`, never ignored. A recursive
+`cp` of or into managed territory is `ENOTSUP`.
+
+A `rename` routes both paths as mutations and its source as a read:
+
+- On disk it moves the raw file. A published disk-origin file may leave
+  `appRoot` — it arrives as its raw source — or change its extension; the
+  watchers drop the old canonical entry and publish the new key by the
+  policy of its place and extension: its preparer, or the disk territory
+  for an extension the place does not cache. Disk-origin places share the
+  disk, so a file moves between them natively.
+- A hidden source is `EACCES`: no new name makes it readable.
+- A directory never enters or leaves a place (`ENOTSUP`); within its place,
+  or outside any, it moves natively.
+- In a virtual place the store moves an ordinary entry atomically and keeps
+  its mtime; the preparer of a new extension runs once. A prepared entry
+  has no raw input to move: `ENOTSUP`.
+- Across a virtual place's boundary it is `EXDEV` — never a copy and a
+  delete.
+
+`readFile` returns the canonical (prepared) content: writing it elsewhere
+with `writeFile` is a new publication the destination may prepare again,
+not a raw-preserving copy.
+
 ## Errors
 
-| Code      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EACCES`  | Strict routing denial: unowned path under `appRoot`, place with no fs domain, or an unpublished / excluded-ext entry in an indexed mount                                                                                                                                                                                                                                                                                |
-| `EROFS`   | Place has `fs.writable: false` (or provider `sea`)                                                                                                                                                                                                                                                                                                                                                                      |
-| `ENOTSUP` | No file descriptor for a virtual entry (`open`); `*View` without `fs.zeroCopy`; compressed API for an unconfigured encoding; `appendFile` / move of a prepared key; a write whose preparer is not registered in this thread; `cp` / `copyFile` / `link` from a source the places serve; `watch` of a managed directory; a recursive walk or `rename` of a tree that holds places; a guarded mutation in a virtual place |
-| `ENOENT`  | Missing key in a writable place; `readdir` of a missing directory                                                                                                                                                                                                                                                                                                                                                       |
-| `ENOTDIR` | `readdir` of a file                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `EXDEV`   | `rename` across places                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `EISDIR`  | `readFile` / `createReadStream` of an implicit directory                                                                                                                                                                                                                                                                                                                                                                |
+| Code      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EACCES`  | Strict routing denial: unowned path under `appRoot`, place with no fs domain, or an unpublished / excluded-ext entry in an indexed mount; any unpublished entry of a place with `fs.fallback: 'deny'`, strict or not; the hidden source of a copy, rename or link                                                                                                                                                                                                                                                                                                                                                                            |
+| `EROFS`   | Place has `fs.writable: false` (or provider `sea`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `ENOTSUP` | No file descriptor for a virtual entry (`open`); `*View` or a `{ zeroCopy: true }` stream without `fs.zeroCopy`; compressed API for an unconfigured encoding; `appendFile`, `rename` or a copy of a prepared virtual key; a write whose preparer is not registered in this thread; a `*Sync` mutation or copy into a `sab + virtual` place; a copy option the VFS cannot honor; a recursive `cp` of or into managed territory; a hard link into or out of a place; `watch` of managed territory; a recursive walk or `rename` of a tree that holds places; a directory renamed into or out of a place; a guarded mutation in a virtual place |
+| `ENOENT`  | Missing key in a writable place; `readdir` of a missing directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `ENOTDIR` | `readdir` of a file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `EXDEV`   | `rename` across a virtual place's boundary: between two places, or between one and the disk                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `EISDIR`  | `readFile` / `createReadStream` of an implicit directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 Errors carry the same `code`, `errno`, `syscall` and `path` fields as
-`node:fs`. A stream stopped by `kernel.close()` errors with
-`ERR_VFS_CLOSED`.
+`node:fs`, and `dest` for copies, links and renames. A stream stopped by
+`kernel.close()` errors with `ERR_VFS_CLOSED`.
 
 ## Protocol
 
 ```
 snapshot    { segments: [{ id, sab }], places: { <name>: { entries: [[key, entry]] } } }
-vfs-update  { name, updateId, places: { <name>: { entries, removals, retired: [[key, retireId]] } }, newSegments }
-vfs-ack     { name: 'vfs-ack', updateId, retained?: [retireId] }
-vfs-release { name: 'vfs-release', retireIds: [retireId] }
-entry       shared { kind, segmentId, offset, length, stat } | disk { kind, path, stat }
-stat        { size, mtimeMs }
+vfs-update  { name, updateId, places: { <name>: { entries, removals, retired: [[key, retireId]] } },
+              newSegments: [{ id, sab }] }                                    main → worker
+vfs-ack     { name: 'vfs-ack', updateId, retained?: [retireId] }              worker → main
+vfs-release { name: 'vfs-release', retireIds: [retireId] }                    worker → main
+vfs-mutate  { name, id, place, op, key, to?, options?, data? }                worker → main
+vfs-mutated { name, id, error?: { code, message, syscall, path, dest } }      main → worker
+entry       shared { kind, segmentId, offset, length, stat, scriptOptions?, meta? }
+            | disk { kind, path, stat, scriptOptions?, meta? }
+stat        { size, mtimeMs } (+ sourceSize, encoding for compressed companions)
 ```
 
 One `vfs-update` per watcher epoch or accepted virtual mutation. Source

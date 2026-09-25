@@ -63,7 +63,7 @@ SAB segments ──────────── one physical copy ────
 | `lib/serial-queue.js`           | `SerialQueue`: one task at a time, arrival order                                                                                                          |
 | `lib/place.js`                  | `Place`: projection, `visible()`, `cached()`, `scripted()`, `prepared()`, `preparerOf()`, `companions()`                                                  |
 | `lib/place-fs.js`               | `PlaceFs` facade, `VfsReadStream`, view leases, disk territory of `fs.fallback: 'disk'`                                                                   |
-| `lib/registry.js`               | `PlaceRegistry` (path → place, key) + `FsRouter` (read / mutate / copy decisions)                                                                         |
+| `lib/registry.js`               | `PlaceRegistry` (path → place, key) + `FsRouter` (read / mutate / copy / rename / link decisions)                                                         |
 | `lib/map-store.js`              | `MapStore`: the per-thread Map sink, atomic publish                                                                                                       |
 | `lib/sab-store.js`              | `SabStore`: main-thread mutations of a `sab + virtual` place                                                                                              |
 | `lib/mutation-queue.js`         | `MutationQueue`: per-(place, key) ordering, exclusive place barrier                                                                                       |
@@ -120,10 +120,13 @@ contiguous extent, companions travel through snapshot, delta, retirement and
 compaction without special cases, and a NUL cannot occur in a file name, so
 companions never collide with files nor leak into listings.
 
-**Files above `maxFileSize` stay disk entries; companions are bounded by the
-segment size only and never fall back to disk.** _Why:_ large media do not
-belong in the pool; a companion exists only in memory — a disk entry would
-point at the raw source.
+**Disk files above `maxFileSize` stay disk entries; content without a disk
+file of its own — prepared, virtual or SEA sources, and every companion —
+never falls back to disk: if it does not fit, its publication is refused
+(and `initialize()` fails).** _Why:_ large media do not belong in the pool;
+a disk entry must point at a file that holds exactly the content, and for
+prepared, virtual or compressed content there is none — a disk entry would
+point at the raw source, or at nothing.
 
 ## Publication
 
@@ -179,10 +182,18 @@ means a projection dropped the version, not that its consumers finished; a
 timeout would bring the bug back under load.
 
 **The `retireId` exists only from retirement until the free — no permanent
-allocation id per entry.** Records keep place, key, size and time for
+allocation id per entry. It is a monotonic counter of the main kernel,
+never reused, and travels beside the change in the update, never inside the
+new entry.** Records keep place, key, size and time for internal
 diagnostics (`kernel.retirements()`, labels like `static:/a.mp4 [fs:br]#17`,
 never parsed back). _Why:_ current entries are identified by (place, key);
-a permanent id would bloat every entry and message for the rare case.
+a permanent id would bloat every entry and message for the rare case; a
+never-reused id means a late release can never match a later retirement.
+
+**A consumer pins only the representation it reads — the source or one
+companion; each is retired and freed on its own.** _Why:_ pinning a whole
+file bundle, or a segment, for one slow reader would keep unrelated bytes
+out of the pool.
 
 **Each thread pins direct consumers by the projected entry object; IPC
 happens only when a pinned version is retired: its id in the ACK
@@ -191,21 +202,37 @@ identity of a physical version for free; pinning a current version happens
 per stream and view and must stay local; reporting the hold inside the ACK
 registers it before the ACK can free anything.
 
-**Streams emit owned chunks by default and release with the stream;
-zero-copy chunks are released only by `stream.release()`.** node:fs callers
-(the fs patch) always get owned chunks. _Why:_ a socket keeps chunks in its
-write queue after the source stream ended — releasing on `'end'` would free
-bytes still being written; third-party code never calls `release()`.
+**Streams emit owned chunks, released with the stream, unless zero-copy is
+on — the place's `fs.zeroCopy`, or `{ zeroCopy }` per call; zero-copy
+chunks are released only by `stream.release()`.** node:fs callers (the fs
+patch) always get owned chunks. _Why:_ a socket keeps chunks in its write
+queue after the source stream ended — releasing on `'end'` would free bytes
+still being written; third-party code never calls `release()`.
+
+**Owned-chunk streams release in `_destroy` — the single path of end,
+error, `destroy()` and an `AbortSignal`.** _Why:_ one path cannot release
+twice; `pipe()` never destroys its source, hence `pipeline()` in the docs.
 
 **Views are explicit leases `{ view, release, [Symbol.dispose] }`, with no
-GC backstop.** _Why:_ a Buffer has no lifecycle to observe; a GC-driven
-release could free memory while a destructured view or a `subarray` of it is
-still in use — use-after-free is worse than a visible leak.
+GC backstop — and neither streams nor leases have warning timers: an
+unreleased zero-copy stream or lease holds its version until `release()` or
+`close()`, visible in `retirements()`.** _Why:_ a Buffer has no lifecycle to
+observe; a GC-driven release could free memory while a destructured view or
+a `subarray` of it is still in use — use-after-free is worse than a visible
+leak; a long pin (a slow download) is normal, not an error.
 
 **`close()` stops active streams (`ERR_VFS_CLOSED`); a worker kernel's
 `close()` also closes its link.** _Why:_ after close nothing guards shared
 bytes — a worker's streams would otherwise read memory the main thread reuses
 once the link is gone.
+
+**A closed link port is the worker's exit: its pending ACKs and its holds
+are dropped.** _Why:_ a thread that is gone reads nothing; waiting for it
+would keep its retired versions forever.
+
+**`map` places take no part in retirement; their leases and releases are
+no-ops.** _Why:_ a Map entry is an owned Buffer the GC keeps alive; an
+update never reuses its bytes.
 
 **Compaction moves published entries only and closes the segment it
 empties; retired extents never move.** _Why:_ moving a retired extent would
@@ -224,6 +251,17 @@ ambiguous, and silent priority rules hide configuration mistakes.
 unrestricted fs takes only the object form; `fs.script.ext` is never its
 scope.** _Why:_ "every file" is not a meaningful preparation target, and the
 script extensions are a consumer filter, not a declaration.
+
+**`prepare` routes, it never selects: neither form adds or removes
+extensions of a domain or of the scan, and every declaration resolves into
+one index `place.prepare = { [ext]: name } | null`.** _Why:_ visibility
+stays a function of the consumer filters; one index gives O(1) selection
+and no per-domain copy that could disagree.
+
+**On the main thread every preparer an enabled place names must be
+registered — `initialize()` checks it before anything is read; a worker
+binds only what `attach({ preparers })` gives it.** _Why:_ a missing
+function is a deployment error: startup fails, not a later publication.
 
 **Preparers are synchronous, run once per publication attempt and never on
 read; returned bytes are copied, `meta` / `scriptOptions` cloned and
@@ -275,6 +313,10 @@ mutations — instead of every integration re-implementing retirement.
 synchronous scratch space without coordination; shared writable state goes
 through `sab + virtual`.
 
+**Renaming a virtual entry keeps its mtime, like a rename on disk.** _Why:_
+a move is not a write: the content is the same, so is its time — in `sab`
+and `map` places alike.
+
 ## Routing and strict mode
 
 **The router decides, the adapters execute; `fs-patch` and `module-hook`
@@ -301,7 +343,12 @@ resolved: `'deny'` under strict, `'disk'` otherwise.** `'deny'` serves
 published canonical entries only; `'disk'` also serves, from disk and inside
 that place only, the files its cache filters do not select, and merges them
 into listings (the facade serves the same territory). Cached extensions stay
-VFS-only under strict; module hooks never fall back. Its disk territory is a
+VFS-only under strict; module hooks never fall back. `fs.fallback` governs
+reads only: mutations follow `fs.writable`, and a disk write reaches the VFS
+only through the watcher — a file outside the cache filters never enters
+SAB. An explicit `'disk'` needs a finite `fs.ext`: without one every file is
+cached and no disk territory is left (the non-strict default still resolves
+to `'disk'`, which then means its permissive reads). Its disk territory is a
 route of its own (`'disk'`): native for reads, but a listing (`readdir`,
 `opendir`) is always the place's — disk directories and uncached files
 only, cached extensions from the published collection — even for a
@@ -315,20 +362,21 @@ non-strict default keeps its permissive reads.
 
 **One rule decides what a native `node:fs` operation may do: it runs only
 once every path it touches has been routed.** A single-path operation runs
-after the routing of its source and destination allows it; a recursive or
-compound operation whose routing could check only its top path is refused;
-the raw disk file of an entry the places serve (published, prepared,
-virtual) is never copied or linked in place of its content; a virtual
-destination is never changed by a native disk operation; a recursive
-operation from outside `appRoot` is refused when its walk would enter
-`appRoot`; unrelated paths outside `appRoot` stay native. What the kernel
-cannot guarantee fails with `ENOTSUP` before anything is read or written.
-_Why:_ every bypass found had one shape — a native operation checked one
-path, then read, listed or changed many: `opendir` listed hidden files, a
-recursive `cp` of a place or of a directory above `appRoot` carried denied
-files out, `copyFile` into a virtual place left a stray disk file, a
-directory `watch` reported hidden names, a recursive `rm` from above deleted
-read-only places. A rule per shape closes the class, not the instance.
+after the routing of its source and destination allows it; a copy or a
+rename hands on the source's raw input — never a prepared result or a
+companion — and the destination publishes it through its own pipeline; a
+recursive or compound operation whose routing could check only its top path
+is refused; a virtual destination is never changed by a native disk
+operation; a recursive operation from outside `appRoot` is refused when its
+walk would enter `appRoot`; unrelated paths outside `appRoot` stay native.
+What the kernel cannot guarantee fails with `ENOTSUP` before anything is
+read or written. _Why:_ every bypass found had one shape — a native
+operation checked one path, then read, listed or changed many: `opendir`
+listed hidden files, a recursive `cp` of a place or of a directory above
+`appRoot` carried denied files out, `copyFile` into a virtual place left a
+stray disk file, a directory `watch` reported hidden names, a recursive
+`rm` from above deleted read-only places, a `rename` gave a hidden file a
+readable name. A rule per shape closes the class, not the instance.
 `ENOTSUP` keeps the contract honest until a VFS-aware implementation exists
 (`TASKS.md`); an approximation such as `cp` with a `filter` would still copy
 raw bytes and miss virtual entries.
@@ -338,13 +386,14 @@ raw bytes and miss virtual entries.
 - _Implemented_, served by the places: `readFile`, `stat`, `lstat`,
   `access`, `realpath`, `existsSync`, `readdir`, `opendir`,
   `createReadStream`, `writeFile`, `appendFile`, `unlink`, `mkdir`, `rm`,
-  `rename`.
+  `rename`, `copyFile` and a non-recursive `cp`.
 - _Recognized but unsupported for managed territory_ (`ENOTSUP`): `open` of
-  a virtual entry; `cp` / `copyFile` / `link` from a source the places
-  serve; `watch` of a managed directory and a recursive `watch` of managed
-  territory; recursive walks (`readdir`, `opendir`, `watch`, `rm`, `rmdir`,
-  `cp`) and `rename` of a tree that holds places; guarded mutations in a
-  virtual place.
+  a virtual entry; a copy or `rename` of a prepared virtual entry, a copy
+  of a place directory; a recursive `cp` of or into managed territory; a
+  hard link into or out of a place; `watch` of managed territory; recursive
+  walks (`readdir`, `opendir`, `watch`, `rm`, `rmdir`) and `rename` of a
+  tree that holds places; a directory renamed into or out of a place;
+  guarded mutations in a virtual place. A hidden source is `EACCES`.
 - _Native passthrough outside managed territory_: unrelated paths outside
   `appRoot`, `disk` / `node-default` places, disk-territory files,
   unmanaged paths without strict; and the guarded APIs (`chmod`, `chown`,
@@ -370,24 +419,78 @@ use — native ones if it ran before the patch — so the filter is the only
 boundary; resolving results against `process.cwd()` let a glob with a `cwd`
 list what strict routing hides.
 
-**Copies and hard links from what the places serve are `ENOTSUP`: a
-published, prepared or virtual entry, a place directory, the strict
-`appRoot`, and — recursively — any disk territory and any tree that holds
-places, on either side of a `cp` (`FsRouter.copy`).** _Why:_ `node:fs`
-copies or links the raw disk file: raw bytes in place of canonical
-(prepared) content, no virtual entries, and a recursive copy walks past the
-filtered listings — a recursive copy of a place, or of a directory above
-`appRoot`, carried files strict routing denies to a readable destination.
-Disk-territory files, passthrough places and unrelated paths keep native
-copies: their disk bytes are what reads return.
+**A single-file copy (`copyFile`, a non-recursive `cp`) hands the
+destination the source's raw input, and the destination publishes it
+through its own pipeline (`FsRouter.copy`).** The raw input of a
+disk-origin place — published, prepared or not — is its raw disk file; of
+an unprepared virtual or SEA entry, its canonical bytes; a prepared virtual
+or SEA entry has none (`ENOTSUP`); a hidden source is `EACCES` before
+anything is read. A disk destination gets the raw bytes — in a disk-origin
+place its watcher prepares them — and a virtual one is written through its
+store: its preparer runs once and no file appears on disk. Raw on disk into
+a native destination is `node:fs` itself. Companions are never copied.
+`node:fs` options keep their meaning for one file; one the VFS cannot honor
+(`COPYFILE_FICLONE_FORCE`, `filter`, `preserveTimestamps`) is `ENOTSUP`.
+Errors name the source (`path`) and the destination (`dest`). _Why:_ the
+raw input is what a publication consumes, so the destination's policy
+decides the content — copying canonical (prepared) content into a place
+that prepares the same extension would prepare it twice, and its bundle may
+embed the source key. A prepared virtual entry keeps no raw input: feeding
+its canonical content in as raw would silently change what the preparer
+sees, and a native copy could not write a virtual destination at all.
+Compressed or bytecode companions are derived from the content; the
+destination rebuilds its own. Refusing every copy of served content made
+the most common operation on a disk-origin place impossible.
 
-**`watch` of a managed directory, recursive or not, is `ENOTSUP`; a single
-managed file keeps a native watcher; `fs.promises.watch` reports a refusal
-when it is iterated.** _Why:_ a directory watcher reports the name of every
-entry that changes, those a place hides included, and it reports disk
-events, not publications; a watcher of one routed file reveals nothing
-else. `node:fs` reports the errors of `fs.promises.watch` from its iterator,
-so a synchronous throw would differ from native behavior.
+**A recursive `cp` stays native at both ends: a source or a destination in
+a place, or one that encloses `appRoot`, is `ENOTSUP`.** _Why:_ a native
+walk reads raw files past the filtered listings, misses virtual entries and
+writes a destination's files behind its store; a recursive copy of a place,
+or of a directory above `appRoot`, carried files strict routing denies to a
+readable destination. A VFS-aware walk is in `TASKS.md`.
+
+**A hard link into or out of an indexed place is `ENOTSUP`
+(`FsRouter.link`); a hidden source is `EACCES`.** _Why:_ a hard link is one
+physical file under two names, while a place gives every name its own
+canonical content, preparation and companions; the second name would also
+escape the place's mutation policy: it can be a writable alias of a
+read-only place's raw file, and a write through it may never reach the
+place's watcher. A copy gives the same bytes without sharing the file.
+
+**A native rename moves the raw file. Both paths pass the mutation
+routing and the source the read routing: a hidden source is `EACCES`. A
+published disk-origin file may leave `appRoot` or change its extension; the
+watchers then drop the old canonical entry and publish the new key by the
+policy of its place and extension. A directory never enters or leaves a
+place (`FsRouter.rename`: `crossing`).** In a virtual place the store moves
+an ordinary entry atomically and keeps its mtime — the preparer of a new
+extension runs once — and refuses a prepared one (`ENOTSUP`); across a
+virtual boundary a rename is `EXDEV`. _Why:_ the raw file is a disk-origin
+place's source of truth: moving it hands on exactly what its publication
+consumes, and each end republishes it by its own rules — the extension
+change of a prepared file is just a new file of the new extension. What made
+a rename a bypass was a hidden source: with write access to a disk-origin
+place, a rename carried a file strict routing hides out of `appRoot`, or
+gave it an extension its place serves from disk. A published source was
+readable before it moved; strict routing decides which paths are served, and
+a preparer is a publication step, not an access boundary. A directory
+would change the policy of all its descendants at once, hidden files
+included, with nothing routed. A prepared virtual entry has no raw input,
+and its bundle may embed the old key (`scriptOptions.filename`, `meta`,
+bytecode). A copy and a delete across places would not be atomic, and a
+virtual place is a filesystem of its own.
+
+**`watch` of managed territory is `ENOTSUP` — a place directory, a
+published file, the strict `appRoot`, a recursive watch of a place or of a
+tree that holds places — while a file of the disk territory keeps a native
+watcher; `fs.promises.watch` reports a refusal when it is iterated.**
+_Why:_ a native watcher reports raw disk events: the names a place hides,
+changes before or without their publication (a preparation that fails keeps
+the previous version), nothing of virtual writes. An event must mean a
+publication, and a publication-level watch is in `TASKS.md`. A
+disk-territory file is its own content: its events describe what reads
+return. `node:fs` reports the errors of `fs.promises.watch` from its
+iterator, so a synchronous throw would differ from native behavior.
 
 **A recursive walk, and a `rename`, of a tree that holds places — `appRoot`
 passed through without strict, or a directory above it — is `ENOTSUP`; one
@@ -456,6 +559,19 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
 | Manual worker transports (`broadcast`, `getWorkerIds`)                                                          | every one would have to re-implement retirement                   |
 | `startsWith('..')` containment, `realpath` in the router                                                        | misroutes `..private`; disk access on the hot path                |
 | Native `cp` with a routing `filter` for managed trees                                                           | raw disk bytes, no virtual entries, no canonical content          |
+| Copying canonical (prepared) content as a copy's input                                                          | the destination prepares it again; its bundle names the source    |
+| Feeding a prepared virtual entry's canonical content back in as raw                                             | stale `meta` / filename / bytecode, a silently different input    |
+| Refusing every copy or rename of served content                                                                 | the raw source of truth could not move; the bypass was hidden raw |
+| A cross-place `rename` as a copy and a delete                                                                   | not atomic; a virtual place is a filesystem of its own (`EXDEV`)  |
+| A native watcher for a published file                                                                           | raw disk events are not publications                              |
+| A full copy per stream, or of its unread rest                                                                   | the cost grows with the file; a pin gives the same stability      |
+| Atomics or a global lock per read; pinning a segment or every companion                                         | cross-thread cost on the hot path; holds unrelated bytes          |
+| Revisions, cancellation tokens, per-key queues or latest-wins for watcher epochs                                | a FIFO gives the guarantee with less machinery                    |
+| Several chained preparers for one extension                                                                     | one extension, one declaration, one canonical content             |
+| Preparation that emits extra files, per-domain variants or derived formats                                      | a file keeps its key, extension and one canonical content         |
+| A guarded native `opendir`; a native listing of a disk-only directory                                           | a second listing path: hidden raw files, no virtual entries       |
+| Native passthrough of the strict `appRoot`                                                                      | lists unmanaged names                                             |
+| A glob-only fix for stale patched references; a wrapper that keeps or re-installs a kernel                      | every captured reference is affected; a closed kernel is gone     |
 | Standalone place-level `script` domain, provider `memory`, `vfs:` URLs, metawatch, root-level `ext` / `compile` | superseded by the place / domain model; no aliases                |
 
 ## Invariants
@@ -484,6 +600,18 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
   restores them in reverse; `.native` variants are preserved; with no
   kernel installed a wrapper is its original.
 - Listings are sorted and deduplicated by string name before any encoding.
+- A preparer runs once per publication attempt, on the publishing thread,
+  never on read; its raw input is never kept in the VFS; a prepared source
+  is never a disk entry; `prepare` and `scriptOptions` never turn
+  `fs.script` on.
+- No native listing, copy, link, rename or watch runs over managed
+  territory past its routing; a refusal comes before any disk read or
+  write.
+- A copy or a rename hands on the raw input only — never a prepared result
+  or a companion; the destination prepares it once, and a virtual
+  destination never gets a disk file.
+- Disk territory never leaves its place (`PlaceFs.#within`) and, under
+  strict, never serves or lists a cached extension.
 
 ## Protocol
 
@@ -494,7 +622,7 @@ vfs-update  { name, updateId, places: { <name>: { entries, removals, retired: [[
 vfs-ack     { name: 'vfs-ack', updateId, retained?: [retireId] }              worker → main
 vfs-release { name: 'vfs-release', retireIds: [retireId] }                    worker → main
 vfs-mutate  { name, id, place, op, key, to?, options?, data? }                worker → main
-vfs-mutated { name, id, error?: { code, message, syscall, path } }            main → worker
+vfs-mutated { name, id, error?: { code, message, syscall, path, dest } }      main → worker
 entry       shared { kind, segmentId, offset, length, stat, scriptOptions?, meta? }
             | disk { kind, path, stat, scriptOptions?, meta? }
 stat        { size, mtimeMs } (+ sourceSize, encoding for compressed companions)
@@ -513,9 +641,10 @@ stat        { size, mtimeMs } (+ sourceSize, encoding for compressed companions)
   instead of timers.
 - Hooks are installed only inside a test and uninstalled in `after` /
   `finally`; bootstrap tests run child processes.
-- glob keeps the `node:fs` functions of its first use, and a `node --test`
-  child has already used it: a glob that kept the patched functions is
-  tested in a plain node process (`test/fixtures/glob-kept.cjs`).
+- glob captures the `node:fs` functions it walks with when it is loaded,
+  and a `node --test` child loads it before any test runs: a glob that kept
+  the patched functions is tested in a plain node process
+  (`test/fixtures/glob-kept.cjs`).
 - A refused operation is tested for its error (`code`, `syscall`, `path`,
   `dest`) and for leaving nothing behind — no copy, no deletion, no move.
 - Prove V8 cached-data acceptance in a worker: the per-isolate compilation

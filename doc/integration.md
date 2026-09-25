@@ -59,10 +59,11 @@ Invariants:
 | Bytecode              | `kernel.bytecode` / `PlaceFs.script` | same, on publish              | auto on write        | auto on write        | `kernel.bytecode` | n/a            | no (`compile: false`) |
 
 Disk-origin writable places (`sab + disk`, `map + disk`) are **eventual
-consistency**: mutations go to disk, the watcher brings them into the
-index (no `waitForUpdate`). A `sab + virtual` mutation resolves its
-Promise only once the new version is already published — no watcher
-involved.
+consistency**: mutations go to disk — copies and renames through the
+patched `fs` included — and the watcher brings them into the index (no
+`waitForUpdate`). A `sab + virtual` mutation, a copy into the place
+included, resolves its Promise only once the new version is already
+published — no watcher involved.
 
 Disk-origin places also decide what happens to a path they do not serve,
 with `fs.fallback` (resolved explicitly: `'deny'` under strict, `'disk'`
@@ -153,10 +154,10 @@ try {
 
 Two layers, `defaults.hooks.{fs,module}`:
 
-| Layer    | Mechanism                                              | Notes                                                                                      |
-| -------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `fs`     | table-driven `node:fs` patch (sync/callback/promises)  | Executes `FsRouter` decisions. Implemented vs guarded lists: see README.                   |
-| `module` | `module.registerHooks({ resolve, load })` + `_compile` | One chain for `require()` and `import`. Domain = `context.conditions.includes('require')`. |
+| Layer    | Mechanism                                              | Notes                                                                                         |
+| -------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `fs`     | table-driven `node:fs` patch (sync/callback/promises)  | Executes `FsRouter` decisions: implemented, recognized but unsupported, passthrough (README). |
+| `module` | `module.registerHooks({ resolve, load })` + `_compile` | One chain for `require()` and `import`. Domain = `context.conditions.includes('require')`.    |
 
 Manual install (when not using `--import shared-memory-fs/register`):
 
@@ -306,8 +307,9 @@ const serve = (req, res, key) => {
 ```
 
 Parsing `Accept-Encoding` is the server's job. With `retainRaw: false`
-the `'raw'` branch has no SAB bytes — use
-`fs.createReadStream(place.pathOf(key))` instead.
+the `'raw'` branch still works: the source is not in SAB, so `readFile()`
+and `createReadStream()` read it from disk themselves (`readFileView()`
+returns `null`).
 
 ### Single-Executable Application bundling
 
@@ -426,10 +428,15 @@ const handler = script.runInThisContext();
   watcher, SEA, virtual writes from any thread, `map` writes — never on
   read. A preparer error or a failing `fs.script.compile` publishes
   nothing; a failing `require.compile` only drops its own companion.
-- In a **virtual** place `appendFile` of a prepared key and moving one
-  away are `ENOTSUP`; renaming an unprepared file onto an extension with a
-  preparer publishes it through that preparer. In a disk-origin place
-  mutations edit the raw file and the watcher re-prepares it.
+- In a **virtual** place `appendFile`, `rename` and copies of a prepared
+  key are `ENOTSUP`: its raw input is not kept. Renaming or copying an
+  unprepared entry onto an extension with a preparer publishes it through
+  that preparer, once. In a disk-origin place mutations edit the raw file
+  and the watcher re-prepares it; a copy or a rename hands on the raw
+  file, never the prepared content.
+- `readFile` gives the prepared content; passing it to `writeFile`
+  elsewhere is a new publication the destination may prepare again, not a
+  raw-preserving copy — `copyFile` hands on the raw input.
 
 ### Testing with virtual fixtures
 
