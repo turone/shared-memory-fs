@@ -346,6 +346,13 @@ mutations of different keys overlap, so the published index alone cannot
 decide; locking every ancestor would serialize all writes of a directory,
 while a set of keys in flight costs nothing when nothing conflicts.
 
+**A write's flag reaches the store: `w…` replaces, `a…` appends, `x` is
+`{ exclusive }`, checked in the key's turn like the hierarchy; a flag a
+store cannot honor (read, numeric) is `ENOTSUP`. A copy's `COPYFILE_EXCL`
+and cp's `force: false` / `errorOnExist` are that same exclusive write.**
+_Why:_ exclusive creation is how callers avoid replacing a file; checked
+before the queue, it would not be exclusive.
+
 ## Routing and strict mode
 
 **The router decides, the adapters execute; `fs-patch` and `module-hook`
