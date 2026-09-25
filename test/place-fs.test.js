@@ -338,14 +338,16 @@ describe('PlaceFs: memory mutations', () => {
       '/a/../b',
       'a\\b',
       42,
-      '/a/',
       '/a//b',
       '/a/./b',
       '.',
+      '../',
     ]) {
       assert.throws(write(key), TypeError, String(key));
     }
-    // A directory operation takes a trailing slash, as node:fs does.
+    // A trailing slash names a directory, which takes no file.
+    assert.throws(write('/a/'), { code: 'EISDIR', path: mem.pathOf('/a') });
+    // A directory operation takes it, as node:fs does.
     mem.mkdir('/slash/', { recursive: true });
     mem.writeFile('/slash/x.txt', 'x');
     mem.rename('/slash/', '/slashed/');

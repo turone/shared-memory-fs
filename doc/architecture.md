@@ -355,12 +355,17 @@ callback, promise and guarded APIs.
 **Containment is lexical: only a real `..` component leaves `appRoot`; the
 router never stats or resolves paths.** _Why:_ `..private` is a legal name
 and must route like any other; the router sits on the hot path of every fs
-call. Symlink / realpath containment is out of scope. A path is routed as
-`path.resolve` normalizes it, trailing separator dropped: a file path that
-ends in one reaches the file, as native `node:fs` on Windows does, where
-POSIX answers `ENOTDIR` — routing and every policy see the same
-normalized path, so nothing is bypassed, and reproducing the POSIX answer
-would take a per-platform check in every operation.
+call. Symlink / realpath containment is out of scope.
+
+**A trailing separator names a directory, as on POSIX, on every platform
+for what a place serves or stores: the router answers `ENOTDIR` for a
+served file named so; a store route keeps the slash on its key, so a file
+write is `EISDIR` and `unlink`, `rm` and `rename` hand `{ directory }` to
+the store, which checks it when the mutation runs. What passes through
+keeps the rules of `node:fs` — on Windows, a trailing separator is
+ignored.** _Why:_ the VFS answers the same on every platform, and a path
+that names a directory never reaches a file. Checked in the mutation's
+own turn, a directory-form `rm` never takes a file written meanwhile.
 
 **Strict mode is a routing policy, not isolation.** _Why:_ code can reach
 the OS by other means (native addons, child processes, its own hooks) and
