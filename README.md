@@ -396,19 +396,23 @@ new VfsConfig({ defaults: { strict: true }, places: { ... } });
 `appRoot` that no place owns is `EACCES` — at every depth, file or
 directory, without the router touching the disk.
 
-Strict is a **routing policy** for code that goes through the patched
-`node:fs` and module hooks. It is not isolation of untrusted code: worker
-threads share one process, and neither they nor the patch replace
-OS-level protection.
+Strict is a **routing and access policy inside `appRoot`** for code that
+goes through the patched `node:fs` and the module hooks: unmanaged
+territory is refused, and the disk territory that stays reachable is
+exactly what the configured places and their `fs.fallback` allow. It is
+not an OS sandbox: worker threads share one process, and neither they nor
+the patched `node:fs` replace the operating system's isolation.
 
 - Containment is lexical: only a real `..` component leaves `appRoot`.
   `..private`, `...data` or `file..js` are ordinary names — an unowned
   `appRoot/..private/x` is denied like any other unowned path, and
   `appRoot/api/..private/x` belongs to place `api`.
 - `appRoot` itself is a **managed root**: `readdir(appRoot)` and
-  `opendir(appRoot)` list the enabled places and nothing else,
-  `stat(appRoot)` is a directory, and other native access to the root
-  (`watch`, writes) is `EACCES`.
+  `opendir(appRoot)` list the enabled places and nothing else, and
+  `stat(appRoot)` is a directory. `watch` of it — as of any managed
+  directory — is `ENOTSUP` (recognized but unsupported); writes to it and
+  the other guarded calls on it (`rmdir`, `statfs`, `watchFile`, …) are
+  `EACCES`.
 - A trusted entry point and `package.json` must live **outside
   `appRoot`**, or inside an explicit `node-default` / `disk` place.
   Under strict, `appRoot` should contain place directories and nothing
@@ -521,12 +525,19 @@ cloneable so workers rebuild from it.
 | `compaction.threshold` | number | `0.3`      | 0 = off; else compact below this    |
 | `hooks.fs`             | bool   | `true`     | Patch `node:fs`                     |
 | `hooks.module`         | bool   | `true`     | `module.registerHooks` + `_compile` |
-| `watch`                | bool   | `false`    | Watch sab places                    |
+| `watch`                | bool   | `false`    | Watch disk-origin places            |
 | `watchTimeout`         | number | `1000`     | Watcher debounce (ms)               |
-| `strict`               | bool   | `false`    | `appRoot` sandbox                   |
+| `strict`               | bool   | `false`    | Routing policy inside `appRoot`     |
 
 Sizes accept `metautil.sizeToBytes` strings or numbers. Booleans must be
 booleans.
+
+`watch` starts the kernel's own watcher: it republishes disk changes of
+the disk-origin cached places — `sab` + `disk` and `map` + `disk` alike;
+virtual places have no disk to watch. It is unrelated to the patched
+`fs.watch`, which refuses managed territory with `ENOTSUP` (see
+[Patched `node:fs`](#patched-nodefs)). `strict` is described in
+[Strict routing](#strict-routing); it is not an OS sandbox.
 
 | `places.<name>.*` | Type   | Default       | Description                                                                  |
 | ----------------- | ------ | ------------- | ---------------------------------------------------------------------------- |
@@ -621,7 +632,8 @@ the link port and ACKs **those — and only those** — back, with the
 retired versions its streams and leases still read. Publishes
 `VfsKernel.current` (also the `kernel` getter on the package).
 `preparers` serve local writes to the worker's own `map` places; a
-worker never prepares shared places.
+worker never prepares shared places. The options object replaces the
+positional `attach(link)` of earlier versions.
 
 ### `PlaceFs`
 
@@ -855,7 +867,9 @@ symlinks are unavailable.
 
 ## Support
 
-CI runs the suite and the linter on every push:
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull
+requests to `main`: `npm ci`, `npm test`, `npm run test:examples` and
+`npm run lint`, on each combination below:
 
 |         | Node 22.22.3 | Node 22.x | Node 24.12.0 | Node 24.x | Node 26.x |
 | ------- | ------------ | --------- | ------------ | --------- | --------- |

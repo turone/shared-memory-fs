@@ -218,7 +218,7 @@ compile, or the file is non-JS), `metavm` creates cached data on first
 run as usual. Prove `cachedDataRejected === false` in a worker, not in
 the compiling thread: V8's per-isolate cache masks rejection there.
 
-### AI agent / plugin sandbox
+### AI agent / plugin workspace
 
 Pattern: one writable `map + virtual` place per agent (or per session),
 strict mode on, optional `sab` place for read-only tooling. The trusted
