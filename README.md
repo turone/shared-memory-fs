@@ -710,7 +710,9 @@ which answers at once.
 
 With `hooks.fs` on, `node:fs` routes through the kernel. Every path-taking
 API falls into one of three groups below. Full `node:fs` compatibility is
-not promised.
+not promised. A path is routed as `path.resolve` gives it, so a trailing
+separator is dropped: a file path ending in one reaches the file, as
+`node:fs` does on Windows, where POSIX would answer `ENOTDIR`.
 
 **The rule.** A native `node:fs` operation runs only once every path it
 touches has been routed:

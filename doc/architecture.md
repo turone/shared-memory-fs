@@ -355,7 +355,12 @@ callback, promise and guarded APIs.
 **Containment is lexical: only a real `..` component leaves `appRoot`; the
 router never stats or resolves paths.** _Why:_ `..private` is a legal name
 and must route like any other; the router sits on the hot path of every fs
-call. Symlink / realpath containment is out of scope.
+call. Symlink / realpath containment is out of scope. A path is routed as
+`path.resolve` normalizes it, trailing separator dropped: a file path that
+ends in one reaches the file, as native `node:fs` on Windows does, where
+POSIX answers `ENOTDIR` — routing and every policy see the same
+normalized path, so nothing is bypassed, and reproducing the POSIX answer
+would take a per-platform check in every operation.
 
 **Strict mode is a routing policy, not isolation.** _Why:_ code can reach
 the OS by other means (native addons, child processes, its own hooks) and
