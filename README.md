@@ -687,11 +687,19 @@ rejected).
 | `writeFile` / `appendFile` / `unlink`        | void \| Promise                                       | Sync for map/disk; Promise for `sab + virtual`                                                                        |
 | `mkdir` / `rm` / `rename`                    | void \| Promise                                       | `mkdir` is a no-op; a directory `rename` moves a raw-only subtree; `ENOTSUP` for `appendFile` / moving a prepared key |
 
-The place's own directory (`'/'`) always exists and never moves: a
-recursive `mkdir` of it succeeds, a plain one is `EEXIST`, writes and
+A virtual place keeps the hierarchy of a filesystem: a path is a file or a
+directory, never both. A key under a file is `ENOTDIR`, a file where a
+directory is `EISDIR` — for writes, appends, copies, renames and subtree
+moves alike, and for mutations that run at the same time. Directories are
+implicit: `mkdir` creates no entry, and a directory exists while a file is
+under it. The place's own directory (`'/'`) always exists and never moves:
+a recursive `mkdir` of it succeeds, a plain one is `EEXIST`, writes and
 `unlink` are `EISDIR`, `rm` and `rename` are `ENOTSUP`. Through patched
 `fs`, a `rename` across a virtual place's boundary is `EXDEV` (see
-[Copies and renames](#copies-and-renames)).
+[Copies and renames](#copies-and-renames)), and the `*Sync` forms refuse a
+`sab + virtual` place (`ENOTSUP`): the main kernel publishes its
+mutations — `mkdirSync` included, except of the place's own directory,
+which answers at once.
 
 ## Patched `node:fs`
 
@@ -851,7 +859,8 @@ A `rename` routes both paths as mutations and its source as a read:
   mtime under the new prefix, in one publication; nothing is prepared,
   compiled or compressed again. One source that cannot move refuses the
   whole subtree (`ENOTSUP`); a destination that exists is `ENOTEMPTY` /
-  `ENOTDIR`, a move into itself `EINVAL` — before anything changes.
+  `ENOTDIR`, one under a file `ENOTDIR`, a move into itself `EINVAL` —
+  before anything changes.
 - Across a virtual place's boundary it is `EXDEV` — never a copy and a
   delete.
 
@@ -867,9 +876,9 @@ not a raw-preserving copy.
 | `EROFS`   | Place has `fs.writable: false` (or provider `sea`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `ENOTSUP` | No file descriptor for a virtual entry (`open`); `*View` or a `{ zeroCopy: true }` stream without `fs.zeroCopy`; compressed API for an unconfigured encoding; `appendFile`, `rename` or a copy of a prepared virtual key; a write whose preparer is not registered in this thread; a `*Sync` mutation or copy into a `sab + virtual` place; a copy option the VFS cannot honor; a recursive `cp` of or into managed territory; a hard link into or out of a place; `watch` of managed territory; a recursive walk or `rename` of a tree that holds places; a directory renamed across a place's boundary (a place's root included); a virtual subtree rename that is not raw-only; `rm` / `rename` of a place's own directory; a guarded mutation in a virtual place |
 | `ENOENT`  | Missing key in a writable place; `readdir` of a missing directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `ENOTDIR` | `readdir` of a file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `ENOTDIR` | `readdir` of a file; a virtual key under a file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `EXDEV`   | `rename` across a virtual place's boundary: between two places, or between one and the disk                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `EISDIR`  | `readFile` / `createReadStream` of an implicit directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `EISDIR`  | `readFile` / `createReadStream` of an implicit directory; a virtual file written, copied or renamed where a directory is; a write or `unlink` of a place's own directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Errors carry the same `code`, `errno`, `syscall` and `path` fields as
 `node:fs`, and `dest` for copies, links and renames. A stream stopped by

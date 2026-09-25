@@ -25,6 +25,9 @@ Invariants:
 
 - Workers never write SAB directly; a `sab + virtual` write from a worker
   goes through the mutation RPC and is applied by the main kernel.
+- A virtual place keeps a filesystem's hierarchy: a key under a file is
+  `ENOTDIR`, a file where a directory is `EISDIR` — whatever the mutation,
+  and also when mutations overlap.
 - One publication pipeline for every source of content: raw input → the
   preparer of its extension (once) → canonical content → bytecode and
   compressed companions → one epoch. Allocations stay private until the

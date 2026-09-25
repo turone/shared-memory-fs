@@ -110,6 +110,17 @@ results; only if it justifies it, they are written straight into the
 provisional allocation, with rollback and ownership guarantees kept and no
 regression for Buffer and string results.
 
+## P3 — Directory lookups in large virtual places
+
+**Problem.** Whether a key names an implicit directory is found by scanning
+every key of the place (`Place.isDirectory`), on a read that misses and
+before every new key a mutation creates (`checkHierarchy`): linear in the
+size of the place.
+
+**Done when.** A per-place directory index, maintained where the index
+changes (publication, removal, subtree moves), answers in O(depth), with a
+benchmark on a place of many thousands of keys.
+
 ## P3 — Public diagnostics
 
 **Problem.** Only the internal `retirements()` shows what the kernel holds.

@@ -317,6 +317,21 @@ through `sab + virtual`.
 a move is not a write: the content is the same, so is its time — in `sab`
 and `map` places alike.
 
+**A virtual place keeps the hierarchy of a filesystem: a path is a file or a
+directory, never both. One check (`checkHierarchy`) runs before every
+mutation that creates a primary key — write, append, copy, file rename,
+subtree move — in `map` and `sab` places alike: a file above the key is
+`ENOTDIR`, a directory at it `EISDIR`. A key whose publication has begun
+counts as a file until it commits or fails (`SabStore`'s keys in flight),
+so two mutations running together cannot create `/f` and `/f/x` both as
+files. Directories stay implicit: `mkdir` creates no entry.** _Why:_
+implicit directories let `/f.txt` and `/f.txt/x` both exist — a structure
+no filesystem has, for which listings, `stat`, subtree operations and a
+later copy to disk have no consistent answer. Per-key ordering lets
+mutations of different keys overlap, so the published index alone cannot
+decide; locking every ancestor would serialize all writes of a directory,
+while a set of keys in flight costs nothing when nothing conflicts.
+
 ## Routing and strict mode
 
 **The router decides, the adapters execute; `fs-patch` and `module-hook`
@@ -591,6 +606,8 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
 | Refusing every virtual directory rename                                                                         | a prefix rename changes no content; raw-only trees can move       |
 | Re-keying a SAB allocation in place on a subtree move                                                           | a pinned version would get a second projection, its pin unheeded  |
 | Recompressing, re-preparing or moving part of a subtree                                                         | wasted work; no raw input; a tree split between two names         |
+| A hierarchy check against the published index only                                                              | two overlapping mutations would both pass                         |
+| Locking every ancestor of a created key                                                                         | serializes all writes of one directory                            |
 | A native watcher for a published file                                                                           | raw disk events are not publications                              |
 | A full copy per stream, or of its unread rest                                                                   | the cost grows with the file; a pin gives the same stability      |
 | Atomics or a global lock per read; pinning a segment or every companion                                         | cross-thread cost on the hot path; holds unrelated bytes          |
@@ -639,6 +656,8 @@ workers call `attach()`.** _Why:_ preloads do not run in worker threads.
   or a companion; the destination prepares it once, and a virtual
   destination never gets a disk file.
 - A virtual subtree moves in one publication or not at all.
+- A virtual path is a file or a directory, never both — also while
+  mutations overlap.
 - Disk territory never leaves its place (`PlaceFs.#within`) and, under
   strict, never serves or lists a cached extension.
 
